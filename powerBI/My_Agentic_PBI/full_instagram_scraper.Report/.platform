@@ -1,0 +1,11 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+  "metadata": {
+    "type": "Report",
+    "displayName": "full_instagram_scraper"
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "096d143d-ff30-46f4-8db3-64b0c0696f43"
+  }
+}

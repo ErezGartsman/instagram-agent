@@ -1,0 +1,72 @@
+# ─── Secrets & Config ────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example          # keep the example template in git
+
+# ─── Database files ───────────────────────────────────────────────────────────
+*.db
+*.duckdb
+*.db-shm
+*.db-wal
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+*.log
+audit.log
+
+# ─── Data files (may contain PII) ────────────────────────────────────────────
+data/
+
+# ─── Python runtime ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# ─── Virtual environments ────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# ─── Distribution / packaging ────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+
+# ─── Type checking ───────────────────────────────────────────────────────────
+.mypy_cache/
+.pytype/
+.pyre/
+
+# ─── Testing ─────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ─── Editors & OS ────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── DuckDB CLI binary (not source, belongs in PATH not the repo) ─────────────
+duckdb.exe
+duckdb
+
+
+# ─── Catch-all for massive data files ───────────────────────────────────────
+*.csv
+*.json
+*.parquet
+*.xlsx
+archive/
+
+*.exe
+*.zip

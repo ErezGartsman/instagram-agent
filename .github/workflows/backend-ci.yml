@@ -1,0 +1,62 @@
+name: Backend CI
+
+# Triggers: any push or PR that touches the backend directory.
+# Vercel picks up the deployment automatically once this workflow goes green.
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "beckend/**"
+      - ".github/workflows/backend-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "beckend/**"
+      - ".github/workflows/backend-ci.yml"
+
+jobs:
+  test:
+    name: "pytest — backend unit tests"
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: beckend
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup with pip cache ───────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: beckend/requirements.txt
+
+      # ── 3. Install dependencies ───────────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Run test suite ─────────────────────────────────────────────────────
+      # Real DB and Gemini calls are mocked — no secrets needed for tests.
+      # GEMINI_API_KEY and SUPABASE_DB_URL are fake values that satisfy
+      # pydantic-settings validation without touching real services.
+      - name: Run pytest
+        env:
+          GEMINI_API_KEY: "ci-fake-key-not-real"
+          SUPABASE_DB_URL: "postgresql://fake:fake@localhost:5432/fake"
+        run: |
+          pytest tests/ -v --tb=short --no-header \
+            --junit-xml=test-results.xml
+
+      # ── 5. Upload test results (visible in GitHub PR UI) ─────────────────────
+      - name: Upload test results
+        if: always()   # upload even when tests fail so we can see what broke
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-results
+          path: beckend/test-results.xml
+          retention-days: 7

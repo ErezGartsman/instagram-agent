@@ -1,0 +1,407 @@
+table dim_users
+	lineageTag: 2509d4fd-b8a6-4077-a207-dff8311f504f
+
+	/// Count of followers (Is Follower = TRUE in dim_users) who have at least one comment on any post.
+	measure 'Followers by Engagement' =
+			
+			CALCULATE(
+			    COUNTROWS(dim_users),
+			    dim_users[Is Follower] = TRUE(),
+			    CROSSFILTER(fact_posts_comments[username], dim_users[username], Both)
+			)
+		formatString: 0
+		displayFolder: Followers
+		lineageTag: aeff35b8-940c-42c1-b2b2-6a9d06bbb9e9
+
+	/// Count of followers active (first_follow_date ≤ date ≤ last_seen_date) as of selected date.
+	measure 'Total Followers' =
+			
+			VAR _SlicerDate = MAX('dim_date'[Date])
+			VAR _LastDataDate =
+			    CALCULATE(MAX(dim_users[last_seen_date]), ALL(dim_users), dim_users[Is Follower] = TRUE())
+			VAR _CalculationDate = MIN(_SlicerDate, _LastDataDate)
+			RETURN
+			CALCULATE(
+			    COUNTROWS(dim_users),
+			    ALL(dim_users),
+			    dim_users[Is Follower] = TRUE(),
+			    dim_users[first_follow_date] <= _CalculationDate,
+			    dim_users[last_seen_date] >= _CalculationDate
+			)
+		formatString: 0
+		displayFolder: Followers
+		lineageTag: e1263eef-6f46-42eb-9940-83384ddd00df
+
+	/// Followers whose last_seen_date is before the most recent scrape — users who unfollowed.
+	measure 'Churned Followers' =
+			
+			VAR _SelectedMaxDate = MAX('dim_date'[Date])
+			VAR _GlobalLastSeen =
+			    CALCULATE(MAX(dim_users[last_seen_date]), ALL(dim_users), dim_users[Is Follower] = TRUE())
+			RETURN
+			CALCULATE(
+			    COUNTROWS(dim_users),
+			    ALL(dim_users),
+			    dim_users[Is Follower] = TRUE(),
+			    dim_users[last_seen_date] <= _SelectedMaxDate,
+			    dim_users[last_seen_date] < _GlobalLastSeen,
+			    TREATAS(VALUES('dim_date'[Date]), dim_users[last_seen_date])
+			)
+		formatString: 0
+		displayFolder: Followers
+		lineageTag: 0628e56e-f528-4581-bd66-2f1fbe5748f7
+
+	/// Running follower count for line chart axes. REMOVEFILTERS on dim_date ensures correct historical accumulation.
+	measure 'Followers Over Time' =
+			
+			VAR MaxDateOnAxis = MAX('dim_date'[Date])
+			RETURN
+			CALCULATE(
+			    COUNTROWS(dim_users),
+			    REMOVEFILTERS('dim_date'),
+			    dim_users[Is Follower] = TRUE(),
+			    dim_users[first_follow_date] <= MaxDateOnAxis,
+			    dim_users[last_seen_date] >= MaxDateOnAxis
+			)
+		formatString: 0
+		displayFolder: Followers
+		lineageTag: 517bb6ac-1ec6-47d7-a3af-ddbaf7b74c28
+
+	/// Distinct commenters who are followers (Is Follower = TRUE), respecting dim_users filter context.
+	measure 'Total Active Users' =
+			
+			CALCULATE(
+			    DISTINCTCOUNT(fact_posts_comments[username]),
+			    KEEPFILTERS(dim_users),
+			    dim_users[Is Follower] = TRUE()
+			)
+		formatString: 0
+		displayFolder: Followers
+		lineageTag: c9b33b69-b5b8-40bd-968c-34334a07730e
+
+	/// Followers who have not engaged in the last 30 days. Leading churn indicator — target below 10% of Total Followers.
+	measure 'Dormant Followers' =
+			
+			CALCULATE(
+			    COUNTROWS(dim_users),
+			    dim_users[Is Follower] = TRUE(),
+			    dim_users[Days Since Last Engagement] > 30
+			)
+		formatString: #,##0
+		displayFolder: Followers
+		lineageTag: 3cd83bbd-d7a1-44a1-bfd0-c08feb4623ea
+
+	/// Dormant followers as a % of total followers. Health KPI — rising % signals content fatigue.
+	measure 'Dormant Followers %' =
+			
+			DIVIDE([Dormant Followers], [Total Followers], BLANK())
+		formatString: 0.0%
+		displayFolder: Followers
+		lineageTag: 82a12cbc-705f-4af0-8aa3-50fe311c2fdf
+
+	/// MIN of dim_date[Date] in current filter context. Used as the start boundary in growth calculations.
+	measure 'Selected Start Date' = MIN('dim_date'[Date])
+		displayFolder: Followers\Growth
+		lineageTag: bc5b168e-dace-45b7-9aec-63498fd1ed11
+
+	/// MAX of dim_date[Date] in current filter context. Used as the end boundary in growth calculations.
+	measure 'Selected End Date' = MAX('dim_date'[Date])
+		displayFolder: Followers\Growth
+		lineageTag: ae808178-f65b-4890-af8a-2b328bb70999
+
+	/// Followers at end of selected period minus followers at start. Positive = net gain, Negative = net loss.
+	measure 'Net Growth (by Date Range)' =
+			
+			VAR _SlicerStart = MIN('dim_date'[Date])
+			VAR _EndCount    = [Total Followers]
+			VAR _StartCount  =
+			    CALCULATE(
+			        COUNTROWS(dim_users),
+			        ALL(dim_users),
+			        dim_users[Is Follower] = TRUE(),
+			        dim_users[first_follow_date] <= _SlicerStart,
+			        dim_users[last_seen_date]    >= _SlicerStart
+			    )
+			RETURN
+			_EndCount - _StartCount
+		formatString: 0
+		displayFolder: Followers\Growth
+		lineageTag: 217b832a-4577-46ad-a5a9-d5ae4484a21f
+
+	/// Net follower growth as a percentage of starting follower count for the selected date range.
+	measure 'Users Net Growth %' =
+			
+			VAR _MinDateSelected = MIN('dim_date'[Date])
+			VAR _EndCount        = [Total Followers]
+			VAR _StartCount      =
+			    CALCULATE(
+			        COUNTROWS(dim_users),
+			        ALL(dim_users),
+			        dim_users[Is Follower] = TRUE(),
+			        dim_users[first_follow_date] <= _MinDateSelected,
+			        dim_users[last_seen_date]    >= _MinDateSelected
+			    )
+			VAR _Diff = _EndCount - _StartCount
+			RETURN
+			IF(_StartCount > 0, DIVIDE(_Diff, _StartCount, BLANK()), BLANK())
+		formatString: 0.0%;-0.0%;0.0%
+		displayFolder: Followers\Growth
+		lineageTag: 1fb69cf5-3c73-4561-86d4-1218566093bd
+
+	/// Follower count on the last date of the selected range. For point-in-time range KPIs.
+	measure 'Total Followers (as of End)' =
+			
+			VAR _end = [Selected End Date]
+			RETURN
+			CALCULATE(
+			    COUNTROWS(dim_users),
+			    ALL(dim_users),
+			    dim_users[Is Follower] = TRUE(),
+			    dim_users[first_follow_date] <= _end,
+			    dim_users[last_seen_date]    >= _end
+			)
+		formatString: 0
+		displayFolder: Followers
+		lineageTag: 45b4d194-47d4-409c-9655-e9026b61d7fa
+
+	/// Follower count on the day before the selected range starts. Used as opening baseline for growth calculations.
+	measure 'Total Followers (as of Start-1)' =
+			
+			VAR _startMinus1 = MIN('dim_date'[Date]) - 1
+			RETURN
+			CALCULATE(
+			    COUNTROWS(dim_users),
+			    ALL(dim_users),
+			    dim_users[Is Follower] = TRUE(),
+			    dim_users[first_follow_date] <= _startMinus1,
+			    dim_users[last_seen_date]    >= _startMinus1
+			)
+		formatString: 0
+		displayFolder: Followers
+		lineageTag: 41bf848c-938c-408a-9135-f27e06edb14b
+
+	/// Count of users (Is Follower = TRUE) whose first_follow_date falls within the week containing the current date context. Uses WEEKNUM with Monday start (type 2). Place on Y Axis of Scatter Chart. Note: first_follow_date reflects first scraper capture, not the true follow date for users acquired before the scraper launched.
+	measure 'New Followers This Week' =
+			
+			CALCULATE(
+			    COUNTROWS(dim_users),
+			    dim_users[Is Follower] = TRUE(),
+			    WEEKNUM(dim_users[first_follow_date], 2)
+			        = WEEKNUM(MAX(dim_date[Date]), 2),
+			    YEAR(dim_users[first_follow_date])
+			        = YEAR(MAX(dim_date[Date]))
+			)
+		formatString: 0
+		displayFolder: Followers
+		lineageTag: 89ed9276-2027-432f-a8b4-681d71adccd2
+
+	column username
+		dataType: string
+		lineageTag: 03c7cac1-e23e-42e0-9131-985c47244034
+		summarizeBy: none
+		sourceColumn: username
+
+		annotation SummarizationSetBy = Automatic
+
+	column 'Is Follower'
+		dataType: boolean
+		formatString: """TRUE"";""TRUE"";""FALSE"""
+		lineageTag: 54939b0f-3049-4ddc-b955-11de85b8c2ca
+		summarizeBy: none
+		sourceColumn: Is Follower
+
+		annotation SummarizationSetBy = Automatic
+
+	column first_follow_date
+		dataType: dateTime
+		formatString: Long Date
+		lineageTag: 029f452b-6ea8-45c6-9729-aa629c0c817b
+		summarizeBy: none
+		sourceColumn: first_follow_date
+
+		variation Variation
+			isDefault
+			relationship: 98617e82-0499-4710-a19e-8efb4e0d8f6d
+			defaultHierarchy: LocalDateTable_4c3db531-8374-4113-81e2-038ec95f412f.'Date Hierarchy'
+
+		annotation SummarizationSetBy = Automatic
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	column last_seen_date
+		dataType: dateTime
+		formatString: Long Date
+		lineageTag: 86282764-5a90-4bdf-93c6-38bf0ef7f1ac
+		summarizeBy: none
+		sourceColumn: last_seen_date
+
+		variation Variation
+			isDefault
+			relationship: 9f092b7d-3afc-4ab0-84d5-af92d8fb8bce
+			defaultHierarchy: LocalDateTable_4fc2801c-8d2f-4bc0-9783-4260f2cee45f.'Date Hierarchy'
+
+		annotation SummarizationSetBy = Automatic
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	column username_url
+		dataType: string
+		lineageTag: ebb14720-b575-4c3f-8ba5-d9f1f479d05b
+		dataCategory: WebUrl
+		summarizeBy: none
+		sourceColumn: username_url
+
+		annotation SummarizationSetBy = Automatic
+
+	/// Per-user most recent engagement date — MAX of comment_date and liker RunDate for this user only. Uses RELATEDTABLE for correct row-level filtering.
+	column 'Last Engagement Date' =
+			
+			VAR LastCommentDate = MAXX(RELATEDTABLE(fact_posts_comments), fact_posts_comments[comment_date])
+			VAR LastLikeDate    = MAXX(RELATEDTABLE(fact_posts_likers),   fact_posts_likers[RunDate])
+			RETURN MAX(LastCommentDate, LastLikeDate)
+		dataType: dateTime
+		formatString: Short Date
+		lineageTag: 52f84eac-6889-490c-90a3-f3b1bed81145
+		summarizeBy: none
+
+		variation Variation
+			isDefault
+			relationship: 71d4601d-e662-45cc-88e1-878561656f19
+			defaultHierarchy: LocalDateTable_ed0f43e1-34d1-4d6a-bc0a-31dbba47d438.'Date Hierarchy'
+
+	/// Integer count of days since this user last liked or commented. BLANK for users with no engagement on record.
+	column 'Days Since Last Engagement' =
+			
+			VAR d = [Last Engagement Date]
+			RETURN IF(ISBLANK(d), BLANK(), DATEDIFF(d, TODAY(), DAY))
+		dataType: int64
+		formatString: 0
+		lineageTag: 7f6f5b1c-15e5-4e60-b0ac-f68124c7ce7c
+		summarizeBy: sum
+
+		annotation SummarizationSetBy = Automatic
+
+	/// 5-tier engagement recency label. Use for audience segmentation visuals. Sort by Engagement Bucket Sort.
+	column 'Engagement Bucket' =
+			
+			VAR _DaysSince = [Days Since Last Engagement]
+			RETURN
+			SWITCH(
+			    TRUE(),
+			    ISBLANK(_DaysSince),  "5. Never Engaged",
+			    _DaysSince <= 7,      "1. Active (0-7 days)",
+			    _DaysSince <= 30,     "2. Recent (8-30 days)",
+			    _DaysSince <= 90,     "3. Lapsed (31-90 days)",
+			                          "4. Inactive (90+ days)"
+			)
+		dataType: string
+		lineageTag: b205ceb7-83f0-4705-92a2-68f668973aa6
+		summarizeBy: none
+		sortByColumn: 'Engagement Bucket Sort'
+
+	/// Integer sort key for Engagement Bucket. Set as Sort By Column for Engagement Bucket. Hidden from Report View.
+	column 'Engagement Bucket Sort' =
+			
+			VAR _DaysSince = [Days Since Last Engagement]
+			RETURN
+			SWITCH(
+			    TRUE(),
+			    ISBLANK(_DaysSince), 5,
+			    _DaysSince <= 7,     1,
+			    _DaysSince <= 30,    2,
+			    _DaysSince <= 90,    3,
+			                         4
+			)
+		dataType: int64
+		isHidden
+		formatString: 0
+		lineageTag: 9320f102-b72e-4ea5-8188-29f68ee02ce0
+		summarizeBy: sum
+
+		annotation SummarizationSetBy = Automatic
+
+	/// Simplified 3-tier engagement bucket for compact visuals (donut charts, gauge labels). Maps to the same underlying recency logic as Engagement Bucket.
+	column 'Engagement Bucket (3)' =
+			
+			VAR _DaysSince = [Days Since Last Engagement]
+			RETURN
+			SWITCH(
+			    TRUE(),
+			    ISBLANK(_DaysSince), "No engagement yet",
+			    _DaysSince <= 7,     "0-7 days",
+			    _DaysSince <= 30,    "8-30 days",
+			                         "31+ days"
+			)
+		dataType: string
+		lineageTag: 6047a55f-522f-4416-bbc4-db620440dc01
+		summarizeBy: none
+		sortByColumn: 'Engagement Bucket Sort'
+
+	partition dim_users = m
+		mode: import
+		source =
+				let
+				    // ── Source tables ─────────────────────────────────────────────────────────
+				    Followers  = Table.SelectColumns(dim_followers, {"username", "first_follow_date", "last_seen_date", "username_url"}),
+				    Likers     = Table.SelectColumns(fact_posts_likers,  {"username"}),
+				    Commenters = Table.SelectColumns(fact_posts_comments, {"username"}),
+				
+				    // ── Build full universe of usernames ───────────────────────────────────────
+				    AllUsers_Raw = Table.Combine({
+				        Table.AddColumn(Likers,     "_src", each "liker"),
+				        Table.AddColumn(Commenters, "_src", each "commenter"),
+				        Table.AddColumn(
+				            Table.SelectColumns(Followers, {"username"}),
+				            "_src", each "follower")
+				    }),
+				
+				    // ── Deduplicate — one row per username ─────────────────────────────────────
+				    AllUsers_Distinct = Table.Distinct(
+				        Table.SelectColumns(AllUsers_Raw, {"username"}),
+				        {"username"}
+				    ),
+				
+				    // ── Join follower attributes (LEFT JOIN via merge) ─────────────────────────
+				    Merged = Table.NestedJoin(
+				        AllUsers_Distinct, {"username"},
+				        Followers,         {"username"},
+				        "_follower_data",
+				        JoinKind.LeftOuter
+				    ),
+				
+				    // ── Expand follower date columns and URL ──────────────────────────────────
+				    Expanded = Table.ExpandTableColumn(
+				        Merged, "_follower_data",
+				        {"first_follow_date", "last_seen_date", "username_url"},
+				        {"first_follow_date", "last_seen_date", "username_url"}
+				    ),
+				
+				    // ── Add Is Follower flag ──────────────────────────────────────────────────
+				    WithFlag = Table.AddColumn(
+				        Expanded,
+				        "Is Follower",
+				        each [first_follow_date] <> null,
+				        type logical
+				    ),
+				
+				    // ── Set final types ───────────────────────────────────────────────────────
+				    Typed = Table.TransformColumnTypes(WithFlag, {
+				        {"username",         type text},
+				        {"Is Follower",      type logical},
+				        {"first_follow_date", type date},
+				        {"last_seen_date",    type date},
+				        {"username_url",     type text}
+				    }),
+				
+				    // ── Final column order ─────────────────────────────────────────────────────
+				    Result = Table.ReorderColumns(Typed,
+				        {"username", "Is Follower", "first_follow_date", "last_seen_date", "username_url"},
+				        MissingField.Ignore
+				    )
+				in
+				    Result
+
+	annotation PBI_NavigationStepName = Navigation
+
+	annotation PBI_ResultType = Table
+

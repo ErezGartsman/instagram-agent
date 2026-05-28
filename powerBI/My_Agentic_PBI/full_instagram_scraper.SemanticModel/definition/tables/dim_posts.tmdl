@@ -1,0 +1,231 @@
+table dim_posts
+	lineageTag: 56f8bc60-3beb-4ac8-b312-d37f2f4fb8b5
+
+	measure 'Total Posts' = COUNTROWS('dim_posts')
+		formatString: 0
+		displayFolder: Posts
+		lineageTag: 8863d93b-0559-4a0f-8cf2-96a24f2da116
+
+		changedProperty = IsHidden
+
+	/// URL of the post. Sourced from dim_posts[post_url] via the post dimension. Use as an image URL data category field for thumbnail visuals.
+	measure 'Post Image URL' = MAX('dim_posts'[post_url])
+		displayFolder: Posts
+		lineageTag: 02a03a2a-4f70-4d6a-8094-405a4aaa7b7e
+		dataCategory: WebUrl
+
+		changedProperty = IsHidden
+
+	/// Number of posts published in the week containing the current date context. Uses WEEKNUM with Monday start (type 2). Place on X Axis of Scatter Chart with dim_date[Week Key] in Details.
+	measure 'Weekly Post Count' =
+			
+			COUNTROWS(
+			    FILTER(
+			        dim_posts,
+			        WEEKNUM(dim_posts[post_date], 2)
+			            = WEEKNUM(MAX(dim_date[Date]), 2)
+			        && YEAR(dim_posts[post_date])
+			            = YEAR(MAX(dim_date[Date]))
+			    )
+			)
+		formatString: 0
+		displayFolder: Posts
+		lineageTag: 5ebab9a4-eecc-46d0-855e-0ba5729a8831
+
+	column post_shortcode
+		dataType: string
+		lineageTag: adb42c5e-5feb-47d8-8a01-7ef5742739a5
+		summarizeBy: none
+		sourceColumn: post_shortcode
+
+		changedProperty = IsHidden
+
+		annotation SummarizationSetBy = Automatic
+
+	column post_url
+		dataType: string
+		lineageTag: e73bb9ef-dce6-4d17-9a0f-e363a8e675db
+		dataCategory: WebUrl
+		summarizeBy: none
+		sourceColumn: post_url
+
+		changedProperty = IsHidden
+
+		annotation SummarizationSetBy = Automatic
+
+	column RunDate
+		dataType: dateTime
+		formatString: Long Date
+		lineageTag: 5a595960-47ff-45a7-9dc9-5909dab9052e
+		summarizeBy: none
+		sourceColumn: RunDate
+
+		variation Variation
+			isDefault
+			relationship: f105db84-c71e-4b48-b590-a3515b139881
+			defaultHierarchy: LocalDateTable_ddb893ff-c1b8-4eea-84fb-6f33b5e3147e.'Date Hierarchy'
+
+		changedProperty = IsHidden
+
+		annotation SummarizationSetBy = Automatic
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	column 'Days Since Post' =
+			
+			VAR d = 'dim_posts'[post_date]
+			VAR diff = DATEDIFF(d, TODAY(), DAY)
+			RETURN
+			IF(ISBLANK(d), BLANK(), IF(diff < 0, 0, diff))
+		formatString: 0
+		lineageTag: c496c513-d1d9-44cb-ac7d-83aa851c9a93
+		summarizeBy: sum
+
+		changedProperty = IsHidden
+
+		annotation SummarizationSetBy = Automatic
+
+	column 'Post Freshness Bucket (3)' =
+			
+			VAR days = [Days Since Post]
+			RETURN
+			SWITCH (
+			    TRUE(),
+			    ISBLANK ( days ), "Unknown",
+			    days <= 7,        "0–7 days",
+			    days <= 30,       "8–30 days",
+			                      "31+ days"
+			)
+		lineageTag: 06bcafa6-3b7c-448a-9550-70e7008b7fbc
+		summarizeBy: none
+		sortByColumn: 'Post Freshness Sort'
+
+		changedProperty = IsHidden
+
+		changedProperty = SortByColumn
+
+		annotation SummarizationSetBy = Automatic
+
+	column post_type =
+			
+			SWITCH(
+			    TRUE(),
+			    CONTAINSSTRING([post_url], "reel"), "Reel",
+			    CONTAINSSTRING([post_url], "/p/"), "Photo", "Other"
+			)
+		lineageTag: e995949d-af37-4b19-b557-67ccbc402d48
+		summarizeBy: none
+
+		changedProperty = IsHidden
+
+		annotation SummarizationSetBy = Automatic
+
+	column 'Post Freshness Sort' =
+			
+			VAR days = [Days Since Post]
+			RETURN
+			SWITCH (
+			    TRUE(),
+			    days <= 7,        1,
+			    days <= 30,       2,
+			    ISBLANK ( days ), 4,
+			                      3
+			)
+		formatString: 0
+		lineageTag: 12ac6371-2d83-4aeb-a453-410d41e414d4
+		summarizeBy: sum
+
+		changedProperty = IsHidden
+
+		annotation SummarizationSetBy = Automatic
+
+	column Full_Date_Time
+		dataType: dateTime
+		formatString: Short Date
+		lineageTag: 75f52522-4e6e-44c2-8b7b-33decdefafd4
+		summarizeBy: none
+		sourceColumn: Full_Date_Time
+
+		variation Variation
+			isDefault
+			relationship: 9d74ddeb-adea-4191-815f-2000e27c0a78
+			defaultHierarchy: LocalDateTable_861b19af-e9ea-4352-aeba-235a27d606e0.'Date Hierarchy'
+
+		changedProperty = IsHidden
+
+		annotation SummarizationSetBy = Automatic
+
+	column 'Post Hour' = HOUR('dim_posts'[Full_Date_Time])
+		formatString: 0
+		lineageTag: c46acceb-9889-4c15-9f7d-55f94f43357c
+		summarizeBy: sum
+
+		changedProperty = IsHidden
+
+		annotation SummarizationSetBy = Automatic
+
+	column post_date
+		dataType: dateTime
+		formatString: Long Date
+		lineageTag: ec231d6d-5ade-453d-87e1-19f532269fa1
+		summarizeBy: none
+		sourceColumn: post_date
+
+		changedProperty = IsHidden
+
+		annotation SummarizationSetBy = Automatic
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	partition dim_posts = m
+		mode: import
+		source =
+				let
+				    // <<< UPDATE THIS PATH IF NEEDED >>>
+				    FolderPath = "C:\Users\Erez\OneDrive - Bar-Ilan University - Students\Desktop\instagram project\data\instagram_media\2026-03-03",
+				
+				    Source      = Folder.Files(FolderPath),
+				    // keep only posts files
+				    KeepPosts   = Table.SelectRows(Source, each [Name] = "batch_posts.csv" and [Extension] = ".csv"),
+				    // add RunDate from folder name (last 10 chars before trailing slash)
+				    WithRunDate = Table.AddColumn(
+				        KeepPosts, "RunDate",
+				        each try Date.FromText(Text.End(Text.TrimEnd([Folder Path], "\"), 10)) otherwise null,
+				        type date
+				    ),
+				    // read each CSV and inject RunDate inside
+				    ReadEach    = Table.AddColumn(WithRunDate, "Data", each
+				        let
+				            raw   = Csv.Document([Content], [Delimiter=",", Encoding=65001, QuoteStyle=QuoteStyle.Csv]),
+				            hdr   = Table.PromoteHeaders(raw, [PromoteAllScalars=true]),
+				            typed = Table.TransformColumnTypes(hdr,{
+				                        {"post_shortcode", type text},
+				                        {"post_url", type text},
+				                        {"posted_at", type text}
+				                    }),
+				            addRD = Table.AddColumn(typed, "RunDate", (r)=> [RunDate], type date)
+				        in  addRD
+				    ),
+				    Combined    = Table.Combine(ReadEach[Data]),
+				    #"Changed Type" = Table.TransformColumnTypes(Combined,{{"posted_at", type datetime}}),
+				    #"Inserted Date" = Table.AddColumn(#"Changed Type", "Date", each DateTime.Date([posted_at]), type date),
+				    #"Renamed Columns" = Table.RenameColumns(#"Inserted Date",{{"Date", "posted"}}),
+				    #"Removed Duplicates" = Table.Distinct(#"Renamed Columns", {"post_shortcode"}),
+				    #"Renamed Columns1" = Table.RenameColumns(#"Removed Duplicates",{{"posted", "post_date"}, {"posted_at", "Full_Date_Time"}}),
+				    #"Reordered Columns" = Table.ReorderColumns(#"Renamed Columns1",{"post_shortcode", "post_url", "post_date", "RunDate", "Full_Date_Time"}),
+				    #"Added Custom" = Table.AddColumn(#"Reordered Columns", "Effective_Date", each if [post_date] <> null then [post_date] else [RunDate]),
+				    #"Changed Type1" = Table.TransformColumnTypes(#"Added Custom",{{"Effective_Date", type date}}),
+				    #"Removed Columns" = Table.RemoveColumns(#"Changed Type1",{"post_date"}),
+				    #"Renamed Columns2" = Table.RenameColumns(#"Removed Columns",{{"Effective_Date", "post_date"}}),
+				    #"Reordered Columns1" = Table.ReorderColumns(#"Renamed Columns2",{"post_shortcode", "post_url", "post_date", "RunDate", "Full_Date_Time"}),
+				    #"Sorted Rows" = Table.Sort(#"Reordered Columns1",{{"RunDate", Order.Descending}}),
+				    #"Removed Duplicates1" = Table.Distinct(#"Sorted Rows", {"post_shortcode"}),
+				    #"Removed Duplicates2" = Table.Distinct(#"Removed Duplicates1", {"post_shortcode"}),
+				    #"Filtered Rows" = Table.SelectRows(#"Removed Duplicates2", each ([post_shortcode] <> ""))
+				in
+				    #"Filtered Rows"
+
+	annotation PBI_NavigationStepName = Navigation
+
+	annotation PBI_ResultType = Table
+

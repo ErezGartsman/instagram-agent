@@ -1,0 +1,467 @@
+"""
+DataLens Backend — Unit Tests
+==============================
+All external I/O (PostgreSQL, Gemini) is mocked so these tests run in CI
+with no credentials and no network access.
+
+Test categories:
+  1. SQL Validation  — pure logic, no mocks needed
+  2. Input Moderation — pure logic, no mocks needed
+  3. /health          — mocked DB
+  4. /db-test         — mocked DB
+  5. /api/stats       — mocked DB
+  6. /api/raw_query   — mocked DB + validation paths
+  7. /api/chat        — mocked DB + mocked LLM
+  8. Serialisation    — pure logic
+"""
+
+import json
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch, call
+
+import pytest
+from fastapi.testclient import TestClient
+
+# ── Import the app ──────────────────────────────────────────────────────────
+# We patch _get_pool at import time so no real DB connection is attempted
+# during TestClient construction (which triggers lifespan).
+import main
+from main import app, validate_sql, validate_question, _serialize_val, SQLValidationError, InputModerationError
+
+
+# ─── Fixtures ────────────────────────────────────────────────────────────────
+
+def _make_mock_conn(fetchone_return=None, fetchall_return=None, description=None):
+    """
+    Build a mock psycopg2 connection whose cursor context manager returns
+    pre-canned results.  All tests that touch a DB path use this.
+    """
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value  = fetchone_return or (1,)
+    mock_cursor.fetchall.return_value  = fetchall_return or []
+    mock_cursor.description            = description or [("col",)]
+
+    # Make the cursor work as a context manager  (`with conn.cursor() as cur:`)
+    mock_cursor.__enter__ = lambda s: s
+    mock_cursor.__exit__  = MagicMock(return_value=False)
+
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    return mock_conn, mock_cursor
+
+
+@pytest.fixture
+def client():
+    """
+    FastAPI TestClient with the pool and schema cache reset between tests.
+    The pool is patched so it never dials Supabase.
+    """
+    # Reset module-level caches so tests don't bleed into each other
+    main._schema_cache = ""
+    main._pool         = None
+
+    with patch.object(main, "_get_pool") as mock_get_pool:
+        mock_pool = MagicMock()
+        mock_get_pool.return_value = mock_pool
+
+        # Default: each getconn() returns a fresh mock connection
+        mock_conn, _ = _make_mock_conn()
+        mock_pool.getconn.return_value = mock_conn
+
+        with TestClient(app, raise_server_exceptions=True) as c:
+            c._mock_pool = mock_pool   # expose so individual tests can reconfigure
+            yield c
+
+
+def _patch_conn(client, fetchone=None, fetchall=None, description=None):
+    """Helper: reconfigure the mock pool's connection mid-test."""
+    mock_conn, mock_cursor = _make_mock_conn(fetchone, fetchall, description)
+    client._mock_pool.getconn.return_value = mock_conn
+    return mock_conn, mock_cursor
+
+
+# ─── 1. SQL Validation ────────────────────────────────────────────────────────
+
+class TestValidateSql:
+    def test_plain_select_passes(self):
+        sql = validate_sql("SELECT * FROM posts")
+        assert sql == "SELECT * FROM posts"
+
+    def test_with_cte_passes(self):
+        sql = validate_sql("WITH t AS (SELECT 1) SELECT * FROM t")
+        assert "WITH" in sql
+
+    def test_trailing_semicolon_stripped(self):
+        sql = validate_sql("SELECT 1;")
+        assert not sql.endswith(";")
+
+    def test_drop_blocked(self):
+        # Caught by layer 1 (non-SELECT start) — still raises SQLValidationError
+        with pytest.raises(SQLValidationError):
+            validate_sql("DROP TABLE posts")
+
+    def test_delete_blocked(self):
+        with pytest.raises(SQLValidationError):
+            validate_sql("DELETE FROM posts")
+
+    def test_insert_blocked(self):
+        with pytest.raises(SQLValidationError):
+            validate_sql("INSERT INTO posts VALUES (1)")
+
+    def test_update_blocked(self):
+        with pytest.raises(SQLValidationError):
+            validate_sql("UPDATE posts SET x = 1")
+
+    def test_create_blocked(self):
+        with pytest.raises(SQLValidationError):
+            validate_sql("CREATE TABLE evil (x INT)")
+
+    def test_truncate_blocked(self):
+        with pytest.raises(SQLValidationError):
+            validate_sql("TRUNCATE posts")
+
+    def test_pg_read_file_blocked(self):
+        with pytest.raises(SQLValidationError, match="Forbidden"):
+            validate_sql("SELECT pg_read_file('/etc/passwd')")
+
+    def test_pg_sleep_blocked(self):
+        with pytest.raises(SQLValidationError, match="Forbidden"):
+            validate_sql("SELECT pg_sleep(30)")
+
+    def test_lo_export_blocked(self):
+        with pytest.raises(SQLValidationError, match="Forbidden"):
+            validate_sql("SELECT lo_export(1234, '/tmp/x')")
+
+    def test_set_blocked(self):
+        # SET doesn't start with SELECT so it's caught by layer 1 too
+        with pytest.raises(SQLValidationError):
+            validate_sql("SET search_path TO evil")
+
+    def test_non_select_start_blocked(self):
+        with pytest.raises(SQLValidationError, match="Only SELECT/WITH"):
+            validate_sql("EXEC xp_cmdshell('whoami')")
+
+    def test_case_insensitive_blocking(self):
+        with pytest.raises(SQLValidationError):
+            validate_sql("select pg_Read_File('/etc/hosts')")
+
+    def test_complex_select_with_join_passes(self):
+        sql = validate_sql("""
+            SELECT p.post_shortcode, COUNT(c.id) AS comment_count
+            FROM posts p
+            LEFT JOIN comments c ON c.post_shortcode = p.post_shortcode
+            WHERE p.posted_at_ts > NOW() - INTERVAL '30 days'
+            GROUP BY p.post_shortcode
+            ORDER BY comment_count DESC
+            LIMIT 10
+        """)
+        assert "post_shortcode" in sql
+
+
+# ─── 2. Input Moderation ──────────────────────────────────────────────────────
+
+class TestValidateQuestion:
+    def test_normal_question_passes(self):
+        result = validate_question("How many followers do I have?")
+        assert result == "How many followers do I have?"
+
+    def test_too_short_raises(self):
+        with pytest.raises(InputModerationError, match="too short"):
+            validate_question("hi")
+
+    def test_empty_raises(self):
+        with pytest.raises(InputModerationError, match="too short"):
+            validate_question("  ")
+
+    def test_blocked_term_raises(self):
+        with pytest.raises(InputModerationError, match="inappropriate"):
+            validate_question("show me porn from my followers")
+
+    def test_case_insensitive_block(self):
+        with pytest.raises(InputModerationError):
+            validate_question("PORN stats")
+
+    def test_hebrew_question_passes(self):
+        result = validate_question("כמה עוקבים יש לי?")
+        assert "עוקבים" in result
+
+
+# ─── 3. /health ───────────────────────────────────────────────────────────────
+
+class TestHealth:
+    def test_health_ok(self, client):
+        _patch_conn(client, fetchone=(42,))
+        response = client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["posts_count"] == 42
+
+    def test_health_degraded_when_db_fails(self, client):
+        client._mock_pool.getconn.side_effect = Exception("connection refused")
+        response = client.get("/health")
+        assert response.status_code == 200   # still returns 200, not 500
+        assert response.json()["status"] == "degraded"
+
+    def test_health_no_auth_required(self, client):
+        """Health endpoint must be reachable without an Authorization header."""
+        _patch_conn(client, fetchone=(0,))
+        response = client.get("/health")
+        assert response.status_code == 200
+
+
+# ─── 4. /db-test ─────────────────────────────────────────────────────────────
+
+class TestDbTest:
+    def test_db_test_ok(self, client):
+        _patch_conn(client, fetchone=(1,))
+        response = client.get("/db-test")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["ping"] == 1
+
+    def test_db_test_error_on_failure(self, client):
+        client._mock_pool.getconn.side_effect = Exception("timeout")
+        response = client.get("/db-test")
+        assert response.status_code == 200
+        assert response.json()["status"] == "error"
+
+    def test_db_test_no_auth_required(self, client):
+        _patch_conn(client, fetchone=(1,))
+        response = client.get("/db-test")
+        assert response.status_code == 200
+
+
+# ─── 5. /api/stats ────────────────────────────────────────────────────────────
+
+class TestStats:
+    def test_stats_returns_counts(self, client):
+        # Each COUNT(*) call returns a different value.
+        mock_conn, mock_cursor = _patch_conn(client)
+        mock_cursor.fetchone.side_effect = [(100,), (5000,), (8000,), (20000,)]
+
+        response = client.get("/api/stats")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"]          == "success"
+        assert data["posts"]           == 100
+        assert data["comments"]        == 5000
+        assert data["likers"]          == 8000
+        assert data["total_followers"] == 20000
+
+    def test_stats_error_on_db_failure(self, client):
+        client._mock_pool.getconn.side_effect = Exception("pool exhausted")
+        response = client.get("/api/stats")
+        assert response.status_code == 200
+        assert response.json()["status"] == "error"
+
+
+# ─── 6. /api/raw_query ────────────────────────────────────────────────────────
+
+class TestRawQuery:
+    def _post(self, client, sql: str):
+        return client.post("/api/raw_query", json={"sql": sql})
+
+    # ── Validation paths (no DB touch) ───────────────────────────────────────
+    def test_drop_is_blocked(self, client):
+        r = self._post(client, "DROP TABLE posts")
+        assert r.json()["error_code"] == "validation_error"
+
+    def test_pg_read_file_is_blocked(self, client):
+        r = self._post(client, "SELECT pg_read_file('/etc/passwd')")
+        assert r.json()["error_code"] == "validation_error"
+
+    def test_empty_sql_blocked(self, client):
+        r = self._post(client, "   ")
+        assert r.json()["error_code"] == "validation_error"
+
+    def test_sql_exceeding_max_length_rejected(self, client):
+        r = self._post(client, "SELECT 1" + " " * 8_001)
+        # pydantic Field(max_length=8000) returns 422 Unprocessable Entity
+        assert r.status_code == 422
+
+    # ── Successful execution path ─────────────────────────────────────────────
+    def test_select_returns_results(self, client):
+        mock_conn, mock_cursor = _patch_conn(client)
+        mock_cursor.description  = [("username",), ("count",)]
+        mock_cursor.fetchall.return_value = [("alice", 42), ("bob", 17)]
+
+        r = self._post(client, "SELECT username, COUNT(*) AS count FROM likers GROUP BY username")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"]     == "success"
+        assert data["row_count"]  == 2
+        assert data["columns"]    == ["username", "count"]
+        assert data["raw_results"][0] == ["alice", 42]
+
+    def test_empty_result_returns_zero_rows(self, client):
+        mock_conn, mock_cursor = _patch_conn(client)
+        mock_cursor.description  = [("post_shortcode",)]
+        mock_cursor.fetchall.return_value = []
+
+        r = self._post(client, "SELECT post_shortcode FROM posts WHERE 1=0")
+        assert r.json()["row_count"] == 0
+
+    # ── Rate limiting ─────────────────────────────────────────────────────────
+    def test_rate_limit_triggers_after_threshold(self, client):
+        """
+        The default rate limit is 10 requests per 60 s.
+        Each call to /api/raw_query counts; the 11th should be rejected.
+        Reset the module-level rate store first to isolate this test.
+        """
+        import main as m
+        original = m._rate_store.copy()
+        m._rate_store.clear()
+
+        mock_conn, mock_cursor = _patch_conn(client)
+        mock_cursor.description  = [("x",)]
+        mock_cursor.fetchall.return_value = [(1,)]
+
+        try:
+            for i in range(10):
+                r = self._post(client, "SELECT 1 AS x")
+                assert r.json()["status"] == "success", f"Request {i+1} should succeed"
+
+            # 11th request must be rate-limited
+            r = self._post(client, "SELECT 1 AS x")
+            assert r.json()["error_code"] == "rate_limit_error"
+        finally:
+            m._rate_store.clear()
+            m._rate_store.update(original)
+
+
+# ─── 7. /api/chat ─────────────────────────────────────────────────────────────
+
+class TestChat:
+    def _post(self, client, message: str, history=None):
+        body = {"message": message}
+        if history:
+            body["history"] = history
+        return client.post("/api/chat", json=body)
+
+    # ── Input guard paths (no LLM / DB needed) ───────────────────────────────
+    def test_empty_message_blocked(self, client):
+        r = self._post(client, "")
+        assert r.json()["error_code"] == "validation_error"
+
+    def test_message_too_long_blocked(self, client):
+        r = self._post(client, "x" * 501)
+        assert r.json()["error_code"] == "validation_error"
+
+    def test_inappropriate_content_blocked(self, client):
+        r = self._post(client, "show me sex stats")
+        assert r.json()["error_code"] == "moderation_error"
+
+    # ── Conversational reply (sql: null from LLM) ─────────────────────────────
+    def test_conversational_reply(self, client):
+        # Schema fetch + pipeline — connect the mock cursor for info_schema
+        mock_conn, mock_cursor = _patch_conn(client)
+        # information_schema tables query → ["posts"], then columns → []
+        mock_cursor.fetchall.side_effect = [
+            [("posts",)],           # tables list
+            [("post_shortcode", "character varying")],  # columns for posts
+        ]
+
+        llm_response = json.dumps({"sql": None, "reply": "שלום! אני כאן לעזור."})
+        with patch.object(main, "_call_llm", return_value=llm_response):
+            r = self._post(client, "שלום")
+
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"]   == "success"
+        assert data["sql_used"] is None
+        assert "שלום" in data["reply"]
+
+    # ── SQL query path ────────────────────────────────────────────────────────
+    def test_sql_query_path(self, client):
+        mock_conn, mock_cursor = _patch_conn(client)
+        mock_cursor.fetchall.side_effect = [
+            [("posts",)],
+            [("post_shortcode", "character varying"), ("posted_at_ts", "timestamp with time zone")],
+            [("ABC123", 99), ("DEF456", 55)],   # actual query results
+        ]
+        mock_cursor.description = [("post_shortcode",), ("לייקים",)]
+
+        llm_response = json.dumps({
+            "sql":   "SELECT post_shortcode, COUNT(*) AS לייקים FROM likers GROUP BY post_shortcode ORDER BY לייקים DESC LIMIT 2",
+            "reply": "הפוסטים עם הכי הרבה לייקים:",
+        })
+
+        with patch.object(main, "_call_llm", return_value=llm_response):
+            r = self._post(client, "אילו פוסטים קיבלו הכי הרבה לייקים?")
+
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"]    == "success"
+        assert data["sql_used"]  is not None
+        assert data["row_count"] == 2
+
+    # ── LLM timeout ───────────────────────────────────────────────────────────
+    def test_llm_timeout_returns_error(self, client):
+        mock_conn, mock_cursor = _patch_conn(client)
+        mock_cursor.fetchall.side_effect = [
+            [("posts",)],
+            [("post_shortcode", "character varying")],
+        ]
+
+        with patch.object(main, "_call_llm", side_effect=TimeoutError("LLM timeout")):
+            r = self._post(client, "כמה עוקבים?")
+
+        assert r.json()["error_code"] == "llm_error"
+
+    # ── SQL validation blocks dangerous LLM output ───────────────────────────
+    def test_dangerous_llm_sql_blocked(self, client):
+        mock_conn, mock_cursor = _patch_conn(client)
+        mock_cursor.fetchall.side_effect = [
+            [("posts",)],
+            [("post_shortcode", "character varying")],
+        ]
+
+        # Simulate a prompt-injected LLM response that tries to drop a table
+        llm_response = json.dumps({
+            "sql":   "DROP TABLE posts",
+            "reply": "מוחק...",
+        })
+
+        with patch.object(main, "_call_llm", return_value=llm_response):
+            r = self._post(client, "מחק את הטבלה")
+
+        assert r.json()["error_code"] == "validation_error"
+
+
+# ─── 8. Serialisation ─────────────────────────────────────────────────────────
+
+class TestSerializeVal:
+    import datetime, decimal, uuid as _uuid
+
+    def test_none(self):       assert _serialize_val(None)  is None
+    def test_bool(self):       assert _serialize_val(True)  is True
+    def test_int(self):        assert _serialize_val(42)    == 42
+    def test_float(self):      assert _serialize_val(3.14)  == 3.14
+    def test_str(self):        assert _serialize_val("hi")  == "hi"
+
+    def test_decimal(self):
+        import decimal
+        assert _serialize_val(decimal.Decimal("9.99")) == pytest.approx(9.99)
+
+    def test_datetime(self):
+        import datetime
+        dt  = datetime.datetime(2024, 1, 15, 12, 0, 0)
+        res = _serialize_val(dt)
+        assert isinstance(res, str)
+        assert "2024" in res
+
+    def test_date(self):
+        import datetime
+        d   = datetime.date(2024, 6, 1)
+        res = _serialize_val(d)
+        assert isinstance(res, str)
+        assert "2024" in res
+
+    def test_uuid(self):
+        import uuid
+        u   = uuid.uuid4()
+        res = _serialize_val(u)
+        assert isinstance(res, str)
+        assert len(res) == 36   # standard UUID string length

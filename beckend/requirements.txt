@@ -1,0 +1,21 @@
+# DataLens Backend — pinned production dependencies
+# Install: pip install -r requirements.txt
+
+# Web framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+
+# Settings & validation
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# PostgreSQL
+psycopg2-binary>=2.9.0
+
+# LLM — use the new google-genai SDK (google-generativeai is deprecated)
+google-genai>=1.0.0
+
+# Testing (CI only — not needed in production image)
+pytest>=8.0.0
+httpx>=0.27.0          # required by FastAPI TestClient
+pytest-mock>=3.14.0

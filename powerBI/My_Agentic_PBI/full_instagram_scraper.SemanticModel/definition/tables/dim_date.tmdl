@@ -1,0 +1,143 @@
+table dim_date
+	lineageTag: 8b0c073d-c616-40ea-af21-c23c45b1db96
+
+	measure user = USERPRINCIPALNAME()
+		isHidden
+		displayFolder: Internal
+		lineageTag: 53a8e643-811c-4063-a7ca-aacd77c68351
+
+	column Date
+		formatString: dd/mm/yyyy
+		lineageTag: 1c07b314-c316-4d48-87c4-32f210e0e2c4
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [Date]
+
+		variation Variation
+			isDefault
+			relationship: dc90578d-0db2-4cf3-b3b6-94d920f401d5
+			defaultHierarchy: LocalDateTable_14d27ac4-9b14-4cd8-bb22-2688c02a0185.'Date Hierarchy'
+
+		annotation SummarizationSetBy = Automatic
+
+		annotation PBI_FormatHint = {"isDateTimeCustom":true}
+
+	column Year
+		formatString: 0
+		lineageTag: 291c248b-ac66-4ecc-b24d-f73fabf33f4b
+		summarizeBy: sum
+		isNameInferred
+		sourceColumn: [Year]
+
+		annotation SummarizationSetBy = Automatic
+
+	column Month
+		lineageTag: 68cbebd0-4e08-466a-a266-75025dd75695
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [Month]
+		sortByColumn: MonthNum
+
+		annotation SummarizationSetBy = Automatic
+
+	column MonthNum
+		formatString: 0
+		lineageTag: 4506fc37-2281-46f1-89d0-7343a40d05e6
+		summarizeBy: sum
+		isNameInferred
+		sourceColumn: [MonthNum]
+
+		annotation SummarizationSetBy = Automatic
+
+	column Quarter
+		lineageTag: 00a52899-d3dc-47a3-86b2-31d7ce7dd1c6
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [Quarter]
+
+		annotation SummarizationSetBy = Automatic
+
+	column Weekday
+		lineageTag: f4884491-7788-433a-97db-113e479eaa7d
+		summarizeBy: none
+		isNameInferred
+		sourceColumn: [Weekday]
+
+		annotation SummarizationSetBy = Automatic
+
+	column WeekdayNum
+		formatString: 0
+		lineageTag: 7c49f566-c3f3-483c-a562-d600512957f2
+		summarizeBy: sum
+		isNameInferred
+		sourceColumn: [WeekdayNum]
+
+		annotation SummarizationSetBy = Automatic
+
+	column YearMonth =
+			
+			FORMAT ( 'dim_date'[Date], "YYYY-MM" )
+		lineageTag: 59c45fda-67f6-44a6-93ba-190c3e7b8b75
+		summarizeBy: none
+		sortByColumn: YearMonthNum
+
+		annotation SummarizationSetBy = Automatic
+
+	column YearMonthNum =
+			
+			YEAR ( 'dim_date'[Date] ) * 100 + MONTH ( 'dim_date'[Date] )
+		formatString: 0
+		lineageTag: 60f1feb0-9782-4b1a-a957-e8705e06273a
+		summarizeBy: sum
+
+		annotation SummarizationSetBy = Automatic
+
+	column 'Year Select' = ```
+			
+			IF(
+			    'dim_date'[Year] = YEAR(TODAY()), 
+			    "This Year", 
+			    FORMAT('dim_date'[Year], "0000")
+			)
+			```
+		lineageTag: 271ff4db-65d2-433f-901c-0f1c3bcb09e8
+		summarizeBy: none
+
+		annotation SummarizationSetBy = Automatic
+
+	column 'Month Select' = ```
+			
+			IF(
+			    'dim_date'[Year] = YEAR(TODAY()) && 'dim_date'[MonthNum] = MONTH(TODAY()), 
+			    "This Month", 
+			    FORMAT('dim_date'[Date], "MMMM")
+			)
+			```
+		lineageTag: ec3c389c-5e83-4fb0-9af9-d4de9b8b5638
+		summarizeBy: none
+		sortByColumn: MonthNum
+
+		annotation SummarizationSetBy = Automatic
+
+	/// Unique integer key per ISO calendar week. Format: YYYYWW (e.g. 202512 = week 12 of 2025). Use in the Details field well of a Scatter Chart to produce one data point per week. Sorts chronologically as an integer.
+	column 'Week Key' = YEAR(dim_date[Date]) * 100 + WEEKNUM(dim_date[Date], 2)
+		dataType: int64
+		lineageTag: c24c75b5-8ddc-4e7e-8b8b-4fbefbd8546b
+		summarizeBy: none
+
+	partition dim_date = calculated
+		mode: import
+		source =
+				
+				ADDCOLUMNS (
+				    CALENDAR (DATE(2014,1,1), TODAY() ),
+				    "Year", YEAR([Date]),
+				    "Month", FORMAT([Date], "MMMM"),
+				    "MonthNum", MONTH([Date]),
+				    "Quarter", "Q" & FORMAT([Date], "Q"),
+				    "Weekday", FORMAT([Date], "dddd"),
+				    "WeekdayNum", WEEKDAY([Date],2) // 1=Sunday, 2=Monday-first
+				)
+
+	annotation PBI_Id = 4b49ecf2618b4fcf8cf8f1ea330fe950
+

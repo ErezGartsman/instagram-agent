@@ -1,0 +1,34 @@
+version: 2
+
+sources:
+  - name: instagram_raw
+    database: INSTAGRAM_ANALYTICS
+    schema: RAW
+    tables:
+      - name: raw_posts
+      - name: raw_comments
+      - name: raw_likers
+
+models:
+  - name: stg_posts
+    description: "Staging table for posts with initial cleaning"
+    columns:
+      - name: post_shortcode
+        tests:
+          - not_null 
+
+  - name: instagram_posts_clean
+    description: "Final cleaned posts table with no duplicates"
+    columns:
+      - name: post_shortcode
+        tests:
+          - unique
+          - not_null
+
+  - name: post_performance_mart
+    description: "Final mart for Power BI analysis"
+    columns:
+      - name: post_shortcode
+        tests:
+          - unique
+          - not_null

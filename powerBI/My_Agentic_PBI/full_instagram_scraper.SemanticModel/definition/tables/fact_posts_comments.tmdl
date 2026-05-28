@@ -1,0 +1,307 @@
+table fact_posts_comments
+	lineageTag: 8dc5fe34-5da1-4d63-b09f-3f355048bc81
+
+	measure 'Distinct Commenters' = DISTINCTCOUNT( fact_posts_comments[username] )
+		formatString: 0
+		displayFolder: Comments
+		lineageTag: 4b3b6d24-b97c-4138-9e94-4975d65751c6
+
+		changedProperty = IsHidden
+
+	measure 'Comments DoD' = ```
+			
+			VAR TodayComments = [Total Comments]
+			VAR YesterdayComments = 
+			    CALCULATE(
+			        [Total Comments],
+			        USERELATIONSHIP(fact_posts_comments[comment_date], 'dim_date'[Date]),
+			        DATEADD('dim_date'[Date], -1, DAY)
+			    )
+			RETURN
+			DIVIDE(TodayComments - YesterdayComments, YesterdayComments, 0)
+			```
+		displayFolder: Comments\Time Intelligence
+		lineageTag: e3e25066-918e-4b0e-b071-8074898d31ba
+
+		changedProperty = IsHidden
+
+		annotation PBI_FormatHint = {"isGeneralNumber":true}
+
+	measure 'Total Comments' = ```
+			COUNTROWS('fact_posts_comments') 
+			```
+		formatString: 0
+		displayFolder: Comments
+		lineageTag: fd80db67-8b5c-4371-ba77-7ecdd331dfb1
+
+		changedProperty = IsHidden
+
+	measure 'Rank by Comments' =
+			
+			RANKX(
+			    ALLSELECTED( 'dim_posts' ),
+			    [Total Comments],
+			    ,
+			    DESC,
+			    Dense
+			)
+		formatString: 0
+		displayFolder: Comments
+		lineageTag: aaa037f4-86a9-4800-868d-9a272d8142fb
+
+		changedProperty = IsHidden
+
+	measure 'Total Comments YTD' =
+			
+			CALCULATE(
+			    TOTALYTD([Total Comments], 'dim_date'[Date]),
+			    USERELATIONSHIP(fact_posts_comments[comment_date], 'dim_date'[Date])
+			)
+		formatString: 0
+		displayFolder: Comments\Time Intelligence
+		lineageTag: a1fcb64a-380b-4730-8f8c-c3207e3f6761
+
+		changedProperty = IsHidden
+
+	measure 'Total Comments LM' =
+			
+			CALCULATE(
+			    [Total Comments],
+			    USERELATIONSHIP(fact_posts_comments[comment_date], 'dim_date'[Date]),
+			    DATEADD('dim_date'[Date], -1, MONTH)
+			)
+		formatString: 0
+		displayFolder: Comments\Time Intelligence
+		lineageTag: 71fc1040-3078-4017-a0fa-52a0bc74a7d7
+
+		changedProperty = IsHidden
+
+	measure 'Comments MoM %' =
+			
+			VAR CurrentCom = [Total Comments]
+			VAR PrevCom = [Total Comments LM]
+			RETURN
+			DIVIDE(CurrentCom - PrevCom, PrevCom, BLANK())
+		displayFolder: Comments\Time Intelligence
+		lineageTag: 6c0026ca-4a43-47de-97a9-c8363ccf01ea
+
+		changedProperty = IsHidden
+
+		annotation PBI_FormatHint = {"isGeneralNumber":true}
+
+	measure 'Total Comments YTD LY' =
+			
+			CALCULATE(
+			    [Total Comments YTD],
+			    USERELATIONSHIP(fact_posts_comments[comment_date], 'dim_date'[Date]),
+			    SAMEPERIODLASTYEAR('dim_date'[Date])
+			)
+		formatString: 0
+		displayFolder: Comments\Time Intelligence
+		lineageTag: cdf0594c-f65e-4802-888c-b18be1ee9249
+
+		changedProperty = IsHidden
+
+	measure 'Comments YTD % Change' =
+			
+			VAR CurrentVal = [Total Comments YTD]
+			VAR PrevVal = [Total Comments YTD LY]
+			RETURN
+			DIVIDE(CurrentVal - PrevVal, PrevVal, BLANK())
+		displayFolder: Comments\Time Intelligence
+		lineageTag: 58559a2d-4329-4d30-a7c9-8059af0cfcf7
+
+		changedProperty = IsHidden
+
+		annotation PBI_FormatHint = {"isGeneralNumber":true}
+
+	measure 'Total Comments SMLY' =
+			
+			CALCULATE(
+			    [Total Comments],
+			    USERELATIONSHIP(fact_posts_comments[comment_date], 'dim_date'[Date]),
+			    SAMEPERIODLASTYEAR('dim_date'[Date])
+			)
+		formatString: 0
+		displayFolder: Comments\Time Intelligence
+		lineageTag: d1ffa6db-4923-49dc-ada9-4ce3408d2973
+
+		changedProperty = IsHidden
+
+	measure 'Comments LY % Change' =
+			
+			VAR CurrentVal = [Total Comments]
+			VAR PrevVal = [Total Comments SMLY]
+			RETURN
+			IF(ISBLANK(PrevVal) || PrevVal=0, BLANK(), DIVIDE(CurrentVal - PrevVal, PrevVal))
+		formatString: 0%;-0%;0%
+		displayFolder: Comments\Time Intelligence
+		lineageTag: f0a82525-3b66-48c5-ac96-a5ebaf8f50c3
+
+		changedProperty = IsHidden
+
+	measure 'Average Comments Per Post' =
+			
+			DIVIDE([Total Comments], [Total Posts], BLANK())
+		formatString: 0
+		displayFolder: Comments
+		lineageTag: 87bc6771-4255-4559-a9ad-3394c3744230
+
+		annotation PBI_FormatHint = {"isDecimal":true}
+
+	/// Total comments in the same 7-day period one week prior
+	measure 'Total Comments WoW' =
+			
+			CALCULATE(
+			    [Total Comments],
+			    USERELATIONSHIP(fact_posts_comments[comment_date], 'dim_date'[Date]),
+			    DATEADD('dim_date'[Date], -7, DAY)
+			)
+		displayFolder: Comments\Time Intelligence
+		lineageTag: 8f24ba31-b77c-404c-999e-1bf659f4e7d3
+
+	/// Week-over-week growth rate for Comments. Positive = improvement vs. same 7-day window last week.
+	measure 'Comments WoW %' =
+			
+			VAR CurrComments = [Total Comments]
+			VAR PrevComments = [Total Comments WoW]
+			RETURN
+			DIVIDE(CurrComments - PrevComments, PrevComments, BLANK())
+		formatString: 0.00%
+		displayFolder: Comments\Time Intelligence
+		lineageTag: e2bbbfc3-56c2-4f0b-a0b7-8d5cfe93af1a
+
+	/// Rolling 7-day average of daily comments. Uses USERELATIONSHIP to filter by actual comment date, not post date. Place on a line chart alongside Likes 7-Day Avg for a full engagement trend view.
+	measure 'Comments 7-Day Avg' =
+			
+			DIVIDE(
+			    CALCULATE(
+			        [Total Comments],
+			        USERELATIONSHIP(fact_posts_comments[comment_date], 'dim_date'[Date]),
+			        DATESINPERIOD('dim_date'[Date], MAX('dim_date'[Date]), -7, DAY)
+			    ),
+			    7,
+			    BLANK()
+			)
+		formatString: #,##0.0
+		displayFolder: Comments\Time Intelligence
+		lineageTag: dbb9305b-61f4-40fa-8b03-cb805e21ebbc
+
+	column post_shortcode
+		dataType: string
+		lineageTag: 520de32c-b423-46b3-a8e1-6499aa8eba00
+		summarizeBy: none
+		sourceColumn: post_shortcode
+
+		changedProperty = IsHidden
+
+		annotation SummarizationSetBy = Automatic
+
+	column username
+		dataType: string
+		lineageTag: 35a0f33a-2bb6-46fa-8228-5186535e42e6
+		summarizeBy: none
+		sourceColumn: username
+
+		changedProperty = IsHidden
+
+		annotation SummarizationSetBy = Automatic
+
+	column comment
+		dataType: string
+		lineageTag: 820b7379-8348-448b-8ac1-aa2625d94144
+		summarizeBy: none
+		sourceColumn: comment
+
+		changedProperty = IsHidden
+
+		annotation SummarizationSetBy = Automatic
+
+	column comment_date
+		dataType: dateTime
+		formatString: Long Date
+		lineageTag: 39254b27-e4b0-4f41-8aab-b6e5f258e748
+		summarizeBy: none
+		sourceColumn: comment_date
+
+		changedProperty = IsHidden
+
+		annotation SummarizationSetBy = Automatic
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	column RunDate
+		dataType: dateTime
+		formatString: Long Date
+		lineageTag: 71acdfd4-4641-463b-8b31-041ff4c7c50a
+		summarizeBy: none
+		sourceColumn: RunDate
+
+		variation Variation
+			isDefault
+			relationship: 31b8326e-5bb9-46c1-8df8-25fc0342078f
+			defaultHierarchy: LocalDateTable_69510268-c2f9-4929-a984-6ac166881e7f.'Date Hierarchy'
+
+		changedProperty = IsHidden
+
+		annotation SummarizationSetBy = Automatic
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	partition fact_posts_comments = m
+		mode: import
+		source =
+				let
+				    FolderPath = "C:\Users\Erez\OneDrive - Bar-Ilan University - Students\Desktop\instagram project\data\instagram_media",
+				    Source = Folder.Files(FolderPath),
+				    KeepComments = Table.SelectRows(Source, each [Name] = "batch_comments.csv" and [Extension] = ".csv"),
+				    WithRunDate = Table.AddColumn(
+				        KeepComments, "RunDate",
+				        each try Date.FromText(Text.End(Text.TrimEnd([Folder Path], "\"), 10)) otherwise null,
+				        type date
+				    ),
+				    ReadEach = Table.AddColumn(WithRunDate, "Data", each
+				        let
+				            raw   = Csv.Document([Content], [Delimiter=",", Encoding=65001, QuoteStyle=QuoteStyle.Csv]),
+				            hdr   = Table.PromoteHeaders(raw, [PromoteAllScalars=true]),
+				            typed = Table.TransformColumnTypes(hdr,{
+				                        {"post_shortcode", type text},
+				                        {"username",      type text},
+				                        {"comment",       type text},
+				                        {"posted_at",     type any},
+				                        {"media_url",     type text}
+				                    }),
+				            // --- FIX: also handle numeric-like TEXT ("1700915575") ---
+				            addDT = Table.AddColumn(typed, "comment_datetime", (r) =>
+				                    let
+				                        v    = r[posted_at],
+				                        vTxt = try Text.From(v) otherwise null,
+				                        n    = if vTxt <> null then try Number.FromText(vTxt) otherwise null else null
+				                    in
+				                        if n <> null then
+				                            // UNIX seconds -> datetime
+				                            #datetime(1970,1,1,0,0,0) + #duration(0,0,0, n)
+				                        else
+				                            // try ISO text
+				                            try DateTime.FromText(vTxt) otherwise null
+				                , type datetime),
+				            addRD = Table.AddColumn(addDT, "RunDate", (r)=> [RunDate], type date),
+				            final = Table.SelectColumns(addRD, {
+				                        "post_shortcode","username","comment","comment_datetime","media_url","RunDate"
+				                    })
+				        in  final
+				    ),
+				    Combined = Table.Combine(ReadEach[Data]),
+				    #"Changed Type" = Table.TransformColumnTypes(Combined,{{"comment_datetime", type date}}),
+				    #"Sorted Rows" = Table.Sort(#"Changed Type",{{"comment_datetime", Order.Descending}}),
+				    #"Renamed Columns" = Table.RenameColumns(#"Sorted Rows",{{"comment_datetime", "comment_date"}}),
+				    #"Changed Type1" = Table.TransformColumnTypes(#"Renamed Columns",{{"post_shortcode", type text}, {"username", type text}, {"comment", type text}, {"comment_date", type date}, {"media_url", type text}, {"RunDate", type date}}),
+				    #"Removed Duplicates" = Table.Distinct(#"Changed Type1", {"username", "comment", "media_url"}),
+				    #"Removed Columns" = Table.RemoveColumns(#"Removed Duplicates",{"media_url"})
+				in
+				    #"Removed Columns"
+
+	annotation PBI_NavigationStepName = Navigation
+
+	annotation PBI_ResultType = Table
+

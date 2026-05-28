@@ -1,0 +1,38 @@
+model Model
+	culture: en-US
+	defaultPowerBIDataSourceVersion: powerBI_V3
+	sourceQueryCulture: en-IL
+	dataAccessOptions
+		legacyRedirects
+		returnErrorValuesAsNull
+
+annotation __PBI_TimeIntelligenceEnabled = 1
+
+annotation PBI_QueryOrder = ["dim_posts","fact_posts_comments","fact_posts_likers","fact_followers","dim_followers","dim_users"]
+
+annotation PBI_ProTooling = ["MCP-PBIModeling","DaxQueryView_Desktop","DevMode"]
+
+ref table dim_posts
+ref table DateTableTemplate_7385f185-19bc-4d9a-8596-6c09bacd8ebb
+ref table LocalDateTable_ddb893ff-c1b8-4eea-84fb-6f33b5e3147e
+ref table fact_posts_comments
+ref table fact_posts_likers
+ref table dim_date
+ref table LocalDateTable_14d27ac4-9b14-4cd8-bb22-2688c02a0185
+ref table LocalDateTable_69510268-c2f9-4929-a984-6ac166881e7f
+ref table LocalDateTable_42b880c0-c186-4fe0-95ab-20adc1371f1b
+ref table LocalDateTable_861b19af-e9ea-4352-aeba-235a27d606e0
+ref table 'Select Metric'
+ref table dim_users
+ref table LocalDateTable_4c3db531-8374-4113-81e2-038ec95f412f
+ref table LocalDateTable_4fc2801c-8d2f-4bc0-9783-4260f2cee45f
+ref table dim_followers
+ref table LocalDateTable_ed0f43e1-34d1-4d6a-bc0a-31dbba47d438
+ref table LocalDateTable_978ea060-5f28-4a68-a7d0-bdd6115d652e
+ref table LocalDateTable_37210f71-30ac-4560-a305-51269c027622
+
+ref role Manager_2025
+ref role Video_Manager
+
+ref cultureInfo en-US
+
