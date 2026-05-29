@@ -12,7 +12,10 @@ pydantic-settings>=2.0.0
 # PostgreSQL
 psycopg2-binary>=2.9.0
 
-# LLM — use the new google-genai SDK (google-generativeai is deprecated)
+# LLM — new google-genai SDK (replaces deprecated google-generativeai)
+# Do NOT add google-api-core here; google-genai no longer uses it and
+# importing google.api_core.exceptions will raise ModuleNotFoundError on
+# a clean Vercel install.
 google-genai>=1.0.0
 
 # Testing (CI only — not needed in production image)

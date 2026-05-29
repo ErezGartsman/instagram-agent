@@ -8,6 +8,7 @@ structured audit logging, conversation history, and CSV export support.
 """
 
 import logging
+import os
 import re
 import time
 import json
@@ -23,11 +24,9 @@ from typing import Optional
 import psycopg2
 import psycopg2.pool
 from google import genai
-from google.genai import types as genai_types
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from google.api_core.exceptions import ResourceExhausted
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
@@ -86,13 +85,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger("datalens")
 
-# Structured audit log — one JSON line per event → audit.log
-_audit_handler = logging.FileHandler("audit.log", encoding="utf-8")
-_audit_handler.setFormatter(logging.Formatter("%(message)s"))
+# ── Audit logger ──────────────────────────────────────────────────────────────
+# On Vercel (and any other read-only serverless environment) we cannot write
+# to the local filesystem — the deployment directory is immutable and even
+# relative paths like "audit.log" hit a PermissionError at import time,
+# crashing the entire function before a single request is served.
+#
+# Detection: Vercel automatically sets the VERCEL=1 env var in every
+# function environment.  When present we route audit events to stdout
+# (prefixed [AUDIT]) so they appear in Vercel's Runtime Logs and remain
+# searchable without any extra infrastructure.
+#
+# Locally: events go to audit.log as before, keeping the file-based audit
+# trail for development and self-hosted deployments.
 _audit_logger = logging.getLogger("datalens.audit")
-_audit_logger.addHandler(_audit_handler)
 _audit_logger.setLevel(logging.INFO)
-_audit_logger.propagate = False  # keep audit entries out of stdout
+_audit_logger.propagate = False
+
+if os.environ.get("VERCEL"):
+    # Serverless: write JSON audit lines to stdout — Vercel captures all stdout
+    _audit_handler: logging.Handler = logging.StreamHandler()
+    _audit_handler.setFormatter(logging.Formatter("[AUDIT] %(message)s"))
+else:
+    # Local / persistent server: write to audit.log
+    _audit_handler = logging.FileHandler("audit.log", encoding="utf-8")
+    _audit_handler.setFormatter(logging.Formatter("%(message)s"))
+
+_audit_logger.addHandler(_audit_handler)
 
 def _audit(event: str, **kwargs) -> None:
     """Write one structured JSON record to audit.log."""
@@ -997,15 +1016,6 @@ def chat(request: ChatRequest, http_request: Request):
             error_code="db_error",
         )
 
-    except ResourceExhausted as e:
-        logger.warning(f"[chat] Gemini rate limit: {e}")
-        _audit("gemini_quota", ip=client_ip)
-        return ChatResponse(
-            status="error",
-            reply="The AI is busy — please wait ~30 seconds and try again.",
-            error_code="llm_error",
-        )
-
     except TimeoutError as e:
         logger.error(f"[chat] LLM timeout: {e}")
         _audit("llm_timeout", ip=client_ip)
@@ -1016,6 +1026,21 @@ def chat(request: ChatRequest, http_request: Request):
         )
 
     except Exception as e:
+        # Check for Gemini quota / rate-limit errors first.
+        # The new google-genai SDK raises google.genai.errors.ClientError (429).
+        # We detect by string rather than importing a specific exception class
+        # that varies across SDK versions and may not be installed on Vercel.
+        # NOTE: TimeoutError must be caught BEFORE this block (it's a subclass
+        # of Exception) — the order of except clauses above is intentional.
+        err_str = str(e).lower()
+        if "429" in err_str or "quota" in err_str or "resource_exhausted" in err_str:
+            logger.warning(f"[chat] Gemini rate limit: {e}")
+            _audit("gemini_quota", ip=client_ip)
+            return ChatResponse(
+                status="error",
+                reply="The AI is busy — please wait ~30 seconds and try again.",
+                error_code="llm_error",
+            )
         logger.error(f"[chat] Unexpected {type(e).__name__}: {e}", exc_info=True)
         _audit("unknown_error", ip=client_ip, error=str(e))
         return ChatResponse(

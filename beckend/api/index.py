@@ -2,13 +2,19 @@
 #
 # Vercel's Python runtime discovers this file because it lives in the `api/`
 # directory.  It looks for a top-level variable named `app` (ASGI) or
-# `handler` (WSGI).  Importing `app` from `main` is all that's needed —
-# Vercel handles the rest.
+# `handler` (WSGI) — FastAPI is ASGI so `app` is the correct export.
 #
-# Why this works:
-#   • Vercel root directory is set to `beckend/` in the project settings.
-#   • That means `beckend/` is on sys.path, so `from main import app` resolves.
-#   • All routes in main.py (/health, /db-test, /api/*) are served through
-#     the single wildcard route in vercel.json → this file.
+# sys.path note:
+#   Vercel adds the directory of THIS file (`beckend/api/`) to sys.path,
+#   NOT the project root (`beckend/`).  Without the explicit insert below,
+#   `from main import app` would raise ModuleNotFoundError because main.py
+#   sits one directory above.  We resolve it by inserting the parent dir
+#   (i.e. `beckend/`) at position 0 so it takes priority over everything else.
+
+import os
+import sys
+
+# Insert beckend/ (parent of this file's directory) onto sys.path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from main import app  # noqa: F401  (Vercel reads the `app` name directly)
