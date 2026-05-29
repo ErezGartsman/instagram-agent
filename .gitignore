@@ -3,49 +3,74 @@
 .env.*
 !.env.example          # keep the example template in git
 
-# ─── Database files ───────────────────────────────────────────────────────────
-*.db
-*.duckdb
-*.db-shm
-*.db-wal
-
-# ─── Logs ────────────────────────────────────────────────────────────────────
-*.log
-audit.log
-
-# ─── Data files (may contain PII) ────────────────────────────────────────────
-data/
-
-# ─── Python runtime ──────────────────────────────────────────────────────────
+# ─── Python & Virtual Environments ───────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
 *.pyo
 *.pyd
-
-# ─── Virtual environments ────────────────────────────────────────────────────
 venv/
 .venv/
 env/
 .env/
 ENV/
 
-# ─── Distribution / packaging ────────────────────────────────────────────────
+# ─── Database Files & Binaries ───────────────────────────────────────────────
+*.db
+*.duckdb
+*.db-shm
+*.db-wal
+duckdb.exe
+duckdb
+*.exe
+*.zip
+
+# ─── Massive Data Files & PII ────────────────────────────────────────────────
+data/
+archive/
+*.csv
+*.parquet
+*.xlsx
+*.json
+
+# ─── JSON Exceptions (MUST come after *.json) ────────────────────────────────
+!vercel.json
+!package.json
+!package-lock.json
+!tsconfig*.json
+!.eslintrc.json
+!*.eslintrc.json
+
+# ─── Unrelated Projects, Infra & Excluded Folders ────────────────────────────
+מחקר חברות AI/
+Social POC*/
+tasks/
+infrastructure/
+dbt_projects/
+powerBI/
+scripts/
+orchestrator.py
+node_modules/
+.ig-profile/
+.claude/
+
+# ─── Logs & Test Output ──────────────────────────────────────────────────────
+*.log
+audit.log
+test-results.xml
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ─── Distribution, Packaging & Type Checking ─────────────────────────────────
 dist/
 build/
 *.egg-info/
 *.egg
 .eggs/
-
-# ─── Type checking ───────────────────────────────────────────────────────────
 .mypy_cache/
 .pytype/
 .pyre/
-
-# ─── Testing ─────────────────────────────────────────────────────────────────
-.pytest_cache/
-.coverage
-htmlcov/
 
 # ─── Editors & OS ────────────────────────────────────────────────────────────
 .idea/
@@ -55,46 +80,3 @@ htmlcov/
 *~
 .DS_Store
 Thumbs.db
-
-# ─── DuckDB CLI binary (not source, belongs in PATH not the repo) ─────────────
-duckdb.exe
-duckdb
-
-
-# ─── Catch-all for massive data files ───────────────────────────────────────
-*.csv
-*.json
-*.parquet
-*.xlsx
-archive/
-
-*.exe
-*.zip
-
-# ─── Exceptions — config/manifest files that are JSON but must be tracked ────
-# (Git processes negations in order, so these must come AFTER the *.json rule)
-!vercel.json
-!package.json
-!package-lock.json
-!tsconfig*.json
-!.eslintrc.json
-!*.eslintrc.json
-
-# ─── Test output ─────────────────────────────────────────────────────────────
-test-results.xml
-
-# ─── Unwanted folders ───────────────────────────────────────
-node_modules/
-.ig-profile/
-.claude/
-
-
-מחקר חברות AI/
-Social POC*/
-tasks/
-
-infrastructure/
-dbt_projects/
-powerBI/
-scripts/
-orchestrator.py

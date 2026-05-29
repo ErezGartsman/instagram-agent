@@ -1,1 +1,0 @@
-select * from {{ source('instagram_raw', 'raw_likers') }}

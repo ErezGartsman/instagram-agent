@@ -1,7 +1,0 @@
-role Video_Manager
-	modelPermission: read
-
-	tablePermission dim_posts = [post_type] == "Reel"
-
-	annotation PBI_Id = d231dbfc1618466c9b8fa10a71a3bc93
-

@@ -1,1 +1,0 @@
-EVALUATE EXCEPT(VALUES(dim_followers[username]), VALUES(dim_users[username]))

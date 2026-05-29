@@ -1,7 +1,0 @@
-role Manager_2025
-	modelPermission: read
-
-	tablePermission dim_date = [Year] == 2026
-
-	annotation PBI_Id = b105959af6b34915b8c653255536b36a
-
