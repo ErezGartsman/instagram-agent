@@ -92,3 +92,9 @@ node_modules/
 מחקר חברות AI/
 Social POC*/
 tasks/
+
+infrastructure/
+dbt_projects/
+powerBI/
+scripts/
+orchestrator.py
