@@ -70,3 +70,20 @@ archive/
 
 *.exe
 *.zip
+
+# ─── Exceptions — config/manifest files that are JSON but must be tracked ────
+# (Git processes negations in order, so these must come AFTER the *.json rule)
+!vercel.json
+!package.json
+!package-lock.json
+!tsconfig*.json
+!.eslintrc.json
+!*.eslintrc.json
+
+# ─── Test output ─────────────────────────────────────────────────────────────
+test-results.xml
+
+# ─── Unwanted folders ───────────────────────────────────────
+node_modules/
+.ig-profile/
+.claude/
