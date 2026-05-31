@@ -7,9 +7,22 @@ import {
 import StatsView from './StatsView'
 import ArchView  from './ArchView'
 
-// In dev: defaults to localhost:8000 if VITE_API_BASE is not set.
-// In production: set VITE_API_BASE=https://api.your-domain.com in .env.production
-const API_BASE = (import.meta.env.VITE_API_BASE ?? 'http://localhost:8000').replace(/\/$/, '')
+// In dev: defaults to localhost:8000 if VITE_API_BASE / VITE_API_URL is not set.
+// In production: set VITE_API_BASE=https://your-backend.vercel.app in Vercel env vars.
+//
+// Normalisation: some env var editors (including Vercel's dashboard) occasionally
+// save "https://" as "https:/" (one slash).  A single-slash URL is treated as a
+// relative path by the browser, so fetch() prepends the current origin and the
+// request goes to the wrong server entirely.  The replace() below re-inserts the
+// missing slash before any downstream code can observe the malformed value.
+const API_BASE = (
+  import.meta.env.VITE_API_BASE ??
+  import.meta.env.VITE_API_URL  ??
+  'http://localhost:8000'
+)
+  .trim()
+  .replace(/\/$/, '')                          // strip accidental trailing slash
+  .replace(/^(https?):\/(?!\/)/, '$1://')      // fix https:/ → https://
 
 const FALLBACK_SESSION_ID = crypto.randomUUID()
 
@@ -76,7 +89,7 @@ const PipelineBar = ({ stage, dbStatus }) => {
   const steps = [
     { id: 'nl',   label: 'NL Parse' },
     { id: 'sql',  label: 'SQL Gen'  },
-    { id: 'db',   label: 'DuckDB'   },
+    { id: 'db',   label: 'Supabase' },
     { id: 'done', label: 'Synthesis'},
   ]
   const order = ['nl', 'sql', 'db', 'done']
