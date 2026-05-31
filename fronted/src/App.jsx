@@ -111,7 +111,7 @@ const PipelineBar = ({ stage, dbStatus }) => {
       <div className="pipeline-bar-right">
         <div className={`db-badge ${dbStatus}`}>
           <span className="status-orb"/>
-          <span>{dbStatus === 'ok' ? 'DuckDB Live' : dbStatus === 'error' ? 'Offline' : 'Connecting'}</span>
+          <span>{dbStatus === 'ok' ? 'Supabase Live' : dbStatus === 'error' ? 'Offline' : 'Connecting'}</span>
         </div>
       </div>
     </div>
@@ -1581,7 +1581,7 @@ export default function App() {
             <div className={`foot-status ${dbStatus}`}>
               <span className="status-orb"/>
               <span className="status-text">
-                {dbStatus === 'ok' ? 'DuckDB connected' : dbStatus === 'error' ? 'DB offline' : 'Connecting…'}
+                {dbStatus === 'ok' ? 'Supabase connected' : dbStatus === 'error' ? 'DB offline' : 'Connecting…'}
               </span>
             </div>
             <div className="kbd-hint"><kbd>⌘K</kbd> to focus</div>
