@@ -2889,7 +2889,7 @@ kbd {
 
   /* Pipeline bar: minimal at very small widths */
   .pipeline-bar { grid-template-columns: 40px 1fr auto; }
-  .db-badge span:last-child { display: none; } /* hide "DuckDB Live" text, keep orb */
+  .db-badge span:last-child { display: none; } /* hide "Supabase Live" text on narrow screens, keep orb */
 }
 
 /* ─── Responsive — 520px (original small-phone block) ───────────────────── */

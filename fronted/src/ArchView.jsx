@@ -8,7 +8,7 @@ const NODES = [
     color: '#e1306c',
     stat:  'Input Layer',
     tags:  ['JSON', 'CSV'],
-    desc:  'Raw follower data and engagement CSVs exported from Instagram\'s official data portal and scrapers. Loaded once via DuckDB\'s read_json_auto — zero preprocessing required.',
+    desc:  'Raw follower data and engagement CSVs exported from Instagram\'s official data portal and scrapers. Migrated once via the ETL pipeline into Supabase PostgreSQL — zero preprocessing at query time.',
     icon:  (
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
         <rect x="2" y="2" width="20" height="20" rx="5"/>
@@ -18,13 +18,13 @@ const NODES = [
     ),
   },
   {
-    id:    'duckdb',
-    title: 'DuckDB',
-    sub:   'OLAP · In-Process',
+    id:    'supabase',
+    title: 'Supabase',
+    sub:   'PostgreSQL · Cloud',
     color: '#14b8a6',
-    stat:  'Query Engine',
-    tags:  ['SQL Engine', 'Columnar', 'read_json_auto'],
-    desc:  'Embeddable OLAP engine running in-process with the API. JSON and CSV files are exposed as relational views and queried with sub-millisecond latency — no server, no ETL.',
+    stat:  'Database',
+    tags:  ['PostgreSQL', 'pgbouncer', 'Supabase'],
+    desc:  'Managed PostgreSQL database hosted on Supabase. 200k+ rows across posts, comments, likers, and followers. Connected via psycopg2 connection pool with pgbouncer session-mode pooling.',
     icon:  (
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
         <ellipse cx="12" cy="5" rx="9" ry="3"/>
@@ -54,7 +54,7 @@ const NODES = [
     color: '#a855f7',
     stat:  'AI Core',
     tags:  ['NL→SQL', 'JSON Output', 'Flash'],
-    desc:  'Converts natural language questions in Hebrew or English into precise DuckDB SQL via structured prompt engineering. Returns validated JSON with query, explanation, and chart config.',
+    desc:  'Converts natural language questions in Hebrew or English into precise PostgreSQL SQL via structured prompt engineering. Returns validated JSON with query, explanation, and chart config.',
     icon:  (
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
         <path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6L12 2z"/>
@@ -83,7 +83,7 @@ const IS_BIDIR = [false, false, true, false]
 const HERO_METRICS = [
   { label: 'Pipeline Nodes', value: '5' },
   { label: 'Avg Latency',    value: '<1ms' },
-  { label: 'SQL Engine',     value: 'DuckDB' },
+  { label: 'SQL Engine',     value: 'PostgreSQL' },
   { label: 'AI Model',       value: 'Gemini 2.5' },
   { label: 'Transport',      value: 'REST · JSON' },
 ]

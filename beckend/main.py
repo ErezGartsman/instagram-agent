@@ -35,7 +35,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     gemini_api_key:      str
-    supabase_db_url:     str   # Pooler URL (pgbouncer, transaction mode, port 6543)
+    supabase_db_url:     str   # Pooler URL — session mode (port 5432) for BI tools / persistent connections
     max_result_rows:     int = 500
     allowed_origins:     str = "http://localhost:5173"
     llm_timeout_seconds: int = 30       # hard deadline for Gemini calls

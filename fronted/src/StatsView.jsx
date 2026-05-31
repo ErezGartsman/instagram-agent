@@ -122,7 +122,7 @@ export default function StatsView({ stats, onQuerySuggestion }) {
           </div>
         )}
         <p className="stats-hero-sub">
-          Live metrics from your DuckDB instance · click any card to inspect the schema
+          Live metrics from your Supabase database · click any card to inspect the schema
         </p>
       </div>
 

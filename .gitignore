@@ -1,7 +1,8 @@
 # ─── Secrets & Config ────────────────────────────────────────────────────────
 .env
 .env.*
-!.env.example          # keep the example template in git
+!.env.example             # keep the example template in git
+!.env.production          # safe to commit — only contains public URLs, no secrets
 
 # ─── Python & Virtual Environments ───────────────────────────────────────────
 __pycache__/
