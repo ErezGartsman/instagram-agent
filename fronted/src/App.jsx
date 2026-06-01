@@ -942,7 +942,7 @@ export default function App() {
         if (Array.isArray(parsed) && parsed.length > 0) return parsed
       }
     } catch {}
-    return [{ id: FALLBACK_SESSION_ID, title: 'New Chat', messages: [] }]
+    return [{ id: FALLBACK_SESSION_ID, title: 'New Chat', messages: [], backendSessionId: null }]
   })
 
   const [activeSessionId, setActiveSessionId] = useState(() => {
@@ -988,10 +988,13 @@ export default function App() {
   const [renameValue, setRenameValue]     = useState('')
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false)
 
-  const bottomRef        = useRef(null)
-  const inputRef         = useRef(null)
-  const pipelineTimerRef = useRef(null)
-  const renameInputRef   = useRef(null)
+  const bottomRef           = useRef(null)
+  const inputRef            = useRef(null)
+  const pipelineTimerRef    = useRef(null)
+  const renameInputRef      = useRef(null)
+  // Tracks which frontend session IDs have already had their DB history restored,
+  // so switching back to a session doesn't re-fetch what's already in state.
+  const restoredSessionsRef = useRef(new Set())
 
   const messages         = sessions.find(s => s.id === activeSessionId)?.messages ?? []
   const recentSessions   = sessions.filter(s => s.messages.some(m => m.sender === 'user'))
@@ -1012,7 +1015,7 @@ export default function App() {
   }, [])
 
   const handleNewChat = useCallback(() => {
-    const newSession = { id: crypto.randomUUID(), title: 'New Chat', messages: [] }
+    const newSession = { id: crypto.randomUUID(), title: 'New Chat', messages: [], backendSessionId: null }
     setSessions(prev => [newSession, ...prev])
     setActiveSessionId(newSession.id)
     setCurrentView('query')
@@ -1033,7 +1036,7 @@ export default function App() {
   const handleDeleteSession = useCallback((id) => {
     setSessions(prev => {
       const next = prev.filter(s => s.id !== id)
-      const remaining = next.length > 0 ? next : [{ id: crypto.randomUUID(), title: 'New Chat', messages: [] }]
+      const remaining = next.length > 0 ? next : [{ id: crypto.randomUUID(), title: 'New Chat', messages: [], backendSessionId: null }]
       if (id === activeSessionId) setActiveSessionId(remaining[0].id)
       return remaining
     })
@@ -1055,6 +1058,36 @@ export default function App() {
     }
     setRenamingId(null)
   }, [renameValue])
+
+  // ── Backend session creation ───────────────────────────────────────────────
+  // Called lazily on the first message of each frontend session.
+  // Hits POST /api/sessions, gets a DB UUID, stores it on the session object
+  // (which the existing localStorage persistence effect then saves automatically).
+  // Returns the backendSessionId string, or null if the call fails (graceful
+  // degradation — chat still works, messages just won't be persisted to DB).
+  const createBackendSession = useCallback(async (frontendSessionId) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/sessions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${import.meta.env.VITE_API_KEY || ''}`,
+        },
+        body: JSON.stringify({ channel: 'web' }),
+      })
+      if (!res.ok) return null
+      const data = await res.json()
+      const backendSessionId = data.session_id
+      // Write backendSessionId into the frontend session so it's persisted
+      // to localStorage via the existing nexus_sessions effect.
+      setSessions(prev => prev.map(s =>
+        s.id === frontendSessionId ? { ...s, backendSessionId } : s
+      ))
+      return backendSessionId
+    } catch {
+      return null   // non-fatal — chat works without persistence
+    }
+  }, [])   // no deps: API_BASE and VITE_API_KEY are build-time constants
 
   const handleShare = useCallback(() => {
     const url = window.location.href
@@ -1251,6 +1284,66 @@ export default function App() {
     }
   }, [])
 
+  // ── DB History Restoration ─────────────────────────────────────────────────
+  // Fires whenever the active session changes. If the session has a
+  // backendSessionId (it was previously created in the DB) but its local
+  // message cache is empty (localStorage was cleared or the user opened a
+  // different browser), we fetch the full history from the backend and
+  // repopulate the chat UI. The restoredSessionsRef prevents double-fetching
+  // when the user switches back to a session whose messages are already loaded.
+  useEffect(() => {
+    const session = sessions.find(s => s.id === activeSessionId)
+
+    // Nothing to restore: no backend session, already has local messages,
+    // or we already fetched for this session in this page-load.
+    if (
+      !session?.backendSessionId ||
+      session.messages.length > 0 ||
+      restoredSessionsRef.current.has(activeSessionId)
+    ) return
+
+    // Mark as in-progress immediately to prevent concurrent fetches.
+    restoredSessionsRef.current.add(activeSessionId)
+
+    const controller = new AbortController()
+
+    fetch(`${API_BASE}/api/sessions/${session.backendSessionId}/history`, {
+      headers: { 'Authorization': `Bearer ${import.meta.env.VITE_API_KEY || ''}` },
+      signal: controller.signal,
+    })
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (!data?.messages?.length) return
+        // Map backend MessageOut objects → frontend message shape
+        const restored = data.messages.map(m => ({
+          id:        crypto.randomUUID(),
+          sender:    m.role === 'user' ? 'user' : 'bot',
+          text:      m.content,
+          sql:       m.sql_used    || null,
+          columns:   null,   // not stored in DB — only available during live session
+          rawResults:null,
+          timestamp: (() => {
+            try { return new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }
+            catch { return '' }
+          })(),
+          isError:   false,
+          fresh:     false,  // do not animate — this is restored, not a new response
+        }))
+        setSessions(prev => prev.map(s =>
+          s.id === activeSessionId ? { ...s, messages: restored } : s
+        ))
+      })
+      .catch(() => {
+        // On failure, remove from the "restored" set so the next visit retries.
+        restoredSessionsRef.current.delete(activeSessionId)
+      })
+
+    return () => controller.abort()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSessionId])  // sessions deliberately omitted: checking it would cause
+                         // re-fetch on every message added, which is the opposite
+                         // of what we want. restoredSessionsRef guards correctness.
+
   // ── Pipeline ───────────────────────────────────────────────────────────────
   // useCallback avoids a new function reference on every unrelated render.
   // Deps: the four values read from component scope (setters/refs are stable).
@@ -1281,8 +1374,9 @@ export default function App() {
       }))
     }
 
-    const currentMessages = sessions.find(s => s.id === sessionId)?.messages ?? []
-    const historyPayload = currentMessages
+    const currentSession  = sessions.find(s => s.id === sessionId)
+    const currentMessages = currentSession?.messages ?? []
+    const historyPayload  = currentMessages
       .filter(m => m.type !== 'thinking' && m.text)
       .slice(-6)
       .map(m => ({ role: m.sender === 'user' ? 'user' : 'assistant', content: m.text }))
@@ -1294,6 +1388,17 @@ export default function App() {
       setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, title } : s))
     }
 
+    // ── Backend session: get existing ID or create one lazily ─────────────────
+    // We create the backend session on the very first message so we don't litter
+    // the DB with sessions for chats that were never actually used.
+    let backendSid = currentSession?.backendSessionId ?? null
+    if (!backendSid) {
+      backendSid = await createBackendSession(sessionId)
+      // createBackendSession already called setSessions to persist the ID;
+      // we capture it in a local var to use in this request without waiting
+      // for the re-render that will update currentSession.
+    }
+
     setLoading(true)
     updateSession(prev => [
       ...prev,
@@ -1301,6 +1406,15 @@ export default function App() {
       { id: crypto.randomUUID(), sender: 'bot',  type: 'thinking' },
     ])
     setPipelineStage('sql')
+
+    // Build the request body. When backendSid is active the backend loads history
+    // from DB and ignores the `history` field, but we send it as a belt-and-
+    // suspenders fallback in case the session lookup ever fails on the server.
+    const chatBody = {
+      message: question,
+      history: historyPayload,
+      ...(backendSid ? { session_id: backendSid } : {}),
+    }
 
     try {
       // 38 s gives the backend's 30 s LLM timeout full room before we give up.
@@ -1310,7 +1424,7 @@ export default function App() {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${import.meta.env.VITE_API_KEY || ''}`
         },
-        body: JSON.stringify({ message: question, history: historyPayload }),
+        body: JSON.stringify(chatBody),
         signal: AbortSignal.timeout(38_000)
       });
       const data = await res.json()
@@ -1368,7 +1482,7 @@ export default function App() {
         pipelineTimerRef.current = null
       }, 1500)
     }
-  }, [loading, activeSessionId, sessions, addToast])
+  }, [loading, activeSessionId, sessions, addToast, createBackendSession])
 
   // ── Raw SQL Execution (bypasses LLM — used by SQL Editor mode) ────────────
   const runRawSql = useCallback(async (sql) => {
