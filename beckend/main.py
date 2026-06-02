@@ -24,6 +24,7 @@ from typing import Optional
 import psycopg2
 import psycopg2.pool
 from google import genai
+from google.genai import types as genai_types
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -1275,10 +1276,16 @@ class RagQueryResponse(BaseModel):
 
 
 def _embed_text(text: str) -> list[float]:
-    """Embed a single string using Gemini text-embedding-004 (768 dims)."""
+    """
+    Embed a single string using gemini-embedding-001, truncated to 768 dims.
+
+    Must use output_dimensionality=768 to match the VECTOR(768) column in
+    knowledge_base — the model defaults to 3072 dims without this config.
+    """
     response = _gemini_client.models.embed_content(
-        model="text-embedding-004",
+        model="gemini-embedding-001",
         contents=text,
+        config=genai_types.EmbedContentConfig(output_dimensionality=768),
     )
     return response.embeddings[0].values
 

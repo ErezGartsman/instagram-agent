@@ -24,6 +24,7 @@ from pathlib import Path
 import psycopg2
 from psycopg2.extras import execute_values
 from google import genai
+from google.genai import types as genai_types
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,7 +44,10 @@ if not GEMINI_API_KEY:
     sys.exit("ERROR: Set GEMINI_API_KEY.")
 
 KNOWLEDGE_DIR  = Path(__file__).parent.parent / "knowledge"
-EMBEDDING_MODEL = "text-embedding-004"   # 768 dimensions, free tier
+EMBEDDING_MODEL   = "gemini-embedding-001"   # stable embedding model
+EMBEDDING_DIM     = 768                      # must match VECTOR(768) in Supabase schema
+                                             # gemini-embedding-001 defaults to 3072;
+                                             # we truncate to 768 via output_dimensionality
 CHUNK_SIZE      = 1800    # characters (~450 tokens) — fits well within context
 CHUNK_OVERLAP   = 200     # characters — enough for sentence continuity
 EMBED_BATCH     = 5       # embed N chunks per API call (rate-limit friendly)
@@ -94,6 +98,9 @@ def embed_chunks(client: genai.Client, chunks: list[str]) -> list[list[float]]:
         response = client.models.embed_content(
             model=EMBEDDING_MODEL,
             contents=batch,
+            config=genai_types.EmbedContentConfig(
+                output_dimensionality=EMBEDDING_DIM,
+            ),
         )
         vectors = [emb.values for emb in response.embeddings]
         all_vectors.extend(vectors)
