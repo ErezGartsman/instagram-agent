@@ -602,7 +602,8 @@ const Message = ({ msg, onRetry, onExport, onPin, isPinned, onRerunSql }) => {
     )
   }
 
-  const showData = !msg.isError && msg.rawResults?.length >= 1 && msg.columns?.length >= 1
+  const showData    = !msg.isError && msg.rawResults?.length >= 1 && msg.columns?.length >= 1
+  const showSources = !msg.isError && msg.sources?.length > 0
   const animateText = !!msg.fresh && !msg.isError
 
   return (
@@ -620,6 +621,17 @@ const Message = ({ msg, onRetry, onExport, onPin, isPinned, onRerunSql }) => {
             onPin={onPin ? () => onPin({ columns: msg.columns, rawResults: msg.rawResults, question: msg.question }) : undefined}
             isPinned={isPinned}
           />
+        )}
+        {showSources && (
+          <div className="msg-sources">
+            <Icon name="sparkle" size={11}/>
+            <span className="msg-sources-label">מקורות:</span>
+            {msg.sources.map(s => (
+              <span key={s} className="msg-source-badge">
+                {s.replace(/\.txt$/i, '')}
+              </span>
+            ))}
+          </div>
         )}
         {msg.timestamp && <span className="msg-timestamp">{msg.timestamp}</span>}
         {msg.isError && msg.originalQuestion && (
@@ -976,6 +988,7 @@ export default function App() {
   // event listener needed because the sidebar-toggle handles all subsequent changes.
   const [isSidebarOpen, setIsSidebarOpen] = useState(() => window.innerWidth > 768)
   const [currentView, setCurrentView]     = useState('query')
+  const [ragMode, setRagMode]             = useState(false)   // false=Analytics, true=Knowledge Base
   const [stats, setStats]                 = useState({ posts: '—', comments: '—', likers: '—', followers: '—' })
   const [input, setInput]                 = useState('')
   const [loading, setLoading]             = useState(false)
@@ -1388,15 +1401,14 @@ export default function App() {
       setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, title } : s))
     }
 
-    // ── Backend session: get existing ID or create one lazily ─────────────────
-    // We create the backend session on the very first message so we don't litter
-    // the DB with sessions for chats that were never actually used.
-    let backendSid = currentSession?.backendSessionId ?? null
-    if (!backendSid) {
-      backendSid = await createBackendSession(sessionId)
-      // createBackendSession already called setSessions to persist the ID;
-      // we capture it in a local var to use in this request without waiting
-      // for the re-render that will update currentSession.
+    // ── Backend session (Analytics mode only) ────────────────────────────────
+    // RAG queries are stateless — no session creation or message persistence.
+    let backendSid = null
+    if (!ragMode) {
+      backendSid = currentSession?.backendSessionId ?? null
+      if (!backendSid) {
+        backendSid = await createBackendSession(sessionId)
+      }
     }
 
     setLoading(true)
@@ -1407,24 +1419,21 @@ export default function App() {
     ])
     setPipelineStage('sql')
 
-    // Build the request body. When backendSid is active the backend loads history
-    // from DB and ignores the `history` field, but we send it as a belt-and-
-    // suspenders fallback in case the session lookup ever fails on the server.
-    const chatBody = {
-      message: question,
-      history: historyPayload,
-      ...(backendSid ? { session_id: backendSid } : {}),
-    }
+    // Build request — RAG uses a simple {message} body; Analytics passes history + session
+    const endpoint  = ragMode ? '/api/rag_query' : '/api/chat'
+    const reqBody   = ragMode
+      ? { message: question }
+      : { message: question, history: historyPayload, ...(backendSid ? { session_id: backendSid } : {}) }
 
     try {
       // 38 s gives the backend's 30 s LLM timeout full room before we give up.
-      const res = await fetch(`${API_BASE}/api/chat`, {
+      const res = await fetch(`${API_BASE}${endpoint}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${import.meta.env.VITE_API_KEY || ''}`
         },
-        body: JSON.stringify(chatBody),
+        body: JSON.stringify(reqBody),
         signal: AbortSignal.timeout(38_000)
       });
       const data = await res.json()
@@ -1437,9 +1446,10 @@ export default function App() {
             id:         crypto.randomUUID(),
             sender:     'bot',
             text:       data.reply,
-            sql:        data.sql_used   || null,
+            sql:        data.sql_used    || null,
             rawResults: data.raw_results || null,
-            columns:    data.columns    || null,
+            columns:    data.columns     || null,
+            sources:    data.sources     || null,   // RAG source filenames
             timestamp:  getTimestamp(),
             isError:    false,
             fresh:      true,
@@ -1482,7 +1492,7 @@ export default function App() {
         pipelineTimerRef.current = null
       }, 1500)
     }
-  }, [loading, activeSessionId, sessions, addToast, createBackendSession])
+  }, [loading, activeSessionId, sessions, addToast, createBackendSession, ragMode])
 
   // ── Raw SQL Execution (bypasses LLM — used by SQL Editor mode) ────────────
   const runRawSql = useCallback(async (sql) => {
@@ -1783,12 +1793,32 @@ export default function App() {
             </div>
 
             <div className="input-dock">
+              {/* ── Mode toggle — switches between Analytics and Knowledge Base ── */}
+              <div className="mode-toggle" role="group" aria-label="Chat mode">
+                <button
+                  className={`mode-btn${!ragMode ? ' active' : ''}`}
+                  onClick={() => setRagMode(false)}
+                  title="Query your Instagram analytics data"
+                >
+                  <Icon name="schema" size={12}/> Instagram Data
+                </button>
+                <button
+                  className={`mode-btn${ragMode ? ' active' : ''}`}
+                  onClick={() => setRagMode(true)}
+                  title="Ask questions about your business"
+                >
+                  <Icon name="sparkle" size={12}/> Knowledge Base
+                </button>
+              </div>
+
               <div className="input-wrapper">
                 <input
                   ref={inputRef}
                   className="chat-input"
                   type="text"
-                  placeholder="Ask anything about your Instagram data… (⌘K)"
+                  placeholder={ragMode
+                    ? 'שאל על השירותים שלנו… (⌘K)'
+                    : 'Ask anything about your Instagram data… (⌘K)'}
                   value={input}
                   onChange={e => setInput(e.target.value)}
                   onKeyDown={e => e.key === 'Enter' && handleSend()}

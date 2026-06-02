@@ -24,6 +24,7 @@ from typing import Optional
 import psycopg2
 import psycopg2.pool
 from google import genai
+from google.genai import types as genai_types
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -188,7 +189,7 @@ _schema_cache: str = ""   # populated once on first chat request; never changes 
 
 # Tables that exist for infrastructure / identity management — never exposed to
 # the LLM so it cannot generate SELECT queries against internal session data.
-_INTERNAL_TABLES = {"sessions", "messages"}
+_INTERNAL_TABLES = {"sessions", "messages", "knowledge_base"}
 
 def get_schema_description(conn) -> str:
     """
@@ -1240,6 +1241,196 @@ def get_session_history(session_id: str):
     except Exception as e:
         logger.error(f"[sessions] Failed to load history for {session_id!r}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Could not load session history.")
+
+
+# ─── RAG ─────────────────────────────────────────────────────────────────────
+
+RAG_PROMPT_TEMPLATE = """\
+You are a knowledgeable business assistant. Answer the user's question using ONLY \
+the context excerpts provided below. Do not invent facts. \
+If the context does not contain enough information, say so honestly.
+
+=== CONTEXT FROM KNOWLEDGE BASE ===
+{context}
+
+=== LANGUAGE RULE ===
+Reply in the exact same language as the user's question. \
+If the question is in Hebrew, reply in Hebrew. If English, reply in English.
+
+=== TONE ===
+Be direct, warm, and professional. One or two clear paragraphs maximum. \
+No bullet points unless listing distinct items. No hollow openers.
+
+User question: "{question}"
+"""
+
+class RagQueryRequest(BaseModel):
+    message:    str
+    session_id: Optional[str] = None   # optional — for session-aware RAG in the future
+
+class RagQueryResponse(BaseModel):
+    status:    str
+    reply:     str
+    sources:   list[str]               # source filenames used (shown as citations in UI)
+    error_code: Optional[str] = None
+
+
+def _embed_text(text: str) -> list[float]:
+    """
+    Embed a single string using gemini-embedding-001, truncated to 768 dims.
+
+    Must use output_dimensionality=768 to match the VECTOR(768) column in
+    knowledge_base — the model defaults to 3072 dims without this config.
+    """
+    response = _gemini_client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=text,
+        config=genai_types.EmbedContentConfig(output_dimensionality=768),
+    )
+    return response.embeddings[0].values
+
+
+def _retrieve_chunks(conn, query_vector: list[float], top_k: int = 5) -> list[dict]:
+    """
+    Run a pgvector cosine similarity search and return the top_k most relevant
+    knowledge_base chunks with their similarity scores and source filenames.
+
+    The <=> operator is cosine *distance* (0 = identical, 2 = opposite), so
+    similarity = 1 - distance.  We filter out anything below 0.5 similarity
+    to avoid injecting completely irrelevant context into the prompt.
+    """
+    vec_str = f"[{','.join(str(v) for v in query_vector)}]"
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT content, source,
+                   1 - (embedding <=> %s::vector) AS similarity
+            FROM   knowledge_base
+            ORDER  BY embedding <=> %s::vector
+            LIMIT  %s
+            """,
+            (vec_str, vec_str, top_k),
+        )
+        rows = cur.fetchall()
+
+    return [
+        {"content": r[0], "source": r[1], "similarity": float(r[2])}
+        for r in rows
+        if float(r[2]) >= 0.50   # relevance threshold — tune if needed
+    ]
+
+
+@app.post(
+    "/api/rag_query",
+    response_model=RagQueryResponse,
+    dependencies=[Depends(require_auth)],
+)
+def rag_query(request: RagQueryRequest, http_request: Request):
+    """
+    Knowledge-base Q&A via RAG.
+
+    Pipeline:
+      1. Embed the user's question with Gemini text-embedding-004.
+      2. Retrieve the top-5 most similar chunks from knowledge_base (pgvector).
+      3. Inject chunks as context into a grounded Gemini prompt.
+      4. Return the answer + source filenames for UI citation display.
+    """
+    client_ip = get_client_ip(http_request)
+    question  = request.message.strip()
+
+    if not question:
+        return RagQueryResponse(
+            status="error", reply="Please enter a question.", sources=[],
+            error_code="validation_error",
+        )
+    if len(question) > 500:
+        return RagQueryResponse(
+            status="error",
+            reply="Question too long — keep it under 500 characters.",
+            sources=[],
+            error_code="validation_error",
+        )
+
+    try:
+        validate_question(question)
+    except InputModerationError as e:
+        _audit("rag_moderation_block", ip=client_ip, reason=str(e))
+        return RagQueryResponse(
+            status="error",
+            reply="Your message contains content that can't be processed.",
+            sources=[],
+            error_code="moderation_error",
+        )
+
+    try:
+        check_rate_limit(client_ip)
+    except RateLimitError:
+        return RagQueryResponse(
+            status="error",
+            reply="Too many requests — please wait a moment.",
+            sources=[],
+            error_code="rate_limit_error",
+        )
+
+    _audit("rag_request", ip=client_ip, question=question)
+
+    try:
+        # Step 1: embed the question
+        query_vector = _embed_text(question)
+
+        # Step 2: retrieve relevant chunks from Supabase
+        with get_db_conn() as conn:
+            chunks = _retrieve_chunks(conn, query_vector, top_k=5)
+
+        if not chunks:
+            return RagQueryResponse(
+                status="success",
+                reply="לא נמצא מידע רלוונטי במאגר הידע שלנו לשאלה זו. נסה לנסח מחדש." \
+                      if any(ord(c) > 0x590 for c in question) else \
+                      "No relevant information found in the knowledge base for your question. Try rephrasing.",
+                sources=[],
+            )
+
+        # Step 3: build the context block
+        context_parts = []
+        for i, chunk in enumerate(chunks, 1):
+            source = chunk["source"] or "unknown"
+            context_parts.append(f"[{i}] (from {source}):\n{chunk['content']}")
+        context = "\n\n".join(context_parts)
+
+        # Step 4: call Gemini with the grounded prompt
+        prompt = RAG_PROMPT_TEMPLATE.format(context=context, question=question)
+        reply  = _call_llm(prompt)
+
+        sources = sorted({c["source"] for c in chunks if c["source"]})
+        _audit("rag_success", ip=client_ip, sources=sources, chunks=len(chunks))
+
+        return RagQueryResponse(status="success", reply=reply, sources=sources)
+
+    except TimeoutError:
+        logger.error("[rag] LLM timeout")
+        return RagQueryResponse(
+            status="error",
+            reply="The AI took too long to respond. Please try again.",
+            sources=[],
+            error_code="llm_error",
+        )
+    except Exception as e:
+        err_str = str(e).lower()
+        if "429" in err_str or "quota" in err_str:
+            return RagQueryResponse(
+                status="error",
+                reply="The AI is busy — please wait ~30 seconds and try again.",
+                sources=[],
+                error_code="llm_error",
+            )
+        logger.error(f"[rag] Unexpected {type(e).__name__}: {e}", exc_info=True)
+        return RagQueryResponse(
+            status="error",
+            reply="Something went wrong. Please try again.",
+            sources=[],
+            error_code="unknown",
+        )
 
 
 @app.post("/api/raw_query", dependencies=[Depends(require_auth)])
