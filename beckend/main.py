@@ -186,6 +186,10 @@ def get_db_conn():
 
 _schema_cache: str = ""   # populated once on first chat request; never changes at runtime
 
+# Tables that exist for infrastructure / identity management — never exposed to
+# the LLM so it cannot generate SELECT queries against internal session data.
+_INTERNAL_TABLES = {"sessions", "messages"}
+
 def get_schema_description(conn) -> str:
     """
     Return the public schema as a prompt-ready string.
@@ -194,6 +198,9 @@ def get_schema_description(conn) -> str:
     table structure without any manual synchronisation.  Result is cached
     after the first successful call so the round-trips don't run on every
     chat request.
+
+    Internal tables (sessions, messages) are excluded so the LLM only sees
+    the Instagram analytics tables it is allowed to query.
     """
     global _schema_cache
     if _schema_cache:
@@ -207,7 +214,7 @@ def get_schema_description(conn) -> str:
                   AND  table_type   = 'BASE TABLE'
                 ORDER  BY table_name
             """)
-            tables = [row[0] for row in cur.fetchall()]
+            tables = [row[0] for row in cur.fetchall() if row[0] not in _INTERNAL_TABLES]
 
             lines = []
             for table in tables:
@@ -228,6 +235,86 @@ def get_schema_description(conn) -> str:
     except Exception as e:
         logger.error(f"[schema] Fetch failed: {e}")
         return ""
+
+
+# ─── Session & Message Persistence ───────────────────────────────────────────
+# All four helpers are intentionally commit-free — the calling route handler
+# owns the transaction boundary and calls conn.commit() at the right moment.
+# This keeps reads and writes inside a single connection checkout, which is
+# important given our pool size of 3.
+
+def _db_create_session(conn, channel: str = "web", contact_id: str = None) -> str:
+    """INSERT a new session row and return its UUID as a plain string."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO sessions (channel, contact_id)
+            VALUES (%s, %s)
+            RETURNING id, created_at
+            """,
+            (channel, contact_id),
+        )
+        row = cur.fetchone()
+    return str(row[0]), str(row[1])   # (session_id, created_at)
+
+
+def _db_load_history(conn, session_id: str, limit: int = 20) -> list:
+    """
+    Return the last `limit` messages for a session, ordered oldest → newest.
+    Used to rebuild the LLM history context from the database so follow-up
+    questions work correctly even after a page refresh.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT role, content, sql_used, row_count, created_at
+            FROM   messages
+            WHERE  session_id = %s
+            ORDER  BY created_at DESC
+            LIMIT  %s
+            """,
+            (session_id, limit),
+        )
+        rows = cur.fetchall()
+    # Reverse: DESC fetch gives newest-first; we need oldest-first for the prompt.
+    return [
+        {
+            "role":       r[0],
+            "content":    r[1],
+            "sql_used":   r[2],
+            "row_count":  r[3],
+            "created_at": str(r[4]),
+        }
+        for r in reversed(rows)
+    ]
+
+
+def _db_save_message(
+    conn,
+    session_id: str,
+    role: str,
+    content: str,
+    sql_used: str = None,
+    row_count: int = None,
+) -> None:
+    """INSERT one message turn. Caller must commit."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO messages (session_id, role, content, sql_used, row_count)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (session_id, role, content, sql_used, row_count),
+        )
+
+
+def _db_touch_session(conn, session_id: str) -> None:
+    """Bump last_active so the session appears first in recent-sessions queries."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE sessions SET last_active = NOW() WHERE id = %s",
+            (session_id,),
+        )
 
 
 # ─── Input Content Moderation ─────────────────────────────────────────────────
@@ -843,8 +930,9 @@ class HistoryMessage(BaseModel):
     content: str
 
 class ChatRequest(BaseModel):
-    message: str
-    history: list[HistoryMessage] = []
+    message:    str
+    history:    list[HistoryMessage] = []  # in-memory history (backward-compat)
+    session_id: Optional[str] = None       # if set, DB history is used instead
 
 class ChatResponse(BaseModel):
     status:       str                    # "success" | "error"
@@ -855,6 +943,7 @@ class ChatResponse(BaseModel):
     error_code:   Optional[str]  = None
     columns:      Optional[list] = None  # column names for CSV export
     raw_results:  Optional[list] = None  # serialised rows for CSV export
+    session_id:   Optional[str]  = None  # echoed back so the frontend can store it
 
 class RawQueryRequest(BaseModel):
     sql: str = Field(
@@ -866,6 +955,23 @@ class RawQueryRequest(BaseModel):
             "before any parsing or DB access occurs."
         ),
     )
+
+class SessionCreateRequest(BaseModel):
+    channel:    str = Field(default="web", pattern="^(web|whatsapp|telegram)$")
+    contact_id: Optional[str] = None   # phone number, Telegram ID, or browser fingerprint
+
+class SessionCreateResponse(BaseModel):
+    session_id: str
+    channel:    str
+    created_at: str
+
+class MessageOut(BaseModel):
+    """One message turn returned by GET /api/sessions/{id}/history."""
+    role:       str
+    content:    str
+    sql_used:   Optional[str] = None
+    row_count:  Optional[int] = None
+    created_at: str
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -984,18 +1090,43 @@ def chat(request: ChatRequest, http_request: Request):
             error_code="rate_limit_error",
         )
 
-    logger.info(f"[chat] {client_ip!r}: {question!r}")
-    _audit("chat_request", ip=client_ip, question=question)
+    session_id = request.session_id
+    logger.info(f"[chat] {client_ip!r} session={session_id!r}: {question!r}")
+    _audit("chat_request", ip=client_ip, question=question, session_id=session_id)
 
     try:
         with get_db_conn() as conn:
-            result = run_pipeline(question, conn, history=request.history)
+            # ── History resolution ────────────────────────────────────────────
+            # If the caller supplied a session_id, load the real conversation
+            # history from the DB so follow-up questions work after a refresh.
+            # Otherwise fall back to the in-memory history sent in the request
+            # (backward-compatible with clients that don't use sessions yet).
+            if session_id:
+                db_msgs = _db_load_history(conn, session_id, limit=12)
+                history = [HistoryMessage(role=m["role"], content=m["content"]) for m in db_msgs]
+            else:
+                history = request.history
+
+            result = run_pipeline(question, conn, history=history)
+
+            # ── Persist messages if a session is active ───────────────────────
+            if session_id:
+                _db_save_message(conn, session_id, "user", question)
+                _db_save_message(
+                    conn, session_id, "assistant",
+                    result["reply"],
+                    sql_used=result.get("sql_used"),
+                    row_count=result.get("row_count"),
+                )
+                _db_touch_session(conn, session_id)
+                conn.commit()   # single commit for all three writes
 
         _audit("chat_success", ip=client_ip,
                row_count=result.get("row_count"),
                ms=result.get("execution_ms"),
+               session_id=session_id,
                conversational=result["sql_used"] is None)
-        return ChatResponse(status="success", **result)
+        return ChatResponse(status="success", session_id=session_id, **result)
 
     except SQLValidationError as e:
         logger.warning(f"[chat] SQL validation blocked: {e}")
@@ -1048,6 +1179,67 @@ def chat(request: ChatRequest, http_request: Request):
             reply="Something went wrong on our end. Please try again.",
             error_code="unknown",
         )
+
+
+@app.post(
+    "/api/sessions",
+    response_model=SessionCreateResponse,
+    dependencies=[Depends(require_auth)],
+)
+def create_session(request: SessionCreateRequest):
+    """
+    Create a new persistent conversation session.
+
+    Returns a session_id UUID the frontend stores in localStorage and sends
+    with every subsequent /api/chat request to enable history persistence,
+    cross-device recall, and eventually GHL CRM sync.
+    """
+    try:
+        with get_db_conn() as conn:
+            session_id, created_at = _db_create_session(
+                conn, request.channel, request.contact_id
+            )
+            conn.commit()
+        logger.info(f"[sessions] Created session={session_id!r} channel={request.channel!r}")
+        return SessionCreateResponse(
+            session_id=session_id,
+            channel=request.channel,
+            created_at=created_at,
+        )
+    except Exception as e:
+        logger.error(f"[sessions] Failed to create session: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not create session.")
+
+
+@app.get("/api/sessions/{session_id}/history", dependencies=[Depends(require_auth)])
+def get_session_history(session_id: str):
+    """
+    Load the full message history for a session.
+
+    Used by the frontend on page-load to restore a previous conversation from
+    localStorage — the frontend supplies the stored session_id and receives
+    back all turns so the chat UI can be reconstructed exactly.
+    """
+    try:
+        with get_db_conn() as conn:
+            # Verify the session exists before loading messages.
+            with conn.cursor() as cur:
+                cur.execute("SELECT channel FROM sessions WHERE id = %s", (session_id,))
+                row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Session not found.")
+            messages = _db_load_history(conn, session_id, limit=200)
+
+        return {
+            "status":     "success",
+            "session_id": session_id,
+            "messages":   messages,
+        }
+    except HTTPException:
+        raise   # re-raise 404 as-is; don't wrap it in a 500
+    except Exception as e:
+        logger.error(f"[sessions] Failed to load history for {session_id!r}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not load session history.")
 
 
 @app.post("/api/raw_query", dependencies=[Depends(require_auth)])
