@@ -1,18 +1,20 @@
 name: Backend CI
 
-# Triggers: any push or PR that touches the backend directory.
+# Triggers: every push to main/develop and every PR targeting main.
+#
+# NO path filter — this is deliberate. "pytest — backend unit tests" is a
+# REQUIRED status check in main's branch-protection rule. A path-filtered
+# workflow is *skipped* (not run) on PRs that don't touch beckend/**, and
+# GitHub reports a skipped-but-required check as permanently "expected"/pending
+# — which silently blocks every frontend-only PR from merging. Running the
+# (fast, fully-mocked) backend suite on all PRs guarantees the required check
+# always reports a real pass/fail, so frontend-only changes are never deadlocked.
 # Vercel picks up the deployment automatically once this workflow goes green.
 on:
   push:
     branches: [main, develop]
-    paths:
-      - "beckend/**"
-      - ".github/workflows/backend-ci.yml"
   pull_request:
     branches: [main]
-    paths:
-      - "beckend/**"
-      - ".github/workflows/backend-ci.yml"
 
 jobs:
   test:

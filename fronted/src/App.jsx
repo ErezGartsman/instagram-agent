@@ -597,7 +597,6 @@ const Message = ({ msg, onRetry, onExport, onPin, isPinned, onRerunSql }) => {
   }
 
   const showData    = !msg.isError && msg.rawResults?.length >= 1 && msg.columns?.length >= 1
-  const showSources = !msg.isError && msg.sources?.length > 0
   const animateText = !!msg.fresh && !msg.isError
 
   return (
@@ -616,17 +615,6 @@ const Message = ({ msg, onRetry, onExport, onPin, isPinned, onRerunSql }) => {
             isPinned={isPinned}
           />
         )}
-        {showSources && (
-          <div className="msg-sources">
-            <Icon name="sparkle" size={11}/>
-            <span className="msg-sources-label">מקורות:</span>
-            {msg.sources.map(s => (
-              <span key={s} className="msg-source-badge">
-                {s.replace(/\.txt$/i, '')}
-              </span>
-            ))}
-          </div>
-        )}
         {msg.timestamp && <span className="msg-timestamp">{msg.timestamp}</span>}
         {msg.isError && msg.originalQuestion && (
           <button className="retry-btn" onClick={() => onRetry(msg.originalQuestion)}>
@@ -640,29 +628,55 @@ const Message = ({ msg, onRetry, onExport, onPin, isPinned, onRerunSql }) => {
 }
 
 // ─── Empty Chat ────────────────────────────────────────────────────────────────
-const EmptyChat = ({ onSelect }) => {
-  const suggestions = [
-    { label: 'Engagement',     icon: 'analytics', color: '79, 126, 255',  q: 'What is the average number of comments per post?' },
-    { label: 'Top Commenters', icon: 'query',     color: '0, 212, 170',   q: 'Who are the top 5 users that commented the most?' },
-    { label: 'Monthly Likes',  icon: 'bar',       color: '157, 110, 255', q: 'How many likes did we get in February 2026?' },
-    { label: 'Post Frequency', icon: 'analytics', color: '245, 167, 66',  q: 'How many posts were published each month?' },
-    { label: 'Most Liked',     icon: 'sparkle',   color: '255, 107, 157', q: 'Which post has the most likes?' },
-  ]
+// Suggested-prompt sets are mode-specific: Instagram analytics (English data
+// questions) vs. "Ask Erez" consulting (Hebrew, business-facing). The whole
+// empty state — headline, subtitle, cards — swaps with the active mode so the
+// RAG experience reads like talking to a representative, not a database.
+const DATA_SUGGESTIONS = [
+  { label: 'Engagement',     icon: 'analytics', color: '79, 126, 255',  q: 'What is the average number of comments per post?' },
+  { label: 'Top Commenters', icon: 'query',     color: '0, 212, 170',   q: 'Who are the top 5 users that commented the most?' },
+  { label: 'Monthly Likes',  icon: 'bar',       color: '157, 110, 255', q: 'How many likes did we get in February 2026?' },
+  { label: 'Post Frequency', icon: 'analytics', color: '245, 167, 66',  q: 'How many posts were published each month?' },
+  { label: 'Most Liked',     icon: 'sparkle',   color: '255, 107, 157', q: 'Which post has the most likes?' },
+]
+
+const RAG_SUGGESTIONS = [
+  { label: 'שירותים', icon: 'schema',  color: '79, 126, 255',  q: 'מה השירותים שלכם?' },
+  { label: 'היכרות',  icon: 'sparkle', color: '0, 212, 170',   q: 'מי זה ארז גרצמן?' },
+  { label: 'פגישה',   icon: 'query',   color: '157, 110, 255', q: 'איך קובעים פגישת ייעוץ?' },
+]
+
+const EmptyChat = ({ onSelect, ragMode }) => {
+  const suggestions = ragMode ? RAG_SUGGESTIONS : DATA_SUGGESTIONS
   return (
     <div className="empty-chat">
       <div className="empty-glyph"><Icon name="logo" size={48}/></div>
-      <h2 className="empty-title">
-        Your Instagram data,<br/>
-        <span className="empty-title-line2">answered.</span>
-      </h2>
-      <p className="empty-sub">
-        Ask in plain language. Get SQL-precision answers, charts, and exportable data — in seconds.
-      </p>
+      {ragMode ? (
+        <>
+          <h2 className="empty-title" dir="rtl">
+            כאן כדי <span className="empty-title-line2">לעזור.</span>
+          </h2>
+          <p className="empty-sub" dir="rtl">
+            שאלו על השירותים, על ארז גרצמן, או על קביעת פגישת ייעוץ — ואשיב לכם ישירות.
+          </p>
+        </>
+      ) : (
+        <>
+          <h2 className="empty-title">
+            Your Instagram data,<br/>
+            <span className="empty-title-line2">answered.</span>
+          </h2>
+          <p className="empty-sub">
+            Ask in plain language. Get SQL-precision answers, charts, and exportable data — in seconds.
+          </p>
+        </>
+      )}
       <div className="suggestion-list">
         {suggestions.map((s, i) => (
           <button
             key={i}
-            className="suggestion-card"
+            className={`suggestion-card${ragMode ? ' rtl' : ''}`}
+            dir={ragMode ? 'rtl' : 'ltr'}
             onClick={() => onSelect(s.q)}
             style={{ '--card-rgb': s.color, animationDelay: `${i * 0.07}s` }}
           >
@@ -1756,7 +1770,7 @@ export default function App() {
 
           <div className="chat-area">
               {messages.length === 0
-                ? <EmptyChat onSelect={handleSuggestion}/>
+                ? <EmptyChat onSelect={handleSuggestion} ragMode={ragMode}/>
                 : (
                   <div className="messages-scroll">
                     {messages.map((msg, i) => (
@@ -1791,7 +1805,7 @@ export default function App() {
                   onClick={() => setRagMode(true)}
                   title="Ask questions about your business"
                 >
-                  <Icon name="sparkle" size={12}/> Knowledge Base
+                  <Icon name="sparkle" size={12}/> Ask Erez
                 </button>
               </div>
 

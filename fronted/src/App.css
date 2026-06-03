@@ -748,12 +748,22 @@ kbd {
   line-height: 1.45; padding-left: 33px;
 }
 
+/* RTL variant — used for the Hebrew "Ask Erez" suggestion cards so the icon,
+   label and question align to the right edge. */
+.suggestion-card.rtl { text-align: right; }
+.suggestion-card.rtl .sug-q { padding-left: 0; padding-right: 33px; }
+
 /* ─── Messages ───────────────────────────────────────────────────────────── */
 .msg-row { display: flex; gap: 10px; align-items: flex-start; }
 .msg-row.user { justify-content: flex-end; }
 
 .msg-bubble-wrapper-user {
   display: flex; flex-direction: column; align-items: flex-end; gap: 4px;
+  /* Cap width here (relative to the full-width row) instead of on the bubble.
+     A % max-width on the bubble resolves against this shrink-to-fit wrapper,
+     a circular dependency that collapsed short messages toward min-content
+     and wrapped them onto a second line. */
+  max-width: 72%;
 }
 
 .bot-avatar {
@@ -782,7 +792,8 @@ kbd {
   background: rgba(79, 126, 255, 0.72);
   color: #fff;
   border-radius: 12px 12px 3px 12px;
-  max-width: 72%;
+  max-width: 100%;          /* cap lives on .msg-bubble-wrapper-user now */
+  width: fit-content;       /* hug content so short messages stay on one line */
   white-space: pre-wrap;
   border: 1px solid rgba(79, 126, 255, 0.35);
   backdrop-filter: blur(14px) saturate(160%);
