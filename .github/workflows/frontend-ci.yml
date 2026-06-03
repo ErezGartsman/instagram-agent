@@ -1,16 +1,16 @@
 name: Frontend CI
 
+# NO path filter — deliberate. "Vite build check" is a REQUIRED status check on
+# main's branch-protection rule. A path-filtered workflow is *skipped* (not run)
+# on backend-only PRs, and GitHub reports a skipped-but-required check as
+# permanently "expected"/pending — which silently blocks those PRs from merging
+# (the mirror image of the backend-ci trap). Running the build on every PR keeps
+# the required check always resolving.
 on:
   push:
     branches: [main, develop]
-    paths:
-      - "fronted/**"
-      - ".github/workflows/frontend-ci.yml"
   pull_request:
     branches: [main]
-    paths:
-      - "fronted/**"
-      - ".github/workflows/frontend-ci.yml"
 
 jobs:
   build:

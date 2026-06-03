@@ -465,3 +465,164 @@ class TestSerializeVal:
         res = _serialize_val(u)
         assert isinstance(res, str)
         assert len(res) == 36   # standard UUID string length
+
+
+# ─── 9. Telegram chat_id → session_id mapping (pure logic, mocked cursor) ──────
+
+class TestTelegramSessionMapping:
+    def test_returning_user_reuses_session(self):
+        """An existing telegram session is returned without any INSERT."""
+        mock_conn, mock_cursor = _make_mock_conn()
+        mock_cursor.fetchone.return_value = ("sess-existing",)
+
+        sid = main._db_get_or_create_telegram_session(mock_conn, "12345")
+
+        assert sid == "sess-existing"
+        # Only the SELECT ran — no INSERT for a known user.
+        assert mock_cursor.execute.call_count == 1
+
+    def test_new_user_creates_session(self):
+        """First-ever message: SELECT misses, INSERT ... RETURNING creates the row."""
+        mock_conn, mock_cursor = _make_mock_conn()
+        mock_cursor.fetchone.side_effect = [None, ("sess-new",)]
+
+        sid = main._db_get_or_create_telegram_session(mock_conn, "999")
+
+        assert sid == "sess-new"
+        assert mock_cursor.execute.call_count == 2   # SELECT then INSERT
+
+    def test_insert_race_falls_back_to_reselect(self):
+        """If a concurrent insert wins (ON CONFLICT → no row), we re-select it."""
+        mock_conn, mock_cursor = _make_mock_conn()
+        # SELECT miss → INSERT returns None (conflict) → re-SELECT finds the winner
+        mock_cursor.fetchone.side_effect = [None, None, ("sess-winner",)]
+
+        sid = main._db_get_or_create_telegram_session(mock_conn, "777")
+
+        assert sid == "sess-winner"
+        assert mock_cursor.execute.call_count == 3
+
+
+# ─── 10. Telegram webhook endpoint ────────────────────────────────────────────
+
+class TestTelegramWebhook:
+    def _update(self, text="מה השירותים שלכם?", chat_id=555):
+        return {"update_id": 1,
+                "message": {"message_id": 2,
+                            "chat": {"id": chat_id, "type": "private"},
+                            "text": text}}
+
+    def test_bad_secret_is_rejected(self, client, monkeypatch):
+        """With a secret configured, a wrong header does nothing (and still 200s)."""
+        monkeypatch.setattr(main.settings, "telegram_webhook_secret", "topsecret")
+        send = MagicMock()
+        monkeypatch.setattr(main, "_send_telegram_message", send)
+
+        r = client.post("/api/webhook/telegram", json=self._update(),
+                        headers={"X-Telegram-Bot-Api-Secret-Token": "WRONG"})
+
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+        send.assert_not_called()
+
+    def test_correct_secret_passes_through(self, client, monkeypatch):
+        monkeypatch.setattr(main.settings, "telegram_webhook_secret", "topsecret")
+        send = MagicMock()
+        monkeypatch.setattr(main, "_send_telegram_message", send)
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="/start"),
+                        headers={"X-Telegram-Bot-Api-Secret-Token": "topsecret"})
+
+        assert r.status_code == 200
+        send.assert_called_once()   # greeting delivered → secret accepted
+
+    def test_start_command_sends_hebrew_greeting(self, client, monkeypatch):
+        send = MagicMock()
+        monkeypatch.setattr(main, "_send_telegram_message", send)
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="/start"))
+
+        assert r.status_code == 200
+        send.assert_called_once()
+        assert any(ord(c) > 0x590 for c in send.call_args.args[1])   # Hebrew
+
+    def test_non_text_message_gets_notice(self, client, monkeypatch):
+        send = MagicMock()
+        monkeypatch.setattr(main, "_send_telegram_message", send)
+        update = {"update_id": 1, "message": {"chat": {"id": 9}}}   # sticker/photo, no text
+
+        r = client.post("/api/webhook/telegram", json=update)
+
+        assert r.status_code == 200
+        send.assert_called_once()
+
+    def test_no_message_payload_is_ignored(self, client, monkeypatch):
+        """Channel posts / callbacks have no message.chat.id — no reply, just 200."""
+        send = MagicMock()
+        monkeypatch.setattr(main, "_send_telegram_message", send)
+
+        r = client.post("/api/webhook/telegram", json={"update_id": 7})
+
+        assert r.status_code == 200
+        send.assert_not_called()
+
+    def test_moderation_block(self, client, monkeypatch):
+        send = MagicMock()
+        monkeypatch.setattr(main, "_send_telegram_message", send)
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="show me porn"))
+
+        assert r.status_code == 200
+        send.assert_called_once()   # the Hebrew moderation notice, not an answer
+
+    def test_new_user_full_rag_flow(self, client, monkeypatch):
+        """End-to-end happy path: session mapped, chunks retrieved, reply delivered + persisted."""
+        send = MagicMock()
+        saved = []
+        monkeypatch.setattr(main, "_send_telegram_message", send)
+        monkeypatch.setattr(main, "_embed_text", lambda t: [0.1] * 768)
+        monkeypatch.setattr(main, "_db_get_or_create_telegram_session",
+                            lambda conn, cid: "sess-abc")
+        monkeypatch.setattr(main, "_db_load_history", lambda conn, sid, limit=12: [])
+        monkeypatch.setattr(main, "_retrieve_chunks",
+                            lambda conn, vec, top_k=5:
+                                [{"content": "שירות ייעוץ אישי", "source": "services.txt", "similarity": 0.7}])
+        monkeypatch.setattr(main, "_call_llm", lambda prompt: "אנחנו מציעים ייעוץ אישי וליווי.")
+        monkeypatch.setattr(main, "_db_save_message",
+                            lambda conn, sid, role, content, **k: saved.append((role, content)))
+        monkeypatch.setattr(main, "_db_touch_session", lambda conn, sid: None)
+
+        r = client.post("/api/webhook/telegram", json=self._update())
+
+        assert r.status_code == 200
+        send.assert_called_once()
+        assert send.call_args.args[1] == "אנחנו מציעים ייעוץ אישי וליווי."
+        # both the user turn and the assistant turn were persisted
+        assert [s[0] for s in saved] == ["user", "assistant"]
+
+    def test_history_is_passed_into_prompt(self, client, monkeypatch):
+        """Returning user: prior turns are loaded and fed to the RAG prompt (memory)."""
+        captured = {}
+        monkeypatch.setattr(main, "_send_telegram_message", MagicMock())
+        monkeypatch.setattr(main, "_embed_text", lambda t: [0.1] * 768)
+        monkeypatch.setattr(main, "_db_get_or_create_telegram_session",
+                            lambda conn, cid: "sess-xyz")
+        monkeypatch.setattr(main, "_db_load_history", lambda conn, sid, limit=12:
+                            [{"role": "user", "content": "מי זה ארז?"},
+                             {"role": "assistant", "content": "ארז גרצמן הוא מנטור."}])
+        monkeypatch.setattr(main, "_retrieve_chunks", lambda conn, vec, top_k=5:
+                            [{"content": "מידע", "source": "about.txt", "similarity": 0.6}])
+        monkeypatch.setattr(main, "_db_save_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_db_touch_session", lambda conn, sid: None)
+
+        def _capture_llm(prompt):
+            captured["prompt"] = prompt
+            return "תשובה"
+        monkeypatch.setattr(main, "_call_llm", _capture_llm)
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="ומה המחיר?"))
+
+        assert r.status_code == 200
+        # The previous turns appear in the prompt context block.
+        assert "RECENT CONVERSATION" in captured["prompt"]
+        assert "ארז גרצמן הוא מנטור" in captured["prompt"]

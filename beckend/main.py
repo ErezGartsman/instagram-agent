@@ -16,6 +16,7 @@ import threading
 import decimal
 import datetime
 import uuid
+import urllib.request
 import concurrent.futures
 from collections import OrderedDict
 from contextlib import asynccontextmanager, contextmanager
@@ -25,7 +26,7 @@ import psycopg2
 import psycopg2.pool
 from google import genai
 from google.genai import types as genai_types
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -46,6 +47,14 @@ class Settings(BaseSettings):
     # Bearer token for API auth. Empty string = auth disabled (local dev only).
     # Set a strong random value in production: openssl rand -hex 32
     nexus_api_key:       str = ""
+
+    # ── Telegram bot (optional — webhook is inert until both are set) ──────────
+    # telegram_bot_token:      from BotFather (/newbot), e.g. "123456789:AA…".
+    # telegram_webhook_secret: a value YOU generate (openssl rand -hex 32) and
+    #   pass to Telegram via setWebhook?secret_token=…; Telegram echoes it back
+    #   in the X-Telegram-Bot-Api-Secret-Token header so we can reject spoofers.
+    telegram_bot_token:      str = ""
+    telegram_webhook_secret: str = ""
 
     model_config = {"env_file": ".env"}
 
@@ -1253,7 +1262,7 @@ If the context does not contain enough information, say so honestly.
 === CONTEXT FROM KNOWLEDGE BASE ===
 {context}
 
-=== LANGUAGE RULE ===
+{history_block}=== LANGUAGE RULE ===
 Reply in the exact same language as the user's question. \
 If the question is in Hebrew, reply in Hebrew. If English, reply in English.
 
@@ -1329,6 +1338,55 @@ def _retrieve_chunks(conn, query_vector: list[float], top_k: int = 5) -> list[di
     ]
 
 
+def _build_rag_history_block(history: list) -> str:
+    """
+    Format recent conversation turns (dicts from _db_load_history, oldest→newest)
+    into a context block for the RAG prompt so the assistant has short-term
+    memory. Returns "" when there is no history — the web /api/rag_query path
+    passes nothing, so its prompt is byte-for-byte unchanged.
+    """
+    if not history:
+        return ""
+    lines = ["=== RECENT CONVERSATION (most recent last; for context only) ==="]
+    for m in history[-6:]:   # last 6 messages ≈ 3 user↔assistant turns
+        role    = "User" if m.get("role") == "user" else "Assistant"
+        content = (m.get("content") or "")[:400]
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines) + "\n\n"
+
+
+def _rag_generate(question: str, chunks: list, history: list = None) -> tuple:
+    """
+    Turn retrieved knowledge-base chunks into a grounded answer. Does NO database
+    access, so it is deliberately called *after* the pooled connection has been
+    released — the slow Gemini call never holds a connection. Returns
+    (reply, sources). Shared by /api/rag_query and the Telegram webhook.
+    """
+    if not chunks:
+        is_hebrew = any(ord(c) > 0x590 for c in question)
+        reply = (
+            "לא נמצא מידע רלוונטי במאגר הידע שלנו לשאלה זו. נסה לנסח מחדש."
+            if is_hebrew else
+            "No relevant information found in the knowledge base for your question. Try rephrasing."
+        )
+        return reply, []
+
+    context_parts = []
+    for i, chunk in enumerate(chunks, 1):
+        source = chunk["source"] or "unknown"
+        context_parts.append(f"[{i}] (from {source}):\n{chunk['content']}")
+    context = "\n\n".join(context_parts)
+
+    prompt = RAG_PROMPT_TEMPLATE.format(
+        context=context,
+        history_block=_build_rag_history_block(history or []),
+        question=question,
+    )
+    reply   = _call_llm(prompt)
+    sources = sorted({c["source"] for c in chunks if c["source"]})
+    return reply, sources
+
+
 @app.post(
     "/api/rag_query",
     response_model=RagQueryResponse,
@@ -1339,7 +1397,7 @@ def rag_query(request: RagQueryRequest, http_request: Request):
     Knowledge-base Q&A via RAG.
 
     Pipeline:
-      1. Embed the user's question with Gemini text-embedding-004.
+      1. Embed the user's question with Gemini gemini-embedding-001 (768 dims).
       2. Retrieve the top-5 most similar chunks from knowledge_base (pgvector).
       3. Inject chunks as context into a grounded Gemini prompt.
       4. Return the answer + source filenames for UI citation display.
@@ -1384,36 +1442,15 @@ def rag_query(request: RagQueryRequest, http_request: Request):
     _audit("rag_request", ip=client_ip, question=question)
 
     try:
-        # Step 1: embed the question
+        # Embed first, then hold the pooled connection only for the vector
+        # search — _rag_generate() runs the slow Gemini call with no connection
+        # checked out.
         query_vector = _embed_text(question)
-
-        # Step 2: retrieve relevant chunks from Supabase
         with get_db_conn() as conn:
             chunks = _retrieve_chunks(conn, query_vector, top_k=5)
 
-        if not chunks:
-            return RagQueryResponse(
-                status="success",
-                reply="לא נמצא מידע רלוונטי במאגר הידע שלנו לשאלה זו. נסה לנסח מחדש." \
-                      if any(ord(c) > 0x590 for c in question) else \
-                      "No relevant information found in the knowledge base for your question. Try rephrasing.",
-                sources=[],
-            )
-
-        # Step 3: build the context block
-        context_parts = []
-        for i, chunk in enumerate(chunks, 1):
-            source = chunk["source"] or "unknown"
-            context_parts.append(f"[{i}] (from {source}):\n{chunk['content']}")
-        context = "\n\n".join(context_parts)
-
-        # Step 4: call Gemini with the grounded prompt
-        prompt = RAG_PROMPT_TEMPLATE.format(context=context, question=question)
-        reply  = _call_llm(prompt)
-
-        sources = sorted({c["source"] for c in chunks if c["source"]})
+        reply, sources = _rag_generate(question, chunks)
         _audit("rag_success", ip=client_ip, sources=sources, chunks=len(chunks))
-
         return RagQueryResponse(status="success", reply=reply, sources=sources)
 
     except TimeoutError:
@@ -1440,6 +1477,185 @@ def rag_query(request: RagQueryRequest, http_request: Request):
             sources=[],
             error_code="unknown",
         )
+
+
+# ─── Telegram Bot Webhook ─────────────────────────────────────────────────────
+# MVP: the bot is strictly the RAG "Erez representative". It only ever answers
+# from the knowledge base — it never generates SQL or touches the Instagram
+# analytics tables. Conversation memory is persisted in the existing sessions /
+# messages tables, keyed by the Telegram chat_id (no schema migration needed).
+
+# All bot-authored system messages are Hebrew to match the representative persona.
+_TG_GREETING = (
+    "שלום! 👋 אני העוזר הדיגיטלי של ארז גרצמן. "
+    "אפשר לשאול אותי על השירותים, על ארז, או על קביעת פגישת ייעוץ. במה אוכל לעזור?"
+)
+_TG_NON_TEXT   = "אני יודע לקרוא רק הודעות טקסט כרגע 🙂 כתבו לי שאלה ואשמח לעזור."
+_TG_TOO_LONG   = "ההודעה קצת ארוכה מדי. נסו לנסח אותה בקצרה ואענה."
+_TG_MODERATION = "לא הצלחתי לעבד את ההודעה. נסו לשאול על השירותים, על ארז, או על קביעת פגישה."
+_TG_RATE_LIMIT = "קצת הרבה הודעות בבת אחת 🙂 נסו שוב בעוד רגע."
+_TG_TIMEOUT    = "סליחה, לקח לי קצת יותר מדי זמן לחשוב. נסו לשאול שוב."
+_TG_ERROR      = "משהו השתבש אצלי כרגע. נסו שוב בעוד רגע."
+
+
+def _db_get_or_create_telegram_session(conn, chat_id: str) -> str:
+    """
+    Map a Telegram chat_id to a persistent Nexus session, reusing the existing
+    sessions table (channel='telegram', contact_id=chat_id). A returning user
+    therefore keeps their full conversation memory across messages and redeploys.
+
+    Race-safe: relies on the UNIQUE(channel, contact_id) index — if two first
+    messages arrive at once, the second INSERT is a no-op (ON CONFLICT) and we
+    re-select the row the winner created. Caller owns the commit.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM sessions WHERE channel = 'telegram' AND contact_id = %s LIMIT 1",
+            (chat_id,),
+        )
+        row = cur.fetchone()
+        if row:
+            return str(row[0])
+
+        cur.execute(
+            """
+            INSERT INTO sessions (channel, contact_id)
+            VALUES ('telegram', %s)
+            ON CONFLICT (channel, contact_id) DO NOTHING
+            RETURNING id
+            """,
+            (chat_id,),
+        )
+        inserted = cur.fetchone()
+        if inserted:
+            return str(inserted[0])
+
+        # A concurrent request won the insert — re-select its row.
+        cur.execute(
+            "SELECT id FROM sessions WHERE channel = 'telegram' AND contact_id = %s LIMIT 1",
+            (chat_id,),
+        )
+        return str(cur.fetchone()[0])
+
+
+def _send_telegram_message(chat_id, text: str) -> None:
+    """
+    Deliver a reply via Telegram's sendMessage. Uses the stdlib urllib so no HTTP
+    dependency is added to the serverless bundle. Best-effort: any network error
+    is logged, never raised — the webhook must always return 200 or Telegram will
+    retry the update and the user gets duplicate replies.
+    """
+    if not settings.telegram_bot_token:
+        logger.error("[telegram] TELEGRAM_BOT_TOKEN not set — cannot send reply.")
+        return
+
+    text = (text or "").strip()[:4096] or "…"   # Telegram hard-caps at 4096 chars
+    url  = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
+    data = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
+    req  = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as e:
+        logger.error(f"[telegram] sendMessage to {chat_id} failed: {e}")
+
+
+@app.post("/api/webhook/telegram")
+def telegram_webhook(
+    update: dict = Body(default={}),
+    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
+):
+    """
+    Telegram Bot webhook — the RAG "Erez representative".
+
+    Defined as a sync `def` so FastAPI runs it in a worker thread: the blocking
+    DB / embedding / LLM / urllib calls below never stall the event loop.
+
+    Auth: Telegram cannot send our Bearer token, so this route is deliberately
+    NOT behind require_auth. Instead we verify the secret token Telegram echoes
+    in the X-Telegram-Bot-Api-Secret-Token header (configured via
+    setWebhook?secret_token=…). Until the secret is set the check is skipped so
+    local testing stays friction-free.
+
+    The handler always returns 200 {"ok": true}; user-facing problems are
+    delivered as chat replies rather than HTTP errors, so Telegram never retries.
+    """
+    # ── 1. Verify the shared secret ───────────────────────────────────────────
+    if settings.telegram_webhook_secret:
+        if x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
+            logger.warning("[telegram] Rejected webhook: bad/missing secret token.")
+            return {"ok": True}   # 200, but do nothing
+
+    # ── 2. Parse the update (only plain-text private/group messages) ──────────
+    message = update.get("message") or update.get("edited_message") or {}
+    chat    = message.get("chat") or {}
+    chat_id = chat.get("id")
+    text    = (message.get("text") or "").strip()
+
+    if chat_id is None:
+        return {"ok": True}   # channel post, callback_query, etc. — ignore
+    chat_id_str = str(chat_id)
+
+    if not text:
+        _send_telegram_message(chat_id, _TG_NON_TEXT)   # sticker / photo / voice
+        return {"ok": True}
+    if text.startswith("/start"):
+        _send_telegram_message(chat_id, _TG_GREETING)
+        return {"ok": True}
+
+    _audit("telegram_request", chat_id=chat_id_str, question=text)
+
+    # ── 3. Guards (reuse the same primitives as the web endpoints) ────────────
+    if len(text) > 500:
+        _send_telegram_message(chat_id, _TG_TOO_LONG)
+        return {"ok": True}
+    try:
+        validate_question(text)
+    except InputModerationError:
+        _audit("telegram_moderation_block", chat_id=chat_id_str)
+        _send_telegram_message(chat_id, _TG_MODERATION)
+        return {"ok": True}
+    try:
+        check_rate_limit(chat_id_str)   # per-user throttle, keyed by chat_id
+    except RateLimitError:
+        _send_telegram_message(chat_id, _TG_RATE_LIMIT)
+        return {"ok": True}
+
+    # ── 4 & 5. Identity mapping + retrieval (one short connection checkout) ────
+    try:
+        query_vector = _embed_text(text)
+        with get_db_conn() as conn:
+            session_id = _db_get_or_create_telegram_session(conn, chat_id_str)
+            history    = _db_load_history(conn, session_id, limit=12)
+            chunks     = _retrieve_chunks(conn, query_vector, top_k=5)
+            conn.commit()   # persist the session row if it was just created
+
+        # ── 6. Generate the grounded answer (no DB connection held) ───────────
+        reply, sources = _rag_generate(text, chunks, history=history)
+
+        # ── 7. Persist this turn so the next message remembers it ─────────────
+        with get_db_conn() as conn:
+            _db_save_message(conn, session_id, "user", text)
+            _db_save_message(conn, session_id, "assistant", reply)
+            _db_touch_session(conn, session_id)
+            conn.commit()
+
+        _audit("telegram_success", chat_id=chat_id_str, session_id=session_id,
+               sources=sources, chunks=len(chunks))
+
+        # ── 8. Deliver ────────────────────────────────────────────────────────
+        _send_telegram_message(chat_id, reply)
+
+    except TimeoutError:
+        logger.error("[telegram] LLM timeout")
+        _send_telegram_message(chat_id, _TG_TIMEOUT)
+    except Exception as e:
+        logger.error(f"[telegram] Unexpected {type(e).__name__}: {e}", exc_info=True)
+        _send_telegram_message(chat_id, _TG_ERROR)
+
+    return {"ok": True}
 
 
 @app.post("/api/raw_query", dependencies=[Depends(require_auth)])
