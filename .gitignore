@@ -1,8 +1,12 @@
 # ─── Secrets & Config ────────────────────────────────────────────────────────
 .env
 .env.*
-!.env.example             # keep the example template in git
-!.env.production          # safe to commit — only contains public URLs, no secrets
+# Negations below MUST be on their own line — a trailing "# comment" becomes
+# part of the pattern and silently breaks the rule.
+# keep the example template in git (no secrets, just placeholders)
+!.env.example
+# safe to commit — only contains public URLs, no secrets
+!.env.production
 
 # ─── Python & Virtual Environments ───────────────────────────────────────────
 __pycache__/
