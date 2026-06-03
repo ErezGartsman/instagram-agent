@@ -83,7 +83,7 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
 
 def embed_chunks(client: genai.Client, chunks: list[str]) -> list[list[float]]:
     """
-    Embed a list of text chunks using Gemini text-embedding-004.
+    Embed a list of text chunks using Gemini gemini-embedding-001.
 
     Processes in batches of EMBED_BATCH with a small delay to stay within
     the free-tier rate limit (1,500 RPM / 100 requests per minute per project).
