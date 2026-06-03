@@ -1296,8 +1296,17 @@ def _retrieve_chunks(conn, query_vector: list[float], top_k: int = 5) -> list[di
     knowledge_base chunks with their similarity scores and source filenames.
 
     The <=> operator is cosine *distance* (0 = identical, 2 = opposite), so
-    similarity = 1 - distance.  We filter out anything below 0.5 similarity
-    to avoid injecting completely irrelevant context into the prompt.
+    similarity = 1 - distance.  We filter out low-relevance rows to avoid
+    injecting completely irrelevant context into the prompt.
+
+    THRESHOLD NOTE (root cause of the "always returns no info" prod bug):
+    gemini-embedding-001 truncated to 768 dims (Matryoshka) produces a
+    similarity distribution that is shifted noticeably lower than the
+    normalised 3072-dim space — genuinely relevant chunks routinely score in
+    the ~0.30–0.45 band rather than ~0.60+. The previous 0.50 floor therefore
+    rejected every row and the endpoint always replied "no relevant info."
+    0.25 keeps obvious garbage out while letting real matches through; the
+    top_k + ORDER BY already guarantee we only ever take the closest rows.
     """
     vec_str = f"[{','.join(str(v) for v in query_vector)}]"
     with conn.cursor() as cur:
@@ -1316,7 +1325,7 @@ def _retrieve_chunks(conn, query_vector: list[float], top_k: int = 5) -> list[di
     return [
         {"content": r[0], "source": r[1], "similarity": float(r[2])}
         for r in rows
-        if float(r[2]) >= 0.50   # relevance threshold — tune if needed
+        if float(r[2]) >= 0.25   # relevance threshold — calibrated for 768-dim gemini-embedding-001
     ]
 
 

@@ -29,6 +29,8 @@ duckdb
 # ─── Massive Data Files & PII ────────────────────────────────────────────────
 data/
 archive/
+# private business knowledge base (RAG source) — never commit
+beckend/knowledge/
 *.csv
 *.parquet
 *.xlsx
