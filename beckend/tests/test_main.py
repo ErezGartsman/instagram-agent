@@ -658,6 +658,124 @@ class TestTelegramWebhook:
         assert r.status_code == 200
         assert "ארז גרצמן" in send.call_args.args[1]
 
+    def test_booking_intent_sends_contact_keyboard(self, client, monkeypatch):
+        """When user expresses booking intent and has no lead, keyboard is sent after reply."""
+        messages_sent = []
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, reply_markup=None:
+                                messages_sent.append({"text": text, "markup": reply_markup}))
+        monkeypatch.setattr(main, "_embed_text", lambda t: [0.1] * 768)
+        monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: [])
+        monkeypatch.setattr(main, "_retrieve_chunks", lambda c, v, top_k=5:
+                            [{"content": "x", "source": "services.txt", "similarity": 0.7}])
+        monkeypatch.setattr(main, "_db_has_lead", lambda c, cid: False)   # no lead yet
+        monkeypatch.setattr(main, "_call_llm", lambda p: "הנה מידע על ייעוץ")
+        monkeypatch.setattr(main, "_db_save_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_db_touch_session", lambda c, sid: None)
+
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="אני מעוניין בפגישת ייעוץ"))
+
+        assert r.status_code == 200
+        assert len(messages_sent) == 2              # RAG reply + keyboard prompt
+        assert messages_sent[1]["markup"] is not None
+        assert messages_sent[1]["markup"].get("keyboard") is not None
+
+    def test_no_keyboard_when_lead_already_exists(self, client, monkeypatch):
+        """Booking intent + existing lead → reply only, no second keyboard prompt."""
+        messages_sent = []
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, reply_markup=None:
+                                messages_sent.append({"text": text}))
+        monkeypatch.setattr(main, "_embed_text", lambda t: [0.1] * 768)
+        monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: [])
+        monkeypatch.setattr(main, "_retrieve_chunks", lambda c, v, top_k=5:
+                            [{"content": "x", "source": "services.txt", "similarity": 0.7}])
+        monkeypatch.setattr(main, "_db_has_lead", lambda c, cid: True)   # already captured
+        monkeypatch.setattr(main, "_call_llm", lambda p: "הנה מידע")
+        monkeypatch.setattr(main, "_db_save_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_db_touch_session", lambda c, sid: None)
+
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="אני מעוניין בפגישת ייעוץ"))
+
+        assert r.status_code == 200
+        assert len(messages_sent) == 1              # RAG reply only
+
+    def test_contact_share_captures_lead_and_alerts_owner(self, client, monkeypatch):
+        """Native contact share → lead saved, owner alerted, warm confirmation sent."""
+        messages_sent = []
+        lead_saved    = {}
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, reply_markup=None:
+                                messages_sent.append({"cid": str(cid), "text": text}))
+        monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "OWNER_ID")
+        monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: [])
+        monkeypatch.setattr(main, "_db_save_lead",
+                            lambda conn, sid, cid, name, phone, summary:
+                                lead_saved.update({"name": name, "phone": phone}) or "lead-uuid")
+        monkeypatch.setattr(main, "_db_mark_lead_notified", lambda c, lid: None)
+
+        contact_update = {"update_id": 1,
+                          "message": {"chat": {"id": 555},
+                                      "contact": {"phone_number": "+972501234567",
+                                                  "first_name": "דנה", "last_name": "כהן"}}}
+        r = client.post("/api/webhook/telegram", json=contact_update)
+
+        assert r.status_code == 200
+        # User gets a warm confirmation
+        user_msgs = [m for m in messages_sent if m["cid"] == "555"]
+        assert any("תודה" in m["text"] for m in user_msgs)
+        # Owner gets an alert DM
+        owner_msgs = [m for m in messages_sent if m["cid"] == "OWNER_ID"]
+        assert len(owner_msgs) == 1
+        assert "+972501234567" in owner_msgs[0]["text"]
+        assert "דנה כהן" in owner_msgs[0]["text"]
+
+    def test_contact_share_duplicate_is_silent(self, client, monkeypatch):
+        """Second contact share from same user → save returns None, no double owner alert."""
+        owner_alerts = []
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, reply_markup=None: None)
+        monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "OWNER")
+        monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: [])
+        monkeypatch.setattr(main, "_db_save_lead",
+                            lambda *a, **k: None)   # ON CONFLICT → None
+        monkeypatch.setattr(main, "_alert_owner",
+                            lambda *a, **k: owner_alerts.append(1))
+
+        contact_update = {"update_id": 2,
+                          "message": {"chat": {"id": 777},
+                                      "contact": {"phone_number": "+972509999999",
+                                                  "first_name": "אלון"}}}
+        r = client.post("/api/webhook/telegram", json=contact_update)
+
+        assert r.status_code == 200
+        assert owner_alerts == []   # owner NOT alerted for duplicate
+
+    def test_regex_phone_fallback_captures_lead(self, client, monkeypatch):
+        """User types their phone number → captured via regex fallback."""
+        captured = {}
+        monkeypatch.setattr(main, "_send_telegram_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: [])
+        monkeypatch.setattr(main, "_db_has_lead", lambda c, cid: False)
+        monkeypatch.setattr(main, "_db_save_lead",
+                            lambda conn, sid, cid, name, phone, summary:
+                                captured.update({"phone": phone}) or "lead-uuid-regex")
+        monkeypatch.setattr(main, "_alert_owner", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_db_mark_lead_notified", lambda c, lid: None)
+
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="המספר שלי הוא 0521234567"))
+
+        assert r.status_code == 200
+        assert captured.get("phone") == "0521234567"
+
     def test_persona_injected_into_rag_prompt(self, client, monkeypatch):
         """The persona/brand DNA is prepended to the RAG prompt."""
         captured = {}

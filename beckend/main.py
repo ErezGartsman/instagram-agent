@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     #   in the X-Telegram-Bot-Api-Secret-Token header so we can reject spoofers.
     telegram_bot_token:      str = ""
     telegram_webhook_secret: str = ""
+    # Your personal Telegram chat_id — get it from @userinfobot.
+    # When set, the bot DMs you every time a new lead is captured.
+    telegram_owner_chat_id:  str = ""
 
     model_config = {"env_file": ".env"}
 
@@ -198,7 +201,7 @@ _schema_cache: str = ""   # populated once on first chat request; never changes 
 
 # Tables that exist for infrastructure / identity management — never exposed to
 # the LLM so it cannot generate SELECT queries against internal session data.
-_INTERNAL_TABLES = {"sessions", "messages", "knowledge_base", "app_config"}
+_INTERNAL_TABLES = {"sessions", "messages", "knowledge_base", "app_config", "leads"}
 
 def get_schema_description(conn) -> str:
     """
@@ -1574,6 +1577,131 @@ def rag_query(request: RagQueryRequest, http_request: Request):
 # analytics tables. Conversation memory is persisted in the existing sessions /
 # messages tables, keyed by the Telegram chat_id (no schema migration needed).
 
+# ─── Lead capture ─────────────────────────────────────────────────────────────
+
+# Booking-intent detector — triggers the native contact-share keyboard after
+# the RAG reply so the steering feels conversational, not pushy.
+_BOOKING_INTENT = re.compile(
+    r"(פגישה|ייעוץ|לקבוע|להירשם|להתייעץ|הרשמה|קביעת\s*תור|שיחה\s*אישית|"
+    r"לדבר\s*עם\s*ארז|ליצור\s*קשר|לפגוש|תור\b|מחיר|כמה\s*עולה|"
+    r"book|booking|appointment|consultation|session|schedule|sign\s*up|contact)",
+    re.IGNORECASE,
+)
+
+# Israeli phone regex — matches 05X-XXXXXXX and international +9725XXXXXXXX
+_IL_PHONE = re.compile(r"(?:\+?972|0)5[0-9][-\s]?\d{3}[-\s]?\d{4}")
+
+# Contact-share keyboard (one-time, resizes to the reply bar)
+_CONTACT_KEYBOARD = {
+    "keyboard":             [[{"text": "📱 שתפו את המספר שלי", "request_contact": True}]],
+    "resize_keyboard":      True,
+    "one_time_keyboard":    True,
+    "input_field_placeholder": "לחצו על הכפתור לשיתוף המספר",
+}
+_REMOVE_KEYBOARD = {"remove_keyboard": True}
+
+_TG_CONTACT_PROMPT = (
+    "רגע לפני שנמשיך — תרצה/י שארז ייצור איתך קשר אישית? "
+    "לחיצה אחת ותהיה/י ברשימה 🙂"
+)
+_TG_LEAD_THANKS = "תודה {name} 🙏 ארז יחזור אלייך בהקדם. בינתיים, אם יש עוד שאלות — אני כאן."
+_TG_LEAD_DUPLICATE = None   # silent — we already have this person's number; don't re-ask
+
+
+def _has_booking_intent(text: str) -> bool:
+    """True when the user's message suggests interest in booking / consultation."""
+    return bool(_BOOKING_INTENT.search(text or ""))
+
+
+def _extract_phone_from_text(text: str) -> str | None:
+    """Regex fallback: pull an Israeli phone number out of free text."""
+    m = _IL_PHONE.search(text or "")
+    return m.group(0).replace(" ", "").replace("-", "") if m else None
+
+
+def _build_intent_summary(history: list, last_text: str) -> str:
+    """
+    One-liner intent summary for the owner alert, built from the last 3 user
+    turns so Erez sees what the conversation was about at a glance.
+    """
+    user_msgs = [m.get("content", "") for m in history if m.get("role") == "user"]
+    user_msgs.append(last_text)
+    parts = [m.strip()[:80] for m in user_msgs[-3:] if m.strip()]
+    return " | ".join(parts)[:300]
+
+
+def _db_has_lead(conn, chat_id_str: str) -> bool:
+    """True if we already captured a lead from this Telegram user (by chat_id)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM leads WHERE channel = 'telegram' AND chat_id = %s LIMIT 1",
+            (chat_id_str,),
+        )
+        return cur.fetchone() is not None
+
+
+def _db_save_lead(
+    conn,
+    session_id: str,
+    chat_id: str,
+    name: str,
+    phone: str,
+    intent_summary: str,
+) -> str | None:
+    """
+    Insert a new lead row and return its UUID, or None if this user already
+    has a lead (ON CONFLICT DO NOTHING on the UNIQUE(channel, chat_id) index).
+    Caller must commit.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO leads (session_id, chat_id, channel, name, phone, intent_summary)
+            VALUES (%s, %s, 'telegram', %s, %s, %s)
+            ON CONFLICT (channel, chat_id) DO NOTHING
+            RETURNING id
+            """,
+            (session_id, chat_id, name or None, phone, intent_summary or None),
+        )
+        row = cur.fetchone()
+    return str(row[0]) if row else None
+
+
+def _db_mark_lead_notified(conn, lead_id: str) -> None:
+    """Stamp notified_at so we never DM the owner twice for the same lead."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE leads SET notified_at = NOW() WHERE id = %s AND notified_at IS NULL",
+            (lead_id,),
+        )
+
+
+def _alert_owner(lead_id: str, name: str, phone: str, intent_summary: str, chat_id: str) -> None:
+    """
+    DM Erez on Telegram with the structured lead details. Best-effort — a
+    delivery failure is logged but never propagated; the user's confirmation
+    has already been sent and must not be affected.
+    """
+    if not settings.telegram_owner_chat_id:
+        logger.warning("[leads] TELEGRAM_OWNER_CHAT_ID not set — owner alert skipped.")
+        return
+
+    now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M UTC")
+    name_str   = name or "לא צוין"
+    intent_str = intent_summary or "—"
+
+    text = (
+        f"🔔 ליד חדש מהבוט\n\n"
+        f"👤 שם: {name_str}\n"
+        f"📱 טלפון: {phone}\n"
+        f"💬 נושא: {intent_str}\n"
+        f"🕐 {now_str}\n\n"
+        f"לפתיחת השיחה: tg://user?id={chat_id}"
+    )
+    _send_telegram_message(settings.telegram_owner_chat_id, text)
+    logger.info(f"[leads] Owner alerted for lead {lead_id}")
+
+
 # Bot-authored system messages are Hebrew to match the representative persona.
 # The /start greeting and the crisis response are config-driven (app_config,
 # editable live in Supabase); the short operational notices below stay in code.
@@ -1625,20 +1753,27 @@ def _db_get_or_create_telegram_session(conn, chat_id: str) -> str:
         return str(cur.fetchone()[0])
 
 
-def _send_telegram_message(chat_id, text: str) -> None:
+def _send_telegram_message(chat_id, text: str, reply_markup: dict = None) -> None:
     """
     Deliver a reply via Telegram's sendMessage. Uses the stdlib urllib so no HTTP
     dependency is added to the serverless bundle. Best-effort: any network error
     is logged, never raised — the webhook must always return 200 or Telegram will
     retry the update and the user gets duplicate replies.
+
+    reply_markup: optional Telegram ReplyKeyboardMarkup / ReplyKeyboardRemove dict.
+    Pass {"keyboard": [[{"text": "…", "request_contact": true}]], …} to show a
+    contact-share button, or {"remove_keyboard": true} to dismiss it.
     """
     if not settings.telegram_bot_token:
         logger.error("[telegram] TELEGRAM_BOT_TOKEN not set — cannot send reply.")
         return
 
-    text = (text or "").strip()[:4096] or "…"   # Telegram hard-caps at 4096 chars
-    url  = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
-    data = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
+    text    = (text or "").strip()[:4096] or "…"   # Telegram hard-caps at 4096 chars
+    url     = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    data = json.dumps(payload).encode("utf-8")
     req  = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
     )
@@ -1675,15 +1810,62 @@ def telegram_webhook(
             logger.warning("[telegram] Rejected webhook: bad/missing secret token.")
             return {"ok": True}   # 200, but do nothing
 
-    # ── 2. Parse the update (only plain-text private/group messages) ──────────
+    # ── 2. Parse the incoming update ─────────────────────────────────────────
     message = update.get("message") or update.get("edited_message") or {}
     chat    = message.get("chat") or {}
     chat_id = chat.get("id")
-    text    = (message.get("text") or "").strip()
 
     if chat_id is None:
         return {"ok": True}   # channel post, callback_query, etc. — ignore
     chat_id_str = str(chat_id)
+
+    # ── 2a. Native contact share (button tap or manual share) ─────────────────
+    # This branch runs BEFORE the text branch.  When a user taps the
+    # contact-share keyboard button, Telegram delivers message.contact
+    # (not message.text), so we capture it here and never reach the text path.
+    contact = message.get("contact")
+    if contact:
+        phone     = (contact.get("phone_number") or "").strip()
+        first     = contact.get("first_name") or ""
+        last      = contact.get("last_name")  or ""
+        name      = f"{first} {last}".strip() or None
+
+        if phone:
+            try:
+                with get_db_conn() as conn:
+                    session_id     = _db_get_or_create_telegram_session(conn, chat_id_str)
+                    history        = _db_load_history(conn, session_id, limit=12)
+                    intent_summary = _build_intent_summary(history, "")
+                    lead_id        = _db_save_lead(
+                        conn, session_id, chat_id_str, name, phone, intent_summary
+                    )
+                    conn.commit()
+
+                if lead_id:
+                    # Alert the owner (best-effort, non-blocking)
+                    _alert_owner(lead_id, name, phone, intent_summary, chat_id_str)
+                    with get_db_conn() as conn:
+                        _db_mark_lead_notified(conn, lead_id)
+                        conn.commit()
+                    _audit("lead_captured", chat_id=chat_id_str,
+                           lead_id=lead_id, phone_len=len(phone))
+                else:
+                    logger.info(f"[leads] Duplicate contact from {chat_id_str} — skipped.")
+
+                # Warm confirmation + remove the keyboard regardless of dedup
+                confirmation = _TG_LEAD_THANKS.format(name=name or "")
+                _send_telegram_message(chat_id, confirmation,
+                                       reply_markup=_REMOVE_KEYBOARD)
+            except Exception as e:
+                logger.error(f"[leads] Contact capture failed: {e}", exc_info=True)
+                _send_telegram_message(chat_id, _TG_ERROR,
+                                       reply_markup=_REMOVE_KEYBOARD)
+        return {"ok": True}
+
+    # ── 2b. Regex fallback — user typed their phone number as free text ───────
+    # Catches "המספר שלי הוא 0521234567" before the general text pipeline so we
+    # can capture the lead without asking them to press the button again.
+    text = (message.get("text") or "").strip()
 
     if not text:
         _send_telegram_message(chat_id, _TG_NON_TEXT)   # sticker / photo / voice
@@ -1692,16 +1874,44 @@ def telegram_webhook(
         _send_telegram_message(chat_id, _get_config("telegram.greeting"))
         return {"ok": True}
 
-    # ── Crisis check — runs FIRST so a user in distress gets compassion, never
-    #    the cold moderation block. Config-driven message points to ERAN 1201. ──
+    # ── Crisis check — runs BEFORE moderation: distress → empathy, not a block ─
     if is_crisis(text):
         _audit("telegram_crisis", chat_id=chat_id_str)
         _send_telegram_message(chat_id, _get_config("crisis.message"))
         return {"ok": True}
 
+    # Regex phone fallback: treat as a contact share if we spot a phone number.
+    phone_in_text = _extract_phone_from_text(text)
+    if phone_in_text:
+        try:
+            with get_db_conn() as conn:
+                already = _db_has_lead(conn, chat_id_str)
+                if not already:
+                    session_id     = _db_get_or_create_telegram_session(conn, chat_id_str)
+                    history        = _db_load_history(conn, session_id, limit=12)
+                    intent_summary = _build_intent_summary(history, text)
+                    lead_id        = _db_save_lead(
+                        conn, session_id, chat_id_str, None, phone_in_text, intent_summary
+                    )
+                    conn.commit()
+                    if lead_id:
+                        _alert_owner(lead_id, None, phone_in_text, intent_summary, chat_id_str)
+                        with get_db_conn() as conn2:
+                            _db_mark_lead_notified(conn2, lead_id)
+                            conn2.commit()
+                        _audit("lead_captured_regex", chat_id=chat_id_str, lead_id=lead_id)
+                        _send_telegram_message(
+                            chat_id,
+                            _TG_LEAD_THANKS.format(name=""),
+                        )
+                        return {"ok": True}
+        except Exception as e:
+            logger.error(f"[leads] Regex-fallback capture failed: {e}", exc_info=True)
+        # If we already had a lead or capture failed, fall through to the normal text path
+
     _audit("telegram_request", chat_id=chat_id_str, question=text)
 
-    # ── 3. Guards (reuse the same primitives as the web endpoints) ────────────
+    # ── 3. Guards ─────────────────────────────────────────────────────────────
     if len(text) > 500:
         _send_telegram_message(chat_id, _TG_TOO_LONG)
         return {"ok": True}
@@ -1712,7 +1922,7 @@ def telegram_webhook(
         _send_telegram_message(chat_id, _TG_MODERATION)
         return {"ok": True}
     try:
-        check_rate_limit(chat_id_str)   # per-user throttle, keyed by chat_id
+        check_rate_limit(chat_id_str)
     except RateLimitError:
         _send_telegram_message(chat_id, _TG_RATE_LIMIT)
         return {"ok": True}
@@ -1721,15 +1931,16 @@ def telegram_webhook(
     try:
         query_vector = _embed_text(text)
         with get_db_conn() as conn:
-            session_id = _db_get_or_create_telegram_session(conn, chat_id_str)
-            history    = _db_load_history(conn, session_id, limit=12)
-            chunks     = _retrieve_chunks(conn, query_vector, top_k=5)
-            conn.commit()   # persist the session row if it was just created
+            session_id   = _db_get_or_create_telegram_session(conn, chat_id_str)
+            history      = _db_load_history(conn, session_id, limit=12)
+            chunks       = _retrieve_chunks(conn, query_vector, top_k=5)
+            already_lead = _db_has_lead(conn, chat_id_str)
+            conn.commit()
 
-        # ── 6. Generate the grounded answer (no DB connection held) ───────────
+        # ── 6. Generate (no DB connection held) ──────────────────────────────
         reply, sources = _rag_generate(text, chunks, history=history)
 
-        # ── 7. Persist this turn so the next message remembers it ─────────────
+        # ── 7. Persist turn ──────────────────────────────────────────────────
         with get_db_conn() as conn:
             _db_save_message(conn, session_id, "user", text)
             _db_save_message(conn, session_id, "assistant", reply)
@@ -1739,8 +1950,15 @@ def telegram_webhook(
         _audit("telegram_success", chat_id=chat_id_str, session_id=session_id,
                sources=sources, chunks=len(chunks))
 
-        # ── 8. Deliver ────────────────────────────────────────────────────────
+        # ── 8. Deliver answer; soft-steer toward booking if intent detected ──
+        # We send the RAG answer first, then — if the user's message showed
+        # booking/consultation intent AND we don't have their contact yet — we
+        # append the contact-share keyboard as a gentle, separate message.
+        # This keeps the answer clean and avoids a pushy combined message.
         _send_telegram_message(chat_id, reply)
+        if _has_booking_intent(text) and not already_lead:
+            _send_telegram_message(chat_id, _TG_CONTACT_PROMPT,
+                                   reply_markup=_CONTACT_KEYBOARD)
 
     except TimeoutError:
         logger.error("[telegram] LLM timeout")
