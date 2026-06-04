@@ -198,7 +198,7 @@ _schema_cache: str = ""   # populated once on first chat request; never changes 
 
 # Tables that exist for infrastructure / identity management — never exposed to
 # the LLM so it cannot generate SELECT queries against internal session data.
-_INTERNAL_TABLES = {"sessions", "messages", "knowledge_base"}
+_INTERNAL_TABLES = {"sessions", "messages", "knowledge_base", "app_config"}
 
 def get_schema_description(conn) -> str:
     """
@@ -245,6 +245,66 @@ def get_schema_description(conn) -> str:
     except Exception as e:
         logger.error(f"[schema] Fetch failed: {e}")
         return ""
+
+
+# ─── App Config — brand voice / persona (live-editable via Supabase) ──────────
+# Keys live in the app_config table so they can be tuned in the Supabase
+# dashboard WITHOUT a redeploy. Values are cached in-process with a short TTL.
+# The hardcoded defaults below are the resilient fallback used when a row is
+# missing, the DB is briefly unreachable, or there is no database at all
+# (tests / CI) — so the bot never sounds broken.
+
+_DEFAULT_CONFIG = {
+    "persona.system": (
+        "את/ה הקול הדיגיטלי של ארז גרצמן — מנטור לתודעה זוגית, ליחסים ולפסיכולוגיה "
+        "של היכרויות (דייטינג). דבר/י תמיד בגוף ראשון, בחום אמיתי ובגובה העיניים, "
+        "כאילו ארז עצמו משוחח. קדם/י את הרגש לפני העצה: קודם הקשבה ואמפתיה אמיתית, "
+        "ורק אחר כך תובנה או כיוון מעשי. עברית טבעית, אישית וחמה — בלי טון תאגידי, "
+        "רובוטי או מכירתי. כשעולה אתגר זוגי מורכב שמתאים לליווי של ארז, הציע/י "
+        "בעדינות ובלי לחץ פגישת ייעוץ אישית כמרחב בטוח להעמיק בו — הצעה רכה, לא "
+        "מכירה אגרסיבית. שמור/י על גבולות: אינך מטפל/ת או פסיכולוג/ית, ואינך תחליף "
+        "לליווי מקצועי. אם אין מספיק מידע במאגר הידע, אמור/י זאת בכנות ובחום, "
+        "והצע/י דרך אחרת לעזור."
+    ),
+    "telegram.greeting": (
+        "היי, כמה טוב שכתבת 🤍 אני העוזר הדיגיטלי של ארז גרצמן — כאן כדי לדבר איתך "
+        "על זוגיות, יחסים והיכרויות, בגובה העיניים. אפשר לשתף אותי במה שעובר עליך, "
+        "לשאול על הליווי של ארז, או פשוט להתחיל לדבר. מה מביא אותך לכאן היום?"
+    ),
+    "crisis.message": (
+        "אני שומע/ת אותך, ונשמע שאת/ה עובר/ת עכשיו תקופה ממש כואבת. את/ה לא לבד בזה, "
+        "ומגיעה לך תמיכה אמיתית. אני רק עוזר דיגיטלי ולא תחליף לעזרה מקצועית — אז אם "
+        'הכאב גדול, חשוב לי שתפנה/י לער"ן (עזרה ראשונה נפשית) בטלפון 1201. הקו פתוח '
+        "בכל שעה, בחינם ובאנונימיות, ויש שם אנשים אמיתיים שאפשר לדבר איתם עכשיו. 🤍"
+    ),
+}
+
+_CONFIG_TTL      = 300        # seconds — edits in Supabase take effect within this window
+_config_cache:   dict = {}    # key → value, loaded in bulk
+_config_cache_ts: float = 0.0
+_config_lock     = threading.Lock()
+
+def _get_config(key: str) -> str:
+    """
+    Return an app_config value, preferring the DB (bulk-cached, TTL) over the
+    hardcoded default. Never raises: any DB failure falls back to the default so
+    a brief outage can't break the bot's voice or the /start greeting.
+    """
+    global _config_cache, _config_cache_ts
+    now = time.time()
+    with _config_lock:
+        if now - _config_cache_ts > _CONFIG_TTL:
+            try:
+                with get_db_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT key, value FROM app_config")
+                        _config_cache = {k: v for k, v in cur.fetchall()}
+            except Exception as e:
+                logger.warning(f"[config] load failed: {e} — using defaults.")
+                # keep whatever we had (possibly empty → defaults below)
+            _config_cache_ts = now   # back off either way; no per-call retry storm
+        value = _config_cache.get(key)
+    return value if value else _DEFAULT_CONFIG.get(key, "")
 
 
 # ─── Session & Message Persistence ───────────────────────────────────────────
@@ -348,6 +408,26 @@ def validate_question(question: str) -> str:
     if _BLOCKED_TERMS.search(question):
         raise InputModerationError("Input contains inappropriate content.")
     return question.strip()
+
+
+# ── Crisis / distress detection ───────────────────────────────────────────────
+# Distinct from moderation: for a relationships & coaching brand, a user
+# expressing self-harm or acute distress must NOT get the cold "can't process
+# this" block. The empathetic representative paths (Telegram + web "Ask Erez")
+# check this FIRST and respond with the compassionate crisis.message
+# (config-driven; points to ERAN / ער"ן 1201) instead of running the LLM.
+_CRISIS_TERMS = re.compile(
+    r"(אובדני|להתאבד|לשים\s*קץ|לסיים\s*את\s*הכל|רוצה\s*למות|"
+    r"לא\s*רוצה\s*לחיות|אין\s*טעם\s*לחיות|אין\s*לי\s*סיבה\s*לחיות|"
+    r"לפגוע\s*בעצמ|פגיעה\s*עצמית|"
+    r"suicide|suicidal|kill\s*myself|end\s*my\s*life|want\s*to\s*die|"
+    r"don'?t\s*want\s*to\s*live|self[\s_\-]*harm|hurt\s*myself|no\s*reason\s*to\s*live)",
+    re.IGNORECASE,
+)
+
+def is_crisis(text: str) -> bool:
+    """True if the message signals acute emotional distress / self-harm."""
+    return bool(_CRISIS_TERMS.search(text or ""))
 
 
 # ─── Per-IP Rate Limiter ──────────────────────────────────────────────────────
@@ -1255,9 +1335,13 @@ def get_session_history(session_id: str):
 # ─── RAG ─────────────────────────────────────────────────────────────────────
 
 RAG_PROMPT_TEMPLATE = """\
-You are a knowledgeable business assistant. Answer the user's question using ONLY \
-the context excerpts provided below. Do not invent facts. \
-If the context does not contain enough information, say so honestly.
+{persona}
+
+=== GROUNDING (FACTS) ===
+Answer using ONLY the context excerpts below. Never invent facts about the \
+business, prices, services, or availability. If the context does not contain \
+the answer, say so warmly and honestly, and offer another way to help. \
+Keep it to one or two short paragraphs; no bullet points unless truly needed.
 
 === CONTEXT FROM KNOWLEDGE BASE ===
 {context}
@@ -1266,11 +1350,7 @@ If the context does not contain enough information, say so honestly.
 Reply in the exact same language as the user's question. \
 If the question is in Hebrew, reply in Hebrew. If English, reply in English.
 
-=== TONE ===
-Be direct, warm, and professional. One or two clear paragraphs maximum. \
-No bullet points unless listing distinct items. No hollow openers.
-
-User question: "{question}"
+User message: "{question}"
 """
 
 class RagQueryRequest(BaseModel):
@@ -1378,6 +1458,7 @@ def _rag_generate(question: str, chunks: list, history: list = None) -> tuple:
     context = "\n\n".join(context_parts)
 
     prompt = RAG_PROMPT_TEMPLATE.format(
+        persona=_get_config("persona.system"),
         context=context,
         history_block=_build_rag_history_block(history or []),
         question=question,
@@ -1416,6 +1497,14 @@ def rag_query(request: RagQueryRequest, http_request: Request):
             reply="Question too long — keep it under 500 characters.",
             sources=[],
             error_code="validation_error",
+        )
+
+    # Crisis check runs BEFORE moderation: a user in distress must get the
+    # compassionate response, never the cold "can't process this" block.
+    if is_crisis(question):
+        _audit("rag_crisis", ip=client_ip)
+        return RagQueryResponse(
+            status="success", reply=_get_config("crisis.message"), sources=[],
         )
 
     try:
@@ -1485,11 +1574,9 @@ def rag_query(request: RagQueryRequest, http_request: Request):
 # analytics tables. Conversation memory is persisted in the existing sessions /
 # messages tables, keyed by the Telegram chat_id (no schema migration needed).
 
-# All bot-authored system messages are Hebrew to match the representative persona.
-_TG_GREETING = (
-    "שלום! 👋 אני העוזר הדיגיטלי של ארז גרצמן. "
-    "אפשר לשאול אותי על השירותים, על ארז, או על קביעת פגישת ייעוץ. במה אוכל לעזור?"
-)
+# Bot-authored system messages are Hebrew to match the representative persona.
+# The /start greeting and the crisis response are config-driven (app_config,
+# editable live in Supabase); the short operational notices below stay in code.
 _TG_NON_TEXT   = "אני יודע לקרוא רק הודעות טקסט כרגע 🙂 כתבו לי שאלה ואשמח לעזור."
 _TG_TOO_LONG   = "ההודעה קצת ארוכה מדי. נסו לנסח אותה בקצרה ואענה."
 _TG_MODERATION = "לא הצלחתי לעבד את ההודעה. נסו לשאול על השירותים, על ארז, או על קביעת פגישה."
@@ -1602,7 +1689,14 @@ def telegram_webhook(
         _send_telegram_message(chat_id, _TG_NON_TEXT)   # sticker / photo / voice
         return {"ok": True}
     if text.startswith("/start"):
-        _send_telegram_message(chat_id, _TG_GREETING)
+        _send_telegram_message(chat_id, _get_config("telegram.greeting"))
+        return {"ok": True}
+
+    # ── Crisis check — runs FIRST so a user in distress gets compassion, never
+    #    the cold moderation block. Config-driven message points to ERAN 1201. ──
+    if is_crisis(text):
+        _audit("telegram_crisis", chat_id=chat_id_str)
+        _send_telegram_message(chat_id, _get_config("crisis.message"))
         return {"ok": True}
 
     _audit("telegram_request", chat_id=chat_id_str, question=text)
