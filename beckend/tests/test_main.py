@@ -1089,3 +1089,207 @@ class TestWebhookResilienceEdgeCases:
 
         assert r.status_code == 200
         assert None in state_cleared   # state cleared after crisis response
+
+
+# ─── 13. Sprint 1B — CRM lead sync (HubSpot provider) ─────────────────────────
+
+class TestCrmFormatPhone:
+    def test_israeli_local(self):     assert main._crm_format_phone("0521234567") == "+972521234567"
+    def test_already_e164(self):      assert main._crm_format_phone("+972521234567") == "+972521234567"
+    def test_972_no_plus(self):       assert main._crm_format_phone("972521234567") == "+972521234567"
+    def test_strips_separators(self): assert main._crm_format_phone("052-123 4567") == "+972521234567"
+    def test_empty(self):             assert main._crm_format_phone("") == ""
+
+
+class TestCrmProviderDispatch:
+    """The swappable adapter: provider selection + the credential-free fake."""
+    def test_disabled_when_no_provider(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "crm_provider", "")
+        assert main._crm_enabled() is False
+        assert main._crm_sync_lead("x", "0521234567", "y") is None
+
+    def test_hubspot_enabled_requires_token(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "crm_provider", "hubspot")
+        monkeypatch.setattr(main.settings, "hubspot_private_token", "")
+        assert main._crm_enabled() is False
+        monkeypatch.setattr(main.settings, "hubspot_private_token", "pat-x")
+        assert main._crm_enabled() is True
+
+    def test_fake_provider_is_deterministic_and_offline(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "crm_provider", "fake")
+        monkeypatch.setattr(main, "_hubspot_request",
+                            lambda *a, **k: pytest.fail("network used in fake mode"))
+        a = main._crm_sync_lead("דנה", "0521234567", "y")
+        b = main._crm_sync_lead("דנה", "0521234567", "y")
+        assert a and a == b and a.startswith("fake-")
+
+
+class TestHubspotUpsertContact:
+    """Idempotency layer 2: search-by-phone then create-or-update."""
+    def _enable(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "crm_provider", "hubspot")
+        monkeypatch.setattr(main.settings, "hubspot_private_token", "pat-x")
+        monkeypatch.setattr(main.settings, "hubspot_intent_property", "")   # note path
+
+    def test_creates_when_not_found(self, monkeypatch):
+        self._enable(monkeypatch)
+        calls = []
+        def fake(method, path, payload=None):
+            calls.append((method, path, payload))
+            if path.endswith("/search"):
+                return {"results": []}                  # not found
+            if path == "/crm/v3/objects/contacts":
+                return {"id": "c1"}
+            return {}
+        monkeypatch.setattr(main, "_hubspot_request", fake)
+
+        cid = main._hubspot_upsert_contact("דנה", "0521234567", "על זוגיות")
+        assert cid == "c1"
+        mp = [(m, p) for m, p, _ in calls]
+        assert ("POST", "/crm/v3/objects/contacts") in mp       # created
+        assert ("POST", "/crm/v3/objects/notes") in mp          # intent → note
+        create = next(pl for m, p, pl in calls if p == "/crm/v3/objects/contacts")
+        assert create["properties"]["phone"] == "+972521234567"
+        assert create["properties"]["lifecyclestage"] == "lead"
+
+    def test_idempotent_update_when_found(self, monkeypatch):
+        self._enable(monkeypatch)
+        calls = []
+        def fake(method, path, payload=None):
+            calls.append((method, path))
+            if path.endswith("/search"):
+                return {"results": [{"id": "existing99"}]}
+            return {}
+        monkeypatch.setattr(main, "_hubspot_request", fake)
+
+        cid = main._hubspot_upsert_contact("דנה", "0521234567", None)
+        assert cid == "existing99"
+        assert ("PATCH", "/crm/v3/objects/contacts/existing99") in calls   # updated
+        assert ("POST", "/crm/v3/objects/contacts") not in calls           # never re-created
+
+    def test_custom_property_skips_note(self, monkeypatch):
+        self._enable(monkeypatch)
+        monkeypatch.setattr(main.settings, "hubspot_intent_property", "nexus_intent")
+        paths = []
+        def fake(method, path, payload=None):
+            paths.append(path)
+            if path.endswith("/search"):
+                return {"results": []}
+            if path == "/crm/v3/objects/contacts":
+                assert payload["properties"]["nexus_intent"] == "בגידה"
+                return {"id": "c2"}
+            return {}
+        monkeypatch.setattr(main, "_hubspot_request", fake)
+        assert main._hubspot_upsert_contact(None, "0521234567", "בגידה") == "c2"
+        assert "/crm/v3/objects/notes" not in paths
+
+
+class TestHubspotPipelineDiscovery:
+    def test_auto_discovers_default_first_stage(self, monkeypatch):
+        main._hubspot_pipeline_cache = None
+        monkeypatch.setattr(main.settings, "hubspot_pipeline_id", "")
+        monkeypatch.setattr(main.settings, "hubspot_stage_id", "")
+        monkeypatch.setattr(main, "_hubspot_request", lambda m, p, pl=None: {
+            "results": [{
+                "id": "default", "displayOrder": 0,
+                "stages": [{"id": "s_appt", "displayOrder": 0},
+                           {"id": "s_qual", "displayOrder": 1}],
+            }]
+        })
+        assert main._hubspot_resolve_stage() == ("default", "s_appt")
+        main._hubspot_pipeline_cache = None   # don't leak cache to other tests
+
+    def test_configured_ids_take_precedence(self, monkeypatch):
+        main._hubspot_pipeline_cache = None
+        monkeypatch.setattr(main.settings, "hubspot_pipeline_id", "P")
+        monkeypatch.setattr(main.settings, "hubspot_stage_id", "S")
+        monkeypatch.setattr(main, "_hubspot_request",
+                            lambda *a, **k: pytest.fail("should not hit the API"))
+        assert main._hubspot_resolve_stage() == ("P", "S")
+
+
+class TestHubspotSyncLead:
+    def test_creates_contact_and_deal(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "crm_provider", "hubspot")
+        monkeypatch.setattr(main.settings, "hubspot_private_token", "pat-x")
+        monkeypatch.setattr(main, "_hubspot_upsert_contact", lambda n, p, i: "c123")
+        deals = []
+        monkeypatch.setattr(main, "_hubspot_create_deal",
+                            lambda cid, name: deals.append((cid, name)))
+        assert main._crm_sync_lead("דנה", "0521234567", "y") == "c123"
+        assert deals == [("c123", "דנה")]               # deal created + associated
+
+    def test_no_deal_when_contact_fails(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "crm_provider", "hubspot")
+        monkeypatch.setattr(main.settings, "hubspot_private_token", "pat-x")
+        monkeypatch.setattr(main, "_hubspot_upsert_contact", lambda n, p, i: None)
+        called = []
+        monkeypatch.setattr(main, "_hubspot_create_deal", lambda *a: called.append(1))
+        assert main._crm_sync_lead("x", "0521234567", "y") is None
+        assert called == []
+
+
+class TestFinalizeLead:
+    """The single post-save funnel: best-effort, never raises, stamps state."""
+    def test_marks_synced_on_success(self, client, monkeypatch):
+        monkeypatch.setattr(main, "_alert_owner", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_crm_sync_lead", lambda n, p, i: "c999")
+        notified, synced = [], []
+        monkeypatch.setattr(main, "_db_mark_lead_notified",
+                            lambda c, lid: notified.append(lid))
+        monkeypatch.setattr(main, "_db_mark_lead_synced",
+                            lambda c, lid, eid: synced.append((lid, eid)))
+        main._finalize_lead("lead1", "דנה", "0521234567", "y", "777")
+        assert notified == ["lead1"]
+        assert synced == [("lead1", "c999")]
+
+    def test_crm_miss_still_notifies_and_leaves_unsynced(self, client, monkeypatch):
+        monkeypatch.setattr(main, "_alert_owner", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_crm_sync_lead", lambda *a, **k: None)
+        notified, synced = [], []
+        monkeypatch.setattr(main, "_db_mark_lead_notified",
+                            lambda c, lid: notified.append(lid))
+        monkeypatch.setattr(main, "_db_mark_lead_synced",
+                            lambda c, lid, eid: synced.append(lid))
+        main._finalize_lead("lead2", None, "0521234567", "y", "777")
+        assert notified == ["lead2"]
+        assert synced == []          # unsynced → reconciler retries later
+
+    def test_owner_alert_exception_does_not_block_sync(self, client, monkeypatch):
+        def boom(*a, **k): raise RuntimeError("telegram down")
+        monkeypatch.setattr(main, "_alert_owner", boom)
+        monkeypatch.setattr(main, "_crm_sync_lead", lambda *a, **k: "c1")
+        synced = []
+        monkeypatch.setattr(main, "_db_mark_lead_notified", lambda c, l: None)
+        monkeypatch.setattr(main, "_db_mark_lead_synced",
+                            lambda c, l, eid: synced.append(eid))
+        main._finalize_lead("lead3", None, "0521234567", "y", "777")   # must not raise
+        assert synced == ["c1"]
+
+
+class TestCronCrmSync:
+    def test_rejects_bad_secret(self, client, monkeypatch):
+        monkeypatch.setattr(main.settings, "cron_secret", "s3cr3t")
+        r = client.get("/api/cron/crm-sync", headers={"Authorization": "Bearer wrong"})
+        assert r.status_code == 401
+
+    def test_skipped_when_crm_disabled(self, client, monkeypatch):
+        monkeypatch.setattr(main.settings, "cron_secret", "")     # guard off (dev)
+        monkeypatch.setattr(main, "_crm_enabled", lambda: False)
+        r = client.get("/api/cron/crm-sync")
+        assert r.status_code == 200
+        assert r.json()["status"] == "skipped"
+
+    def test_processes_pending_leads(self, client, monkeypatch):
+        monkeypatch.setattr(main.settings, "cron_secret", "")
+        monkeypatch.setattr(main, "_crm_enabled", lambda: True)
+        _patch_conn(client, fetchall=[("lead1", "דנה", "0521234567", "y")])
+        synced = []
+        monkeypatch.setattr(main, "_crm_sync_lead", lambda n, p, i: "cX")
+        monkeypatch.setattr(main, "_db_mark_lead_synced",
+                            lambda c, lid, eid: synced.append((lid, eid)))
+        r = client.get("/api/cron/crm-sync")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "ok" and body["synced"] == 1
+        assert synced == [("lead1", "cX")]
