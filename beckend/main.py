@@ -1622,7 +1622,7 @@ _TG_CONTACT_PROMPT = (
     "(אם קפצה לכם מקלדת רגילה והכפתור נעלם, לחצו על סמל הריבועים הקטן "
     "בצד שורת ההודעה כדי להחזיר אותו)."
 )
-_TG_LEAD_THANKS = "תודה {name} 🙏 ארז יחזור אלייך בהקדם. בינתיים, אם יש עוד שאלות — אני כאן."
+_TG_LEAD_THANKS = "תודה {name} 🙏 הפנייה התקבלה וארז יחזור אליכם בהקדם. בינתיים, אם יש עוד שאלות — אני כאן."
 _TG_LEAD_DUPLICATE = None   # silent — we already have this person's number; don't re-ask
 
 
