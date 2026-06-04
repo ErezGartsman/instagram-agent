@@ -589,6 +589,9 @@ class TestTelegramWebhook:
         monkeypatch.setattr(main, "_embed_text", lambda t: [0.1] * 768)
         monkeypatch.setattr(main, "_db_get_or_create_telegram_session",
                             lambda conn, cid: "sess-abc")
+        monkeypatch.setattr(main, "_db_get_session_state", lambda conn, sid: None)
+        monkeypatch.setattr(main, "_db_set_session_state", lambda conn, sid, s: None)
+        monkeypatch.setattr(main, "_db_has_lead", lambda conn, cid: False)
         monkeypatch.setattr(main, "_db_load_history", lambda conn, sid, limit=12: [])
         monkeypatch.setattr(main, "_retrieve_chunks",
                             lambda conn, vec, top_k=5:
@@ -613,6 +616,9 @@ class TestTelegramWebhook:
         monkeypatch.setattr(main, "_embed_text", lambda t: [0.1] * 768)
         monkeypatch.setattr(main, "_db_get_or_create_telegram_session",
                             lambda conn, cid: "sess-xyz")
+        monkeypatch.setattr(main, "_db_get_session_state", lambda conn, sid: None)
+        monkeypatch.setattr(main, "_db_set_session_state", lambda conn, sid, s: None)
+        monkeypatch.setattr(main, "_db_has_lead", lambda conn, cid: False)
         monkeypatch.setattr(main, "_db_load_history", lambda conn, sid, limit=12:
                             [{"role": "user", "content": "מי זה ארז?"},
                              {"role": "assistant", "content": "ארז גרצמן הוא מנטור."}])
@@ -658,51 +664,88 @@ class TestTelegramWebhook:
         assert r.status_code == 200
         assert "ארז גרצמן" in send.call_args.args[1]
 
-    def test_booking_intent_sends_contact_keyboard(self, client, monkeypatch):
-        """When user expresses booking intent and has no lead, keyboard is sent after reply."""
-        messages_sent = []
-        monkeypatch.setattr(main, "_send_telegram_message",
-                            lambda cid, text, reply_markup=None:
-                                messages_sent.append({"text": text, "markup": reply_markup}))
+    def _base_rag_patches(self, monkeypatch, *, already_lead=False, bot_state=None):
+        """Shared monkeypatching for the RAG path — keeps individual tests concise."""
         monkeypatch.setattr(main, "_embed_text", lambda t: [0.1] * 768)
         monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_get_session_state", lambda c, sid: bot_state)
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: None)
+        monkeypatch.setattr(main, "_db_has_lead", lambda c, cid: already_lead)
         monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: [])
         monkeypatch.setattr(main, "_retrieve_chunks", lambda c, v, top_k=5:
                             [{"content": "x", "source": "services.txt", "similarity": 0.7}])
-        monkeypatch.setattr(main, "_db_has_lead", lambda c, cid: False)   # no lead yet
-        monkeypatch.setattr(main, "_call_llm", lambda p: "הנה מידע על ייעוץ")
-        monkeypatch.setattr(main, "_db_save_message", lambda *a, **k: None)
-        monkeypatch.setattr(main, "_db_touch_session", lambda c, sid: None)
-
-        r = client.post("/api/webhook/telegram",
-                        json=self._update(text="אני מעוניין בפגישת ייעוץ"))
-
-        assert r.status_code == 200
-        assert len(messages_sent) == 2              # RAG reply + keyboard prompt
-        assert messages_sent[1]["markup"] is not None
-        assert messages_sent[1]["markup"].get("keyboard") is not None
-
-    def test_no_keyboard_when_lead_already_exists(self, client, monkeypatch):
-        """Booking intent + existing lead → reply only, no second keyboard prompt."""
-        messages_sent = []
-        monkeypatch.setattr(main, "_send_telegram_message",
-                            lambda cid, text, reply_markup=None:
-                                messages_sent.append({"text": text}))
-        monkeypatch.setattr(main, "_embed_text", lambda t: [0.1] * 768)
-        monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
-        monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: [])
-        monkeypatch.setattr(main, "_retrieve_chunks", lambda c, v, top_k=5:
-                            [{"content": "x", "source": "services.txt", "similarity": 0.7}])
-        monkeypatch.setattr(main, "_db_has_lead", lambda c, cid: True)   # already captured
         monkeypatch.setattr(main, "_call_llm", lambda p: "הנה מידע")
         monkeypatch.setattr(main, "_db_save_message", lambda *a, **k: None)
         monkeypatch.setattr(main, "_db_touch_session", lambda c, sid: None)
 
+    def test_booking_intent_triggers_qualification_question(self, client, monkeypatch):
+        """Booking intent + no lead → RAG reply then qualification question (no keyboard yet)."""
+        messages_sent = []
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, reply_markup=None:
+                                messages_sent.append({"text": text, "markup": reply_markup}))
+        self._base_rag_patches(monkeypatch, already_lead=False, bot_state=None)
+
         r = client.post("/api/webhook/telegram",
                         json=self._update(text="אני מעוניין בפגישת ייעוץ"))
 
         assert r.status_code == 200
-        assert len(messages_sent) == 1              # RAG reply only
+        assert len(messages_sent) == 2                        # RAG reply + qualification question
+        assert messages_sent[1]["markup"] is None             # NO keyboard yet
+        assert "תוכלי לשתף" in messages_sent[1]["text"]      # qualification question text
+
+    def test_no_qualification_when_lead_already_exists(self, client, monkeypatch):
+        """Booking intent + existing lead → single RAG reply, no qualification question."""
+        messages_sent = []
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, reply_markup=None:
+                                messages_sent.append({"text": text}))
+        self._base_rag_patches(monkeypatch, already_lead=True, bot_state=None)
+
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="אני מעוניין בפגישת ייעוץ"))
+
+        assert r.status_code == 200
+        assert len(messages_sent) == 1                        # RAG reply only
+
+    def test_qualification_answer_sends_contact_keyboard(self, client, monkeypatch):
+        """When state='awaiting_qualification' any user reply triggers the contact keyboard."""
+        messages_sent = []
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, reply_markup=None:
+                                messages_sent.append({"text": text, "markup": reply_markup}))
+        self._base_rag_patches(monkeypatch, already_lead=False,
+                               bot_state="awaiting_qualification")
+
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="אני עוברת גירושין ומתקשה להמשיך"))
+
+        assert r.status_code == 200
+        assert len(messages_sent) == 1                          # ack only, no LLM
+        assert messages_sent[0]["markup"] is not None           # keyboard attached
+        assert messages_sent[0]["markup"].get("keyboard") is not None
+        assert "תודה ששיתפת" in messages_sent[0]["text"]
+
+    def test_qualification_state_cleared_when_lead_exists(self, client, monkeypatch):
+        """Stale awaiting_qualification + already_lead → normal RAG, state silently cleared."""
+        messages_sent = []
+        state_cleared = []
+        # Apply base patches first, then override _db_set_session_state with the
+        # spy so the specific assertion isn't silently overwritten.
+        self._base_rag_patches(monkeypatch, already_lead=True,
+                               bot_state="awaiting_qualification")
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, reply_markup=None:
+                                messages_sent.append({"text": text}))
+        monkeypatch.setattr(main, "_db_set_session_state",
+                            lambda c, sid, s: state_cleared.append(s))
+
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="שאלה רגילה"))
+
+        assert r.status_code == 200
+        assert None in state_cleared                 # state was cleared to None
+        assert len(messages_sent) == 1               # normal RAG reply, no keyboard
 
     def test_contact_share_captures_lead_and_alerts_owner(self, client, monkeypatch):
         """Native contact share → lead saved, owner alerted, warm confirmation sent."""
@@ -782,6 +825,9 @@ class TestTelegramWebhook:
         monkeypatch.setattr(main, "_send_telegram_message", MagicMock())
         monkeypatch.setattr(main, "_embed_text", lambda t: [0.1] * 768)
         monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_get_session_state", lambda c, sid: None)
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: None)
+        monkeypatch.setattr(main, "_db_has_lead", lambda c, cid: False)
         monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: [])
         monkeypatch.setattr(main, "_retrieve_chunks", lambda c, v, top_k=5:
                             [{"content": "x", "source": "about.txt", "similarity": 0.7}])

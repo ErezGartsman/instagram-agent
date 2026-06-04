@@ -1600,9 +1600,21 @@ _CONTACT_KEYBOARD = {
 }
 _REMOVE_KEYBOARD = {"remove_keyboard": True}
 
+_TG_QUALIFICATION_QUESTION = (
+    "בשמחה. כדי שנוכל לבדוק אם ארז הוא הכתובת המדויקת עבורך, "
+    "תוכלי לשתף בכמה מילים על מה תרצי שנדבר?"
+)
+_TG_QUALIFICATION_ACK = (
+    "תודה ששיתפת 🙏 ממה שתיארת, נראה שיש מקום ממשי לעבוד על זה יחד. "
+    "תרצי להשאיר פרטי קשר כדי שארז יוכל לחזור אלייך?"
+)
+# Updated keyboard prompt: explicitly directs users past the standard keyboard
+# that Telegram opens when they tap the reply bar — a known UX trap.
 _TG_CONTACT_PROMPT = (
-    "רגע לפני שנמשיך — תרצה/י שארז ייצור איתך קשר אישית? "
-    "לחיצה אחת ותהיה/י ברשימה 🙂"
+    "רגע לפני שנמשיך – תרצו שארז ייצור קשר אישית? "
+    "לחצו על הכפתור הגדול 'שתף איש קשר' שמופיע כאן למטה 👇 "
+    "(אם קפצה לכם מקלדת רגילה והכפתור נעלם, לחצו על סמל הריבועים הקטן "
+    "בצד שורת ההודעה כדי להחזיר אותו)."
 )
 _TG_LEAD_THANKS = "תודה {name} 🙏 ארז יחזור אלייך בהקדם. בינתיים, אם יש עוד שאלות — אני כאן."
 _TG_LEAD_DUPLICATE = None   # silent — we already have this person's number; don't re-ask
@@ -1638,6 +1650,32 @@ def _db_has_lead(conn, chat_id_str: str) -> bool:
             (chat_id_str,),
         )
         return cur.fetchone() is not None
+
+
+def _db_get_session_state(conn, session_id: str) -> str | None:
+    """
+    Return the bot_state value for a session, or None if unset / session not found.
+    Used to drive the 2-turn qualification state machine.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT bot_state FROM sessions WHERE id = %s",
+            (session_id,),
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _db_set_session_state(conn, session_id: str, state: str | None) -> None:
+    """
+    Write bot_state for a session. Pass None to clear back to normal.
+    Caller must commit.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE sessions SET bot_state = %s WHERE id = %s",
+            (state, session_id),
+        )
 
 
 def _db_save_lead(
@@ -1927,38 +1965,77 @@ def telegram_webhook(
         _send_telegram_message(chat_id, _TG_RATE_LIMIT)
         return {"ok": True}
 
-    # ── 4 & 5. Identity mapping + retrieval (one short connection checkout) ────
+    # ── 4. Identity mapping — fast checkout, no embedding yet ─────────────────
     try:
-        query_vector = _embed_text(text)
         with get_db_conn() as conn:
             session_id   = _db_get_or_create_telegram_session(conn, chat_id_str)
-            history      = _db_load_history(conn, session_id, limit=12)
-            chunks       = _retrieve_chunks(conn, query_vector, top_k=5)
+            bot_state    = _db_get_session_state(conn, session_id)
             already_lead = _db_has_lead(conn, chat_id_str)
+            history      = _db_load_history(conn, session_id, limit=12)
             conn.commit()
 
-        # ── 6. Generate (no DB connection held) ──────────────────────────────
+        # ── PATH A: qualification answer ──────────────────────────────────────
+        # The user has replied to the qualification question ("what would you
+        # like to talk about?").  Skip the LLM — acknowledge warmly, show the
+        # contact keyboard, and clear the state machine.
+        if bot_state == "awaiting_qualification":
+            if not already_lead:
+                with get_db_conn() as conn:
+                    _db_save_message(conn, session_id, "user", text)
+                    _db_set_session_state(conn, session_id, None)
+                    _db_touch_session(conn, session_id)
+                    conn.commit()
+                _send_telegram_message(chat_id, _TG_QUALIFICATION_ACK,
+                                       reply_markup=_CONTACT_KEYBOARD)
+                _audit("telegram_qualification_answered", chat_id=chat_id_str,
+                       session_id=session_id)
+            else:
+                # Lead already captured while state was stale — clear and continue
+                with get_db_conn() as conn:
+                    _db_set_session_state(conn, session_id, None)
+                    conn.commit()
+                # fall through to normal RAG below
+            if not already_lead:
+                return {"ok": True}
+
+        # ── PATH B / C: normal RAG + optional qualification trigger ───────────
+        # Embed text and retrieve chunks only now — embedding is the slowest
+        # per-request step and is skipped entirely for PATH A.
+        query_vector = _embed_text(text)
+        with get_db_conn() as conn:
+            chunks = _retrieve_chunks(conn, query_vector, top_k=5)
+
+        # ── 5. Generate (no DB connection held during LLM call) ───────────────
         reply, sources = _rag_generate(text, chunks, history=history)
 
-        # ── 7. Persist turn ──────────────────────────────────────────────────
+        # Decide whether to trigger the qualification step after this reply.
+        # Conditions: booking intent in user's text + no existing lead + not
+        # already waiting for qualification (state is None).
+        trigger_qualification = (
+            _has_booking_intent(text)
+            and not already_lead
+            and bot_state is None
+        )
+
+        # ── 6. Persist turn + update state in one commit ──────────────────────
         with get_db_conn() as conn:
             _db_save_message(conn, session_id, "user", text)
             _db_save_message(conn, session_id, "assistant", reply)
+            if trigger_qualification:
+                _db_set_session_state(conn, session_id, "awaiting_qualification")
             _db_touch_session(conn, session_id)
             conn.commit()
 
         _audit("telegram_success", chat_id=chat_id_str, session_id=session_id,
-               sources=sources, chunks=len(chunks))
+               sources=sources, chunks=len(chunks),
+               qualification_triggered=trigger_qualification)
 
-        # ── 8. Deliver answer; soft-steer toward booking if intent detected ──
-        # We send the RAG answer first, then — if the user's message showed
-        # booking/consultation intent AND we don't have their contact yet — we
-        # append the contact-share keyboard as a gentle, separate message.
-        # This keeps the answer clean and avoids a pushy combined message.
+        # ── 7. Deliver ────────────────────────────────────────────────────────
         _send_telegram_message(chat_id, reply)
-        if _has_booking_intent(text) and not already_lead:
-            _send_telegram_message(chat_id, _TG_CONTACT_PROMPT,
-                                   reply_markup=_CONTACT_KEYBOARD)
+        if trigger_qualification:
+            # Send the qualification question as a second message so the RAG
+            # answer reads cleanly before the conversational pivot.
+            _send_telegram_message(chat_id, _TG_QUALIFICATION_QUESTION)
 
     except TimeoutError:
         logger.error("[telegram] LLM timeout")
