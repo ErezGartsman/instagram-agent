@@ -65,6 +65,10 @@ def client():
     # real TELEGRAM_WEBHOOK_SECRET happens to be set in the local .env. Tests that
     # exercise the secret gate set it explicitly via monkeypatch.
     main.settings.telegram_webhook_secret = ""
+    # Rate store is module-level and accumulates across tests.  Moving
+    # check_rate_limit before the DB checkout means more paths now hit it;
+    # clear it here so no test bleeds its request count into the next one.
+    main._rate_store.clear()
 
     with patch.object(main, "_get_pool") as mock_get_pool:
         mock_pool = MagicMock()
@@ -709,13 +713,18 @@ class TestTelegramWebhook:
         assert len(messages_sent) == 1                        # RAG reply only
 
     def test_qualification_answer_sends_contact_keyboard(self, client, monkeypatch):
-        """When state='awaiting_qualification' any user reply triggers the contact keyboard."""
+        """When state='awaiting_qualification' any user reply triggers the contact keyboard
+        (via _send_contact_keyboard so UX instructions are always appended)."""
         messages_sent = []
+        states_set    = []
         monkeypatch.setattr(main, "_send_telegram_message",
                             lambda cid, text, reply_markup=None:
                                 messages_sent.append({"text": text, "markup": reply_markup}))
         self._base_rag_patches(monkeypatch, already_lead=False,
                                bot_state="awaiting_qualification")
+        # Override the state-setter spy AFTER base patches so it isn't overwritten.
+        monkeypatch.setattr(main, "_db_set_session_state",
+                            lambda c, sid, s: states_set.append(s))
 
         r = client.post("/api/webhook/telegram",
                         json=self._update(text="אני עוברת גירושין ומתקשה להמשיך"))
@@ -724,7 +733,45 @@ class TestTelegramWebhook:
         assert len(messages_sent) == 1                          # ack only, no LLM
         assert messages_sent[0]["markup"] is not None           # keyboard attached
         assert messages_sent[0]["markup"].get("keyboard") is not None
-        assert "תודה ששיתפת" in messages_sent[0]["text"]
+        assert "תודה על השיתוף" in messages_sent[0]["text"]    # new gender-neutral ACK
+        assert "הכפתור הגדול" in messages_sent[0]["text"]      # UX instructions appended
+        assert "awaiting_contact" in states_set                 # state advanced correctly
+
+    def test_awaiting_contact_non_phone_re_shows_keyboard(self, client, monkeypatch):
+        """While awaiting_contact, typing 'כן' (or any non-phone text) re-shows the keyboard."""
+        messages_sent = []
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, reply_markup=None:
+                                messages_sent.append({"text": text, "markup": reply_markup}))
+        self._base_rag_patches(monkeypatch, already_lead=False,
+                               bot_state="awaiting_contact")
+
+        # "כן" is 2 chars — it would fail validate_question if this path were wrong
+        r = client.post("/api/webhook/telegram", json=self._update(text="כן"))
+
+        assert r.status_code == 200
+        assert len(messages_sent) == 1                          # gentle redirect only
+        assert messages_sent[0]["markup"] is not None           # keyboard still shown
+        assert "לחצו על הכפתור" in messages_sent[0]["text"]    # redirect text
+        assert "הכפתור הגדול" in messages_sent[0]["text"]      # UX instructions appended
+
+    def test_awaiting_contact_phone_text_captures_lead(self, client, monkeypatch):
+        """While awaiting_contact, typing a phone number captures the lead."""
+        captured = {}
+        monkeypatch.setattr(main, "_send_telegram_message", lambda *a, **k: None)
+        self._base_rag_patches(monkeypatch, already_lead=False,
+                               bot_state="awaiting_contact")
+        monkeypatch.setattr(main, "_db_save_lead",
+                            lambda conn, sid, cid, name, phone, summary:
+                                captured.update({"phone": phone}) or "lead-id-awaiting")
+        monkeypatch.setattr(main, "_alert_owner", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_db_mark_lead_notified", lambda c, lid: None)
+
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="המספר שלי הוא 0521234567"))
+
+        assert r.status_code == 200
+        assert captured.get("phone") == "0521234567"
 
     def test_qualification_state_cleared_when_lead_exists(self, client, monkeypatch):
         """Stale awaiting_qualification + already_lead → normal RAG, state silently cleared."""

@@ -1605,10 +1605,16 @@ _TG_QUALIFICATION_QUESTION = (
     "נשמח לשמוע בכמה מילים על מה תרצו לדבר?"
 )
 _TG_QUALIFICATION_ACK = (
-    "תודה ששיתפת 🙏 ממה שתיארת, נראה שיש מקום ממשי לעבוד על זה יחד. "
-    "תרצי להשאיר פרטי קשר כדי שארז יוכל לחזור אלייך?"
+    "תודה על השיתוף 🙏 ממה שעלה, נראה שיש מקום ממשי לעבוד על זה יחד. "
+    "נשמח לקבל פרטי קשר כדי שארז יוכל לחזור אליכם:"
 )
-# Updated keyboard prompt: explicitly directs users past the standard keyboard
+# Gentle redirect when the user types text (e.g. "כן") instead of tapping the
+# contact button while bot_state == 'awaiting_contact'.
+_TG_AWAITING_CONTACT_RETRY = (
+    "אנא לחצו על הכפתור למטה כדי לשתף את המספר, "
+    "או פשוט הקלידו אותו כאן:"
+)
+# Keyboard UX instructions: explicitly directs users past the standard keyboard
 # that Telegram opens when they tap the reply bar — a known UX trap.
 _TG_CONTACT_PROMPT = (
     "רגע לפני שנמשיך – תרצו שארז ייצור קשר אישית? "
@@ -1822,6 +1828,22 @@ def _send_telegram_message(chat_id, text: str, reply_markup: dict = None) -> Non
         logger.error(f"[telegram] sendMessage to {chat_id} failed: {e}")
 
 
+def _send_contact_keyboard(chat_id, preamble: str) -> None:
+    """
+    Send the contact-share keyboard with `_TG_CONTACT_PROMPT` always appended.
+
+    The prompt explains how to find the contact button when Telegram's standard
+    keyboard pops up and hides it — a UX trap that is otherwise invisible to the
+    user. Centralising keyboard delivery here ensures the instructions can never
+    be accidentally omitted from any code path that shows the keyboard.
+    """
+    _send_telegram_message(
+        chat_id,
+        f"{preamble}\n\n{_TG_CONTACT_PROMPT}",
+        reply_markup=_CONTACT_KEYBOARD,
+    )
+
+
 @app.post("/api/webhook/telegram")
 def telegram_webhook(
     update: dict = Body(default={}),
@@ -1900,9 +1922,7 @@ def telegram_webhook(
                                        reply_markup=_REMOVE_KEYBOARD)
         return {"ok": True}
 
-    # ── 2b. Regex fallback — user typed their phone number as free text ───────
-    # Catches "המספר שלי הוא 0521234567" before the general text pipeline so we
-    # can capture the lead without asking them to press the button again.
+    # ── 2b. Parse text ────────────────────────────────────────────────────────
     text = (message.get("text") or "").strip()
 
     if not text:
@@ -1912,60 +1932,23 @@ def telegram_webhook(
         _send_telegram_message(chat_id, _get_config("telegram.greeting"))
         return {"ok": True}
 
-    # ── Crisis check — runs BEFORE moderation: distress → empathy, not a block ─
+    # ── Crisis check — always first among text handlers ───────────────────────
     if is_crisis(text):
         _audit("telegram_crisis", chat_id=chat_id_str)
         _send_telegram_message(chat_id, _get_config("crisis.message"))
         return {"ok": True}
 
-    # Regex phone fallback: treat as a contact share if we spot a phone number.
-    phone_in_text = _extract_phone_from_text(text)
-    if phone_in_text:
-        try:
-            with get_db_conn() as conn:
-                already = _db_has_lead(conn, chat_id_str)
-                if not already:
-                    session_id     = _db_get_or_create_telegram_session(conn, chat_id_str)
-                    history        = _db_load_history(conn, session_id, limit=12)
-                    intent_summary = _build_intent_summary(history, text)
-                    lead_id        = _db_save_lead(
-                        conn, session_id, chat_id_str, None, phone_in_text, intent_summary
-                    )
-                    conn.commit()
-                    if lead_id:
-                        _alert_owner(lead_id, None, phone_in_text, intent_summary, chat_id_str)
-                        with get_db_conn() as conn2:
-                            _db_mark_lead_notified(conn2, lead_id)
-                            conn2.commit()
-                        _audit("lead_captured_regex", chat_id=chat_id_str, lead_id=lead_id)
-                        _send_telegram_message(
-                            chat_id,
-                            _TG_LEAD_THANKS.format(name=""),
-                        )
-                        return {"ok": True}
-        except Exception as e:
-            logger.error(f"[leads] Regex-fallback capture failed: {e}", exc_info=True)
-        # If we already had a lead or capture failed, fall through to the normal text path
-
     _audit("telegram_request", chat_id=chat_id_str, question=text)
 
-    # ── 3. Guards ─────────────────────────────────────────────────────────────
-    if len(text) > 500:
-        _send_telegram_message(chat_id, _TG_TOO_LONG)
-        return {"ok": True}
-    try:
-        validate_question(text)
-    except InputModerationError:
-        _audit("telegram_moderation_block", chat_id=chat_id_str)
-        _send_telegram_message(chat_id, _TG_MODERATION)
-        return {"ok": True}
+    # ── 3. Rate limit (in-memory — runs before DB checkout) ───────────────────
     try:
         check_rate_limit(chat_id_str)
     except RateLimitError:
         _send_telegram_message(chat_id, _TG_RATE_LIMIT)
         return {"ok": True}
 
-    # ── 4. Identity mapping — fast checkout, no embedding yet ─────────────────
+    # ── 4. Identity mapping — before validate_question so bot_state can
+    #       bypass the length guard for short replies like "כן" (2 chars). ─────
     try:
         with get_db_conn() as conn:
             session_id   = _db_get_or_create_telegram_session(conn, chat_id_str)
@@ -1974,50 +1957,123 @@ def telegram_webhook(
             history      = _db_load_history(conn, session_id, limit=12)
             conn.commit()
 
+        # ── STATE: awaiting_contact ────────────────────────────────────────────
+        # The contact keyboard was shown in PATH A.  The user must EITHER tap
+        # the native contact button (handled as message.contact above) OR type
+        # their phone number.  Any other text (e.g. "כן") gets a gentle redirect
+        # that re-shows the keyboard.
+        #
+        # This block runs BEFORE validate_question so that short affirmative
+        # replies that fall below the 3-char length guard (e.g. "כן") don't
+        # produce a confusing "cannot process" error message.
+        if bot_state == "awaiting_contact":
+            phone = _extract_phone_from_text(text)
+            if already_lead:
+                # Lead captured since we showed the keyboard — clear stale state
+                # and fall through to normal conversation.
+                with get_db_conn() as conn:
+                    _db_set_session_state(conn, session_id, None)
+                    conn.commit()
+                bot_state = None  # continue to guards + RAG below
+            elif phone:
+                # User typed their phone number — capture it.
+                try:
+                    intent_summary = _build_intent_summary(history, text)
+                    with get_db_conn() as conn:
+                        lead_id = _db_save_lead(conn, session_id, chat_id_str,
+                                                None, phone, intent_summary)
+                        _db_set_session_state(conn, session_id, None)
+                        conn.commit()
+                    if lead_id:
+                        _alert_owner(lead_id, None, phone, intent_summary, chat_id_str)
+                        with get_db_conn() as conn:
+                            _db_mark_lead_notified(conn, lead_id)
+                            conn.commit()
+                        _audit("lead_captured_regex_awaiting", chat_id=chat_id_str,
+                               lead_id=lead_id)
+                        _send_telegram_message(chat_id, _TG_LEAD_THANKS.format(name=""),
+                                               reply_markup=_REMOVE_KEYBOARD)
+                except Exception as e:
+                    logger.error(f"[leads] awaiting_contact phone capture: {e}", exc_info=True)
+                    _send_telegram_message(chat_id, _TG_ERROR, reply_markup=_REMOVE_KEYBOARD)
+                return {"ok": True}
+            else:
+                # "כן", "בסדר", any non-phone text — re-show the keyboard with
+                # explicit button instructions.
+                _send_contact_keyboard(chat_id, _TG_AWAITING_CONTACT_RETRY)
+                return {"ok": True}
+
+        # ── 5. Content guards (only reached when not in awaiting_contact) ──────
+        if len(text) > 500:
+            _send_telegram_message(chat_id, _TG_TOO_LONG)
+            return {"ok": True}
+        try:
+            validate_question(text)
+        except InputModerationError:
+            _audit("telegram_moderation_block", chat_id=chat_id_str)
+            _send_telegram_message(chat_id, _TG_MODERATION)
+            return {"ok": True}
+
         # ── PATH A: qualification answer ──────────────────────────────────────
-        # The user has replied to the qualification question ("what would you
-        # like to talk about?").  Skip the LLM — acknowledge warmly, show the
-        # contact keyboard, and clear the state machine.
+        # The user replied to "what would you like to talk about?".
+        # Skip the LLM: acknowledge warmly, show the contact keyboard, advance
+        # the state machine to 'awaiting_contact'.
         if bot_state == "awaiting_qualification":
             if not already_lead:
                 with get_db_conn() as conn:
                     _db_save_message(conn, session_id, "user", text)
-                    _db_set_session_state(conn, session_id, None)
+                    _db_set_session_state(conn, session_id, "awaiting_contact")
                     _db_touch_session(conn, session_id)
                     conn.commit()
-                _send_telegram_message(chat_id, _TG_QUALIFICATION_ACK,
-                                       reply_markup=_CONTACT_KEYBOARD)
+                _send_contact_keyboard(chat_id, _TG_QUALIFICATION_ACK)
                 _audit("telegram_qualification_answered", chat_id=chat_id_str,
                        session_id=session_id)
             else:
-                # Lead already captured while state was stale — clear and continue
+                # Lead already captured while in qualification state — clear.
                 with get_db_conn() as conn:
                     _db_set_session_state(conn, session_id, None)
                     conn.commit()
-                # fall through to normal RAG below
             if not already_lead:
                 return {"ok": True}
 
+        # ── Regex phone fallback for normal conversation ───────────────────────
+        # Catches users who spontaneously type their number without being prompted.
+        # Full Israeli phone numbers (9+ chars) always pass the length guard above.
+        phone_in_text = _extract_phone_from_text(text)
+        if phone_in_text and not already_lead:
+            try:
+                intent_summary = _build_intent_summary(history, text)
+                with get_db_conn() as conn:
+                    lead_id = _db_save_lead(conn, session_id, chat_id_str,
+                                            None, phone_in_text, intent_summary)
+                    conn.commit()
+                if lead_id:
+                    _alert_owner(lead_id, None, phone_in_text, intent_summary, chat_id_str)
+                    with get_db_conn() as conn:
+                        _db_mark_lead_notified(conn, lead_id)
+                        conn.commit()
+                    _audit("lead_captured_regex", chat_id=chat_id_str, lead_id=lead_id)
+                    _send_telegram_message(chat_id, _TG_LEAD_THANKS.format(name=""))
+                    return {"ok": True}
+            except Exception as e:
+                logger.error(f"[leads] Regex capture failed: {e}", exc_info=True)
+            # If capture failed, fall through to RAG.
+
         # ── PATH B / C: normal RAG + optional qualification trigger ───────────
-        # Embed text and retrieve chunks only now — embedding is the slowest
-        # per-request step and is skipped entirely for PATH A.
+        # Embedding is the slowest step — only reached here (not for PATH A or
+        # awaiting_contact, which return early with scripted responses).
         query_vector = _embed_text(text)
         with get_db_conn() as conn:
             chunks = _retrieve_chunks(conn, query_vector, top_k=5)
 
-        # ── 5. Generate (no DB connection held during LLM call) ───────────────
         reply, sources = _rag_generate(text, chunks, history=history)
 
-        # Decide whether to trigger the qualification step after this reply.
-        # Conditions: booking intent in user's text + no existing lead + not
-        # already waiting for qualification (state is None).
         trigger_qualification = (
             _has_booking_intent(text)
             and not already_lead
             and bot_state is None
         )
 
-        # ── 6. Persist turn + update state in one commit ──────────────────────
         with get_db_conn() as conn:
             _db_save_message(conn, session_id, "user", text)
             _db_save_message(conn, session_id, "assistant", reply)
@@ -2030,11 +2086,8 @@ def telegram_webhook(
                sources=sources, chunks=len(chunks),
                qualification_triggered=trigger_qualification)
 
-        # ── 7. Deliver ────────────────────────────────────────────────────────
         _send_telegram_message(chat_id, reply)
         if trigger_qualification:
-            # Send the qualification question as a second message so the RAG
-            # answer reads cleanly before the conversational pivot.
             _send_telegram_message(chat_id, _TG_QUALIFICATION_QUESTION)
 
     except TimeoutError:
