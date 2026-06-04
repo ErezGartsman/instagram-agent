@@ -57,8 +57,14 @@ def client():
     The pool is patched so it never dials Supabase.
     """
     # Reset module-level caches so tests don't bleed into each other
-    main._schema_cache = ""
-    main._pool         = None
+    main._schema_cache    = ""
+    main._pool            = None
+    main._config_cache    = {}
+    main._config_cache_ts = 0.0
+    # Default the Telegram secret OFF so webhook tests don't depend on whether a
+    # real TELEGRAM_WEBHOOK_SECRET happens to be set in the local .env. Tests that
+    # exercise the secret gate set it explicitly via monkeypatch.
+    main.settings.telegram_webhook_secret = ""
 
     with patch.object(main, "_get_pool") as mock_get_pool:
         mock_pool = MagicMock()
@@ -626,3 +632,76 @@ class TestTelegramWebhook:
         # The previous turns appear in the prompt context block.
         assert "RECENT CONVERSATION" in captured["prompt"]
         assert "ארז גרצמן הוא מנטור" in captured["prompt"]
+
+    def test_crisis_message_for_distress(self, client, monkeypatch):
+        """Distress/self-harm → compassionate ERAN (1201) message, never the LLM."""
+        send = MagicMock()
+        llm  = MagicMock()
+        monkeypatch.setattr(main, "_send_telegram_message", send)
+        monkeypatch.setattr(main, "_call_llm", llm)   # must NOT be reached
+
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="אני לא רוצה לחיות יותר, אין טעם"))
+
+        assert r.status_code == 200
+        send.assert_called_once()
+        assert "1201" in send.call_args.args[1]   # ERAN hotline number
+        llm.assert_not_called()
+
+    def test_greeting_comes_from_config(self, client, monkeypatch):
+        """/start delivers the config-driven greeting (default mentions Erez)."""
+        send = MagicMock()
+        monkeypatch.setattr(main, "_send_telegram_message", send)
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="/start"))
+
+        assert r.status_code == 200
+        assert "ארז גרצמן" in send.call_args.args[1]
+
+    def test_persona_injected_into_rag_prompt(self, client, monkeypatch):
+        """The persona/brand DNA is prepended to the RAG prompt."""
+        captured = {}
+        monkeypatch.setattr(main, "_send_telegram_message", MagicMock())
+        monkeypatch.setattr(main, "_embed_text", lambda t: [0.1] * 768)
+        monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: [])
+        monkeypatch.setattr(main, "_retrieve_chunks", lambda c, v, top_k=5:
+                            [{"content": "x", "source": "about.txt", "similarity": 0.7}])
+        monkeypatch.setattr(main, "_db_save_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_db_touch_session", lambda c, sid: None)
+        def cap(p):
+            captured["p"] = p
+            return "ok"
+        monkeypatch.setattr(main, "_call_llm", cap)
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="שאלה על זוגיות"))
+
+        assert r.status_code == 200
+        # default persona (loaded from defaults since mock DB is empty) names Erez
+        assert "ארז גרצמן" in captured["p"]
+
+
+# ─── 11. App config (persona / greeting / crisis) ─────────────────────────────
+
+class TestAppConfig:
+    def test_returns_default_when_db_empty(self, client):
+        """Empty app_config table → hardcoded default (here, the crisis message)."""
+        val = main._get_config("crisis.message")
+        assert "1201" in val
+
+    def test_returns_db_value_when_present(self, client):
+        mock_conn, mock_cursor = _patch_conn(client)
+        mock_cursor.fetchall.return_value = [("persona.system", "CUSTOM VOICE")]
+        main._config_cache, main._config_cache_ts = {}, 0.0   # force a reload
+
+        assert main._get_config("persona.system") == "CUSTOM VOICE"
+
+    def test_unknown_key_returns_empty_string(self, client):
+        main._config_cache, main._config_cache_ts = {}, 0.0
+        assert main._get_config("nope.not.here") == ""
+
+    def test_is_crisis_detects_hebrew_and_english(self):
+        assert main.is_crisis("אני רוצה למות")
+        assert main.is_crisis("I want to kill myself")
+        assert not main.is_crisis("מה השירותים שלכם?")
+        assert not main.is_crisis("how much does a session cost?")
