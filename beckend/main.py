@@ -1600,6 +1600,64 @@ _CONTACT_KEYBOARD = {
 }
 _REMOVE_KEYBOARD = {"remove_keyboard": True}
 
+# ── State machine constants ────────────────────────────────────────────────────
+_BOT_STATE_TTL_HOURS = 24   # states older than this are treated as NULL on load
+_MAX_CONTACT_RETRIES = 3    # non-phone, non-escape replies before graceful exit
+
+# User explicitly opts out of the current funnel step.
+_TG_ESCAPE_RESPONSE = (
+    "בסדר גמור 😊 אם תרצו לחזור לנושא בעתיד — אני כאן. "
+    "אפשר גם לשאול כל שאלה אחרת."
+)
+# Shown after MAX_CONTACT_RETRIES non-phone replies in awaiting_contact.
+_TG_CONTACT_RETRY_EXHAUSTED = (
+    "ממש בסדר, ללא לחץ 😊 אם תחליטו שתרצו שארז יחזור אליכם — "
+    "פשוט שלחו את המספר בכל עת ואשמח לעזור."
+)
+
+# Regex: user wants to exit the current funnel state.
+# Checked before validate_question so short signals like "לא" (2 chars) are caught
+# before the length guard rejects them.
+_ESCAPE_INTENT = re.compile(
+    r"\b(לא\b|בטל|עצור|הפסק|שנה\s*נושא|לא\s*רלוונטי|לא\s*עכשיו|"
+    r"דילוג|שכח|ignore|stop|cancel|never\s*mind|not\s*now|skip|back)\b",
+    re.IGNORECASE,
+)
+
+def _is_escape_intent(text: str) -> bool:
+    """True when the message is a clear opt-out from the current funnel step."""
+    return bool(_ESCAPE_INTENT.search(text or ""))
+
+
+def _make_contact_state(retry: int = 0) -> str:
+    """Encode the awaiting_contact state with its retry counter."""
+    return f"awaiting_contact:{retry}"
+
+def _is_awaiting_contact(state: str | None) -> bool:
+    """True for any awaiting_contact:N state (including legacy bare string)."""
+    return bool(state and state.startswith("awaiting_contact"))
+
+def _parse_contact_retry(state: str | None) -> int:
+    """Extract the retry count from 'awaiting_contact:N'. Returns 0 for any edge case."""
+    try:
+        return int((state or "").split(":", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def _format_lead_thanks(name: str | None) -> str:
+    """
+    Build the lead confirmation message without a double-space when no name is given.
+    `_TG_LEAD_THANKS.format(name='')` produces 'תודה  🙏' (double space); this
+    helper inserts 'name + space' only when a non-empty name is available.
+    """
+    prefix = f"{name.strip()} " if name and name.strip() else ""
+    return (
+        f"תודה {prefix}🙏 הפנייה התקבלה וארז יחזור אליכם בהקדם. "
+        f"בינתיים, אם יש עוד שאלות — אני כאן."
+    )
+
+
 _TG_QUALIFICATION_QUESTION = (
     "בשמחה. כדי שנוכל לבדוק אם ארז הוא הכתובת המדויקת עבורך, "
     "נשמח לשמוע בכמה מילים על מה תרצו לדבר?"
@@ -1660,28 +1718,51 @@ def _db_has_lead(conn, chat_id_str: str) -> bool:
 
 def _db_get_session_state(conn, session_id: str) -> str | None:
     """
-    Return the bot_state value for a session, or None if unset / session not found.
-    Used to drive the 2-turn qualification state machine.
+    Return the bot_state for a session, or None when unset, not found, or expired.
+
+    TTL check: if bot_state_expires_at < NOW() the state is treated as NULL.
+    The stale value stays in the DB until the next _db_set_session_state call
+    clears it — no extra write on the read path (important for serverless).
     """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT bot_state FROM sessions WHERE id = %s",
+            "SELECT bot_state, bot_state_expires_at FROM sessions WHERE id = %s",
             (session_id,),
         )
         row = cur.fetchone()
-    return row[0] if row else None
+    if not row or row[0] is None:
+        return None
+    bot_state, expires_at = row[0], row[1]
+    if expires_at and expires_at < datetime.datetime.now(datetime.timezone.utc):
+        logger.info(f"[state] Expired bot_state={bot_state!r} for session {session_id[:8]}")
+        return None   # expired — caller will clear on next write
+    return bot_state
 
 
 def _db_set_session_state(conn, session_id: str, state: str | None) -> None:
     """
-    Write bot_state for a session. Pass None to clear back to normal.
-    Caller must commit.
+    Write bot_state for a session and maintain its TTL.
+
+    Setting a non-None state also writes bot_state_expires_at = NOW() + 24 h so
+    a user who started the qualification funnel and went idle for a day returns
+    to a clean conversation instead of being trapped in a stale state.
+    Passing None clears both columns. Caller must commit.
     """
     with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE sessions SET bot_state = %s WHERE id = %s",
-            (state, session_id),
-        )
+        if state is None:
+            cur.execute(
+                "UPDATE sessions SET bot_state = NULL, bot_state_expires_at = NULL "
+                "WHERE id = %s",
+                (session_id,),
+            )
+        else:
+            cur.execute(
+                "UPDATE sessions "
+                "SET bot_state = %s, "
+                "    bot_state_expires_at = NOW() + INTERVAL '%s hours' "
+                "WHERE id = %s",
+                (state, _BOT_STATE_TTL_HOURS, session_id),
+            )
 
 
 def _db_save_lead(
@@ -1913,8 +1994,7 @@ def telegram_webhook(
                     logger.info(f"[leads] Duplicate contact from {chat_id_str} — skipped.")
 
                 # Warm confirmation + remove the keyboard regardless of dedup
-                confirmation = _TG_LEAD_THANKS.format(name=name or "")
-                _send_telegram_message(chat_id, confirmation,
+                _send_telegram_message(chat_id, _format_lead_thanks(name),
                                        reply_markup=_REMOVE_KEYBOARD)
             except Exception as e:
                 logger.error(f"[leads] Contact capture failed: {e}", exc_info=True)
@@ -1933,9 +2013,21 @@ def telegram_webhook(
         return {"ok": True}
 
     # ── Crisis check — always first among text handlers ───────────────────────
+    # The empathetic response is delivered BEFORE any DB work so that a DB
+    # hiccup can never block it. State is then cleared so the user returns to
+    # a clean conversation after speaking with a professional — not the contact
+    # keyboard or the qualification question.
     if is_crisis(text):
         _audit("telegram_crisis", chat_id=chat_id_str)
         _send_telegram_message(chat_id, _get_config("crisis.message"))
+        try:
+            with get_db_conn() as conn:
+                sid = _db_get_or_create_telegram_session(conn, chat_id_str)
+                if _db_get_session_state(conn, sid):   # only write if there's state to clear
+                    _db_set_session_state(conn, sid, None)
+                    conn.commit()
+        except Exception:
+            pass   # non-critical — never let this block or delay the crisis response
         return {"ok": True}
 
     _audit("telegram_request", chat_id=chat_id_str, question=text)
@@ -1957,26 +2049,38 @@ def telegram_webhook(
             history      = _db_load_history(conn, session_id, limit=12)
             conn.commit()
 
+        # ── Escape-intent gate ────────────────────────────────────────────────────
+        # Runs BEFORE validate_question and all state checks.
+        # If a user in any funnel state sends an opt-out signal ("לא", "בטל",
+        # "cancel"…) we clear state gracefully and let them ask freely.
+        # Short signals like "לא" (2 chars) would fail the length guard if we
+        # checked escape intent after validate_question — so we check here.
+        if bot_state and _is_escape_intent(text):
+            with get_db_conn() as conn:
+                _db_set_session_state(conn, session_id, None)
+                conn.commit()
+            _send_telegram_message(chat_id, _TG_ESCAPE_RESPONSE)
+            _audit("telegram_escape", chat_id=chat_id_str, prior_state=bot_state)
+            return {"ok": True}
+
         # ── STATE: awaiting_contact ────────────────────────────────────────────
-        # The contact keyboard was shown in PATH A.  The user must EITHER tap
-        # the native contact button (handled as message.contact above) OR type
-        # their phone number.  Any other text (e.g. "כן") gets a gentle redirect
-        # that re-shows the keyboard.
-        #
-        # This block runs BEFORE validate_question so that short affirmative
-        # replies that fall below the 3-char length guard (e.g. "כן") don't
-        # produce a confusing "cannot process" error message.
-        if bot_state == "awaiting_contact":
+        # The contact keyboard was shown.  User must EITHER tap the native button
+        # (handled as message.contact above) OR type their phone number.
+        # Non-phone text gets a re-show with a retry counter; after
+        # _MAX_CONTACT_RETRIES it exits gracefully.
+        # Runs BEFORE validate_question so short replies ("כן", 2 chars) bypass
+        # the length guard without producing a confusing error.
+        if _is_awaiting_contact(bot_state):
             phone = _extract_phone_from_text(text)
+            retry = _parse_contact_retry(bot_state)
+
             if already_lead:
-                # Lead captured since we showed the keyboard — clear stale state
-                # and fall through to normal conversation.
+                # Lead captured since the keyboard was shown — clear stale state.
                 with get_db_conn() as conn:
                     _db_set_session_state(conn, session_id, None)
                     conn.commit()
-                bot_state = None  # continue to guards + RAG below
+                bot_state = None   # fall through to normal conversation
             elif phone:
-                # User typed their phone number — capture it.
                 try:
                     intent_summary = _build_intent_summary(history, text)
                     with get_db_conn() as conn:
@@ -1991,19 +2095,31 @@ def telegram_webhook(
                             conn.commit()
                         _audit("lead_captured_regex_awaiting", chat_id=chat_id_str,
                                lead_id=lead_id)
-                        _send_telegram_message(chat_id, _TG_LEAD_THANKS.format(name=""),
+                        _send_telegram_message(chat_id, _format_lead_thanks(None),
                                                reply_markup=_REMOVE_KEYBOARD)
                 except Exception as e:
-                    logger.error(f"[leads] awaiting_contact phone capture: {e}", exc_info=True)
+                    logger.error(f"[leads] awaiting_contact capture: {e}", exc_info=True)
                     _send_telegram_message(chat_id, _TG_ERROR, reply_markup=_REMOVE_KEYBOARD)
                 return {"ok": True}
+            elif retry >= _MAX_CONTACT_RETRIES:
+                # Graceful exit after three non-phone, non-escape replies.
+                with get_db_conn() as conn:
+                    _db_set_session_state(conn, session_id, None)
+                    conn.commit()
+                _send_telegram_message(chat_id, _TG_CONTACT_RETRY_EXHAUSTED,
+                                       reply_markup=_REMOVE_KEYBOARD)
+                _audit("telegram_contact_exhausted", chat_id=chat_id_str)
+                return {"ok": True}
             else:
-                # "כן", "בסדר", any non-phone text — re-show the keyboard with
-                # explicit button instructions.
+                # Non-phone, non-escape — increment counter, re-show keyboard.
+                with get_db_conn() as conn:
+                    _db_set_session_state(conn, session_id,
+                                          _make_contact_state(retry + 1))
+                    conn.commit()
                 _send_contact_keyboard(chat_id, _TG_AWAITING_CONTACT_RETRY)
                 return {"ok": True}
 
-        # ── 5. Content guards (only reached when not in awaiting_contact) ──────
+        # ── 5. Content guards (only reached when not in a state machine branch) ─
         if len(text) > 500:
             _send_telegram_message(chat_id, _TG_TOO_LONG)
             return {"ok": True}
@@ -2015,21 +2131,20 @@ def telegram_webhook(
             return {"ok": True}
 
         # ── PATH A: qualification answer ──────────────────────────────────────
-        # The user replied to "what would you like to talk about?".
+        # User replied to "what would you like to talk about?".
         # Skip the LLM: acknowledge warmly, show the contact keyboard, advance
-        # the state machine to 'awaiting_contact'.
+        # state to awaiting_contact:0 (retry counter starts at zero).
         if bot_state == "awaiting_qualification":
             if not already_lead:
                 with get_db_conn() as conn:
                     _db_save_message(conn, session_id, "user", text)
-                    _db_set_session_state(conn, session_id, "awaiting_contact")
+                    _db_set_session_state(conn, session_id, _make_contact_state(0))
                     _db_touch_session(conn, session_id)
                     conn.commit()
                 _send_contact_keyboard(chat_id, _TG_QUALIFICATION_ACK)
                 _audit("telegram_qualification_answered", chat_id=chat_id_str,
                        session_id=session_id)
             else:
-                # Lead already captured while in qualification state — clear.
                 with get_db_conn() as conn:
                     _db_set_session_state(conn, session_id, None)
                     conn.commit()
@@ -2037,8 +2152,6 @@ def telegram_webhook(
                 return {"ok": True}
 
         # ── Regex phone fallback for normal conversation ───────────────────────
-        # Catches users who spontaneously type their number without being prompted.
-        # Full Israeli phone numbers (9+ chars) always pass the length guard above.
         phone_in_text = _extract_phone_from_text(text)
         if phone_in_text and not already_lead:
             try:
@@ -2053,11 +2166,10 @@ def telegram_webhook(
                         _db_mark_lead_notified(conn, lead_id)
                         conn.commit()
                     _audit("lead_captured_regex", chat_id=chat_id_str, lead_id=lead_id)
-                    _send_telegram_message(chat_id, _TG_LEAD_THANKS.format(name=""))
+                    _send_telegram_message(chat_id, _format_lead_thanks(None))
                     return {"ok": True}
             except Exception as e:
                 logger.error(f"[leads] Regex capture failed: {e}", exc_info=True)
-            # If capture failed, fall through to RAG.
 
         # ── PATH B / C: normal RAG + optional qualification trigger ───────────
         # Embedding is the slowest step — only reached here (not for PATH A or
