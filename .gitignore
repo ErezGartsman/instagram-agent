@@ -1,6 +1,11 @@
 # ─── Secrets & Config ────────────────────────────────────────────────────────
 .env
 .env.*
+# Ad-hoc secret/credential notes kept beside the project (e.g.
+# "# DataLens — Environment Variables.txt"). Never commit these.
+*Environment Variables*.txt
+*secrets*.txt
+*credentials*.txt
 # Negations below MUST be on their own line — a trailing "# comment" becomes
 # part of the pattern and silently breaks the rule.
 # keep the example template in git (no secrets, just placeholders)

@@ -17,6 +17,7 @@ import decimal
 import datetime
 import uuid
 import urllib.request
+import urllib.error
 import concurrent.futures
 from collections import OrderedDict
 from contextlib import asynccontextmanager, contextmanager
@@ -58,6 +59,25 @@ class Settings(BaseSettings):
     # Your personal Telegram chat_id — get it from @userinfobot.
     # When set, the bot DMs you every time a new lead is captured.
     telegram_owner_chat_id:  str = ""
+
+    # ── CRM lead sync (optional — inert until a provider is configured) ────────
+    # The sync destination is a swappable adapter selected by crm_provider:
+    #   "hubspot" → push to HubSpot (needs hubspot_private_token).
+    #   "fake"    → in-memory no-op provider for local dev / tests (no network).
+    #   ""        → disabled; lead capture behaves exactly as before.
+    crm_provider:        str = "hubspot"
+    # HubSpot Free — a Private App access token (Settings → Integrations →
+    # Private Apps) with contacts + deals read/write scopes. Looks like pat-….
+    hubspot_private_token: str = ""
+    # Optional: pin the Deal pipeline + stage. Leave empty to auto-discover the
+    # default pipeline's first stage on first use (cached for the process).
+    hubspot_pipeline_id: str = ""
+    hubspot_stage_id:    str = ""
+    # Optional: internal name of a custom Contact property to receive the intent
+    # summary. When empty the summary is attached as a Note on the contact.
+    hubspot_intent_property: str = ""
+    # Shared secret guarding the /api/cron/crm-sync reconciliation endpoint.
+    cron_secret:         str = ""
 
     model_config = {"env_file": ".env"}
 
@@ -1838,6 +1858,256 @@ def _alert_owner(lead_id: str, name: str, phone: str, intent_summary: str, chat_
     logger.info(f"[leads] Owner alerted for lead {lead_id}")
 
 
+# ─── CRM lead sync — swappable provider adapter ───────────────────────────────
+# Supabase is the source of truth; the CRM is a downstream projection. The sync
+# destination lives behind a single _crm_sync_lead() interface selected by
+# settings.crm_provider, so the vendor (HubSpot today) is an implementation
+# detail — swap providers by changing one env var, and run credential-free with
+# the "fake" provider in tests/local dev. Every call is BEST-EFFORT: a failure
+# logs and returns None but never raises, so the user's chat reply is never
+# affected. Leads that don't sync keep crm_synced_at = NULL and are retried by
+# /api/cron/crm-sync. Uses stdlib urllib only (no SDK) to keep the bundle small.
+
+_HUBSPOT_BASE = "https://api.hubapi.com"
+_hubspot_pipeline_cache: Optional[tuple] = None   # (pipeline_id, stage_id), discovered once
+
+
+def _crm_enabled() -> bool:
+    """True when a usable provider is configured."""
+    if settings.crm_provider == "hubspot":
+        return _hubspot_enabled()
+    if settings.crm_provider == "fake":
+        return True
+    return False
+
+
+def _crm_sync_lead(name: Optional[str], phone: str,
+                   intent_summary: Optional[str]) -> Optional[str]:
+    """Dispatch a lead push to the configured provider. Returns the external id."""
+    if not _crm_enabled():
+        return None
+    if settings.crm_provider == "fake":
+        return _fake_sync_lead(name, phone, intent_summary)
+    return _hubspot_sync_lead(name, phone, intent_summary)
+
+
+def _fake_sync_lead(name: Optional[str], phone: str,
+                    intent_summary: Optional[str]) -> Optional[str]:
+    """In-memory provider for tests / local dev — deterministic id, no network."""
+    external_id = f"fake-{abs(hash(phone)) % 10**8:08d}"
+    logger.info(f"[crm] (fake) synced lead → {external_id}")
+    return external_id
+
+
+def _crm_format_phone(phone: str) -> str:
+    """Best-effort E.164 normalisation (Israeli-aware) for stable CRM matching."""
+    p = (phone or "").strip().replace(" ", "").replace("-", "")
+    if not p:
+        return p
+    if p.startswith("+"):
+        return p
+    if p.startswith("0") and len(p) == 10:   # local 05X-XXXXXXX
+        return "+972" + p[1:]
+    if p.startswith("972"):
+        return "+" + p
+    return "+" + p
+
+
+# ── HubSpot provider ──────────────────────────────────────────────────────────
+
+def _hubspot_enabled() -> bool:
+    return bool(settings.hubspot_private_token)
+
+
+def _hubspot_request(method: str, path: str,
+                     payload: Optional[dict] = None) -> Optional[dict]:
+    """
+    One authenticated HubSpot v3 request. Returns parsed JSON on success or None
+    on any error (logged, never raised). 10 s timeout keeps the webhook within
+    the same budget as Telegram sends.
+    """
+    url = f"{_HUBSPOT_BASE}{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={
+            "Authorization": f"Bearer {settings.hubspot_private_token}",
+            "Content-Type":  "application/json",
+            "Accept":        "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8")
+        return json.loads(body) if body else {}
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8")[:300]
+        except Exception:
+            pass
+        logger.error(f"[crm] HubSpot {method} {path} → HTTP {e.code}: {detail}")
+        return None
+    except Exception as e:
+        logger.error(f"[crm] HubSpot {method} {path} failed: {e}")
+        return None
+
+
+def _hubspot_find_contact_by_phone(phone: str) -> Optional[str]:
+    """Idempotency layer 2: return an existing contact id matching this phone."""
+    if not phone:
+        return None
+    body = _hubspot_request("POST", "/crm/v3/objects/contacts/search", {
+        "filterGroups": [
+            {"filters": [{"propertyName": "phone", "operator": "EQ", "value": phone}]}
+        ],
+        "properties": ["phone"],
+        "limit": 1,
+    })
+    results = (body or {}).get("results") or []
+    return results[0].get("id") if results else None
+
+
+def _hubspot_upsert_contact(name: Optional[str], phone: str,
+                            intent_summary: Optional[str]) -> Optional[str]:
+    """Find-or-create a Contact (deduped on phone). Returns the contact id."""
+    e164 = _crm_format_phone(phone)
+    props: dict = {"phone": e164, "lifecyclestage": "lead", "hs_lead_status": "NEW"}
+    if name:
+        props["firstname"] = name
+    if intent_summary and settings.hubspot_intent_property:
+        props[settings.hubspot_intent_property] = intent_summary
+
+    existing = _hubspot_find_contact_by_phone(e164)
+    if existing:
+        body = _hubspot_request("PATCH", f"/crm/v3/objects/contacts/{existing}",
+                                {"properties": props})
+        contact_id = existing if body is not None else None
+    else:
+        body = _hubspot_request("POST", "/crm/v3/objects/contacts",
+                                {"properties": props})
+        contact_id = (body or {}).get("id")
+
+    # No custom field configured → attach intent as a Note (best-effort).
+    if contact_id and intent_summary and not settings.hubspot_intent_property:
+        _hubspot_add_note(contact_id, intent_summary)
+    return contact_id
+
+
+def _hubspot_add_note(contact_id: str, intent_summary: str) -> None:
+    """Attach the intent summary as a Note associated to the contact."""
+    _hubspot_request("POST", "/crm/v3/objects/notes", {
+        "properties": {
+            "hs_note_body": intent_summary,
+            "hs_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        },
+        "associations": [{
+            "to":    {"id": contact_id},
+            "types": [{"associationCategory": "HUBSPOT_DEFINED",
+                       "associationTypeId": 202}],   # note → contact
+        }],
+    })
+
+
+def _hubspot_resolve_stage() -> tuple:
+    """
+    Return (pipeline_id, stage_id). Uses the configured IDs when set, otherwise
+    auto-discovers the default deal pipeline's first stage and caches it for the
+    process lifetime. Returns (None, None) if discovery fails.
+    """
+    global _hubspot_pipeline_cache
+    if settings.hubspot_pipeline_id and settings.hubspot_stage_id:
+        return settings.hubspot_pipeline_id, settings.hubspot_stage_id
+    if _hubspot_pipeline_cache is not None:
+        return _hubspot_pipeline_cache
+
+    body = _hubspot_request("GET", "/crm/v3/pipelines/deals")
+    pipelines = (body or {}).get("results") or []
+    if not pipelines:
+        return None, None
+    pipeline = next((p for p in pipelines if p.get("id") == "default"), None) \
+        or min(pipelines, key=lambda p: p.get("displayOrder", 0))
+    stages = pipeline.get("stages") or []
+    if not stages:
+        return None, None
+    stage = min(stages, key=lambda s: s.get("displayOrder", 0))
+    _hubspot_pipeline_cache = (pipeline.get("id"), stage.get("id"))
+    logger.info(f"[crm] HubSpot pipeline auto-discovered: {_hubspot_pipeline_cache}")
+    return _hubspot_pipeline_cache
+
+
+def _hubspot_create_deal(contact_id: str, name: Optional[str]) -> None:
+    """Create a Deal in the resolved pipeline/stage, associated to the contact."""
+    pipeline_id, stage_id = _hubspot_resolve_stage()
+    if not (pipeline_id and stage_id):
+        logger.warning("[crm] No deal pipeline/stage resolved — contact synced "
+                       "without a deal.")
+        return
+    deal_name = f"ליד טלגרם — {name}" if name else "ליד טלגרם"
+    _hubspot_request("POST", "/crm/v3/objects/deals", {
+        "properties": {
+            "dealname":  deal_name,
+            "pipeline":  pipeline_id,
+            "dealstage": stage_id,
+        },
+        "associations": [{
+            "to":    {"id": contact_id},
+            "types": [{"associationCategory": "HUBSPOT_DEFINED",
+                       "associationTypeId": 3}],      # deal → contact
+        }],
+    })
+
+
+def _hubspot_sync_lead(name: Optional[str], phone: str,
+                       intent_summary: Optional[str]) -> Optional[str]:
+    """Upsert Contact (idempotent) + create associated Deal. Returns contact id."""
+    contact_id = _hubspot_upsert_contact(name, phone, intent_summary)
+    if contact_id:
+        _hubspot_create_deal(contact_id, name)
+        logger.info(f"[crm] HubSpot synced lead → contact {contact_id}")
+    return contact_id
+
+
+def _db_mark_lead_synced(conn, lead_id: str, external_id: str) -> None:
+    """Stamp crm_external_id + crm_synced_at so the reconciler skips this lead."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE leads SET crm_external_id = %s, crm_synced_at = NOW() "
+            "WHERE id = %s",
+            (external_id, lead_id),
+        )
+
+
+def _finalize_lead(lead_id: str, name: Optional[str], phone: str,
+                   intent_summary: Optional[str], chat_id: str) -> None:
+    """
+    Single post-save side-effect funnel for ALL three capture paths:
+    owner alert → CRM sync → stamp notified_at (+ crm_synced_at on success),
+    in one commit. Entirely best-effort: any failure is logged, never raised —
+    the caller has already sent the user's confirmation. Leads that fail the CRM
+    push keep crm_synced_at = NULL and are retried by /api/cron/crm-sync.
+    """
+    try:
+        _alert_owner(lead_id, name, phone, intent_summary, chat_id)
+    except Exception as e:
+        logger.error(f"[leads] owner alert failed for {lead_id}: {e}")
+
+    external_id = None
+    try:
+        external_id = _crm_sync_lead(name, phone, intent_summary)
+    except Exception as e:
+        logger.error(f"[crm] sync failed for lead {lead_id}: {e}")
+
+    try:
+        with get_db_conn() as conn:
+            _db_mark_lead_notified(conn, lead_id)
+            if external_id:
+                _db_mark_lead_synced(conn, lead_id, external_id)
+            conn.commit()
+    except Exception as e:
+        logger.error(f"[leads] finalize bookkeeping failed for {lead_id}: {e}")
+
+
 # Bot-authored system messages are Hebrew to match the representative persona.
 # The /start greeting and the crisis response are config-driven (app_config,
 # editable live in Supabase); the short operational notices below stay in code.
@@ -1994,11 +2264,8 @@ def telegram_webhook(
                     conn.commit()
 
                 if lead_id:
-                    # Alert the owner (best-effort, non-blocking)
-                    _alert_owner(lead_id, name, phone, intent_summary, chat_id_str)
-                    with get_db_conn() as conn:
-                        _db_mark_lead_notified(conn, lead_id)
-                        conn.commit()
+                    # Owner alert + CRM sync + bookkeeping (best-effort).
+                    _finalize_lead(lead_id, name, phone, intent_summary, chat_id_str)
                     _audit("lead_captured", chat_id=chat_id_str,
                            lead_id=lead_id, phone_len=len(phone))
                 else:
@@ -2100,10 +2367,7 @@ def telegram_webhook(
                         _db_set_session_state(conn, session_id, None)
                         conn.commit()
                     if lead_id:
-                        _alert_owner(lead_id, None, phone, intent_summary, chat_id_str)
-                        with get_db_conn() as conn:
-                            _db_mark_lead_notified(conn, lead_id)
-                            conn.commit()
+                        _finalize_lead(lead_id, None, phone, intent_summary, chat_id_str)
                         _audit("lead_captured_regex_awaiting", chat_id=chat_id_str,
                                lead_id=lead_id)
                         _send_telegram_message(chat_id, _format_lead_thanks(None),
@@ -2172,10 +2436,7 @@ def telegram_webhook(
                                             None, phone_in_text, intent_summary)
                     conn.commit()
                 if lead_id:
-                    _alert_owner(lead_id, None, phone_in_text, intent_summary, chat_id_str)
-                    with get_db_conn() as conn:
-                        _db_mark_lead_notified(conn, lead_id)
-                        conn.commit()
+                    _finalize_lead(lead_id, None, phone_in_text, intent_summary, chat_id_str)
                     _audit("lead_captured_regex", chat_id=chat_id_str, lead_id=lead_id)
                     _send_telegram_message(chat_id, _format_lead_thanks(None))
                     return {"ok": True}
@@ -2238,6 +2499,59 @@ def telegram_webhook(
         _send_telegram_message(chat_id, _TG_ERROR)
 
     return {"ok": True}
+
+
+@app.get("/api/cron/crm-sync")
+def cron_crm_sync(
+    authorization: Optional[str] = Header(default=None),
+    x_cron_secret: Optional[str] = Header(default=None),
+):
+    """
+    Reconciliation job — retries the CRM push for any lead committed to Supabase
+    but never synced (crm_synced_at IS NULL), e.g. because the CRM was down during
+    live capture. Triggered by Vercel Cron (see vercel.json).
+
+    Auth: guarded by CRON_SECRET. Vercel Cron sends it as
+    'Authorization: Bearer <secret>'; we also accept an X-Cron-Secret header for
+    manual curl. When CRON_SECRET is unset the guard is skipped (local dev only).
+    Batched (LIMIT 50) so a backlog can't exceed the function time budget.
+    """
+    if settings.cron_secret:
+        bearer = (authorization or "")
+        if bearer.startswith("Bearer "):
+            bearer = bearer[len("Bearer "):].strip()
+        if bearer != settings.cron_secret and x_cron_secret != settings.cron_secret:
+            raise HTTPException(status_code=401, detail="Invalid cron secret.")
+
+    if not _crm_enabled():
+        return {"status": "skipped", "reason": "CRM not configured"}
+
+    synced, failed = 0, 0
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, name, phone, intent_summary FROM leads "
+                    "WHERE crm_synced_at IS NULL ORDER BY created_at LIMIT 50"
+                )
+                pending = cur.fetchall()
+
+        for lead_id, name, phone, intent in pending:
+            external_id = _crm_sync_lead(name, phone, intent)
+            if external_id:
+                with get_db_conn() as conn:
+                    _db_mark_lead_synced(conn, str(lead_id), external_id)
+                    conn.commit()
+                synced += 1
+            else:
+                failed += 1
+
+        _audit("crm_reconcile", pending=len(pending), synced=synced, failed=failed)
+        return {"status": "ok", "pending": len(pending),
+                "synced": synced, "failed": failed}
+    except Exception as e:
+        logger.error(f"[crm] reconcile failed: {e}", exc_info=True)
+        return {"status": "error", "detail": "reconcile failed"}
 
 
 @app.post("/api/raw_query", dependencies=[Depends(require_auth)])
