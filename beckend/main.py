@@ -1683,6 +1683,17 @@ _TG_CONTACT_PROMPT = (
 _TG_LEAD_THANKS = "תודה {name} 🙏 הפנייה התקבלה וארז יחזור אליכם בהקדם. בינתיים, אם יש עוד שאלות — אני כאן."
 _TG_LEAD_DUPLICATE = None   # silent — we already have this person's number; don't re-ask
 
+# Deterministic reply for a user we ALREADY captured who shows booking intent
+# again. already_lead suppresses the qualification funnel, so without this the
+# message falls through to the generic RAG model — which has no booking script
+# and tends to ramble. This fixed, on-brand line confirms we have their details
+# and invites a short topic note, skipping the LLM entirely.
+_TG_ALREADY_LEAD_BOOKING = (
+    "הפרטים שלכם כבר אצלנו 🙏 ארז יחזור אליכם בהקדם לתיאום. "
+    "אם תרצו, אפשר להשאיר כאן בכמה מילים על מה תרצו להתמקד בשיחה — "
+    "וזה יעזור לארז להגיע מוכן. בינתיים אני כאן לכל שאלה."
+)
+
 
 def _has_booking_intent(text: str) -> bool:
     """True when the user's message suggests interest in booking / consultation."""
@@ -2170,6 +2181,23 @@ def telegram_webhook(
                     return {"ok": True}
             except Exception as e:
                 logger.error(f"[leads] Regex capture failed: {e}", exc_info=True)
+
+        # ── PATH A2: returning lead shows booking intent again ────────────────
+        # already_lead suppresses the qualification funnel (trigger below is
+        # gated on `not already_lead`). Without an explicit branch, such a user
+        # drops into the generic RAG model, which has no booking script and
+        # rambles. Answer deterministically and skip the LLM entirely — this
+        # also avoids the slow embed + generate round-trip for a known contact.
+        if already_lead and bot_state is None and _has_booking_intent(text):
+            with get_db_conn() as conn:
+                _db_save_message(conn, session_id, "user", text)
+                _db_save_message(conn, session_id, "assistant", _TG_ALREADY_LEAD_BOOKING)
+                _db_touch_session(conn, session_id)
+                conn.commit()
+            _send_telegram_message(chat_id, _TG_ALREADY_LEAD_BOOKING)
+            _audit("telegram_already_lead_booking", chat_id=chat_id_str,
+                   session_id=session_id)
+            return {"ok": True}
 
         # ── PATH B / C: normal RAG + optional qualification trigger ───────────
         # Embedding is the slowest step — only reached here (not for PATH A or
