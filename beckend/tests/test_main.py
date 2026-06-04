@@ -37,7 +37,9 @@ def _make_mock_conn(fetchone_return=None, fetchall_return=None, description=None
     pre-canned results.  All tests that touch a DB path use this.
     """
     mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value  = fetchone_return or (1,)
+    # Default two-column row: satisfies _db_get_session_state's (bot_state, expires_at)
+    # unpack without erroring, while returning None state (no funnel active).
+    mock_cursor.fetchone.return_value  = fetchone_return or (None, None)
     mock_cursor.fetchall.return_value  = fetchall_return or []
     mock_cursor.description            = description or [("col",)]
 
@@ -735,7 +737,7 @@ class TestTelegramWebhook:
         assert messages_sent[0]["markup"].get("keyboard") is not None
         assert "תודה על השיתוף" in messages_sent[0]["text"]    # new gender-neutral ACK
         assert "הכפתור הגדול" in messages_sent[0]["text"]      # UX instructions appended
-        assert "awaiting_contact" in states_set                 # state advanced correctly
+        assert "awaiting_contact:0" in states_set                # state advanced to retry-0
 
     def test_awaiting_contact_non_phone_re_shows_keyboard(self, client, monkeypatch):
         """While awaiting_contact, typing 'כן' (or any non-phone text) re-shows the keyboard."""
@@ -852,6 +854,8 @@ class TestTelegramWebhook:
         captured = {}
         monkeypatch.setattr(main, "_send_telegram_message", lambda *a, **k: None)
         monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_get_session_state", lambda c, sid: None)
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: None)
         monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: [])
         monkeypatch.setattr(main, "_db_has_lead", lambda c, cid: False)
         monkeypatch.setattr(main, "_db_save_lead",
@@ -916,3 +920,172 @@ class TestAppConfig:
         assert main.is_crisis("I want to kill myself")
         assert not main.is_crisis("מה השירותים שלכם?")
         assert not main.is_crisis("how much does a session cost?")
+
+
+# ─── 12. Sprint 1A — state machine resilience ─────────────────────────────────
+
+class TestEscapeIntent:
+    """Pure-function tests for the opt-out detector."""
+    def test_detects_hebrew_lo(self):        assert main._is_escape_intent("לא")
+    def test_detects_batel(self):            assert main._is_escape_intent("בטל בבקשה")
+    def test_detects_stop_english(self):     assert main._is_escape_intent("stop")
+    def test_detects_never_mind(self):       assert main._is_escape_intent("never mind")
+    def test_benign_not_detected(self):      assert not main._is_escape_intent("מה השירותים?")
+    def test_lo_inside_word_not_matched(self):
+        # "לאחרונה" contains "לא" but as a substring with \b it should NOT match
+        assert not main._is_escape_intent("לאחרונה")
+
+
+class TestContactStateHelpers:
+    """Pure-function tests for awaiting_contact encoding helpers."""
+    def test_make_contact_state_default(self): assert main._make_contact_state() == "awaiting_contact:0"
+    def test_make_contact_state_n(self):       assert main._make_contact_state(2) == "awaiting_contact:2"
+    def test_is_awaiting_contact_true(self):   assert main._is_awaiting_contact("awaiting_contact:0")
+    def test_is_awaiting_contact_false(self):  assert not main._is_awaiting_contact("awaiting_qualification")
+    def test_is_awaiting_contact_none(self):   assert not main._is_awaiting_contact(None)
+    def test_parse_retry_zero(self):           assert main._parse_contact_retry("awaiting_contact:0") == 0
+    def test_parse_retry_two(self):            assert main._parse_contact_retry("awaiting_contact:2") == 2
+    def test_parse_retry_bad_input(self):      assert main._parse_contact_retry(None) == 0
+
+
+class TestFormatLeadThanks:
+    """Cosmetic fix: no double-space when name is absent."""
+    def test_with_name(self):
+        result = main._format_lead_thanks("דנה")
+        assert "תודה דנה 🙏" in result
+        assert "  " not in result          # no double space
+    def test_without_name(self):
+        result = main._format_lead_thanks(None)
+        assert result.startswith("תודה 🙏")
+        assert "  " not in result          # no double space
+    def test_empty_string_name(self):
+        result = main._format_lead_thanks("")
+        assert result.startswith("תודה 🙏")
+        assert "  " not in result
+    def test_whitespace_only_name(self):
+        result = main._format_lead_thanks("   ")
+        assert result.startswith("תודה 🙏")
+
+
+class TestBotStateTTL:
+    """Unit tests for _db_get_session_state TTL expiry logic."""
+    def test_returns_state_when_not_expired(self):
+        import datetime
+        mock_conn, mock_cursor = _make_mock_conn()
+        future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
+        mock_cursor.fetchone.return_value = ("awaiting_contact:0", future)
+        assert main._db_get_session_state(mock_conn, "s1") == "awaiting_contact:0"
+
+    def test_returns_none_when_expired(self):
+        import datetime
+        mock_conn, mock_cursor = _make_mock_conn()
+        past = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+        mock_cursor.fetchone.return_value = ("awaiting_contact:0", past)
+        assert main._db_get_session_state(mock_conn, "s1") is None
+
+    def test_returns_none_when_no_expiry_column(self):
+        """Legacy rows without an expires_at value are treated as non-expiring."""
+        mock_conn, mock_cursor = _make_mock_conn()
+        mock_cursor.fetchone.return_value = ("awaiting_qualification", None)
+        assert main._db_get_session_state(mock_conn, "s1") == "awaiting_qualification"
+
+    def test_returns_none_for_missing_session(self):
+        mock_conn, mock_cursor = _make_mock_conn()
+        mock_cursor.fetchone.return_value = None
+        assert main._db_get_session_state(mock_conn, "s1") is None
+
+
+class TestWebhookResilienceEdgeCases:
+    """Webhook-level tests for Sprint 1A escape, retry, and crisis-clear."""
+
+    def _update(self, text="שלום", chat_id=555):
+        return {"update_id": 1,
+                "message": {"chat": {"id": chat_id, "type": "private"}, "text": text}}
+
+    def _base(self, monkeypatch, *, bot_state=None, already_lead=False):
+        monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_get_session_state", lambda c, sid: bot_state)
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: None)
+        monkeypatch.setattr(main, "_db_has_lead", lambda c, cid: already_lead)
+        monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: [])
+        monkeypatch.setattr(main, "_db_touch_session", lambda c, sid: None)
+        monkeypatch.setattr(main, "_db_save_message", lambda *a, **k: None)
+
+    def test_escape_clears_state_from_awaiting_qualification(self, client, monkeypatch):
+        """'לא' while awaiting_qualification → graceful exit, state cleared."""
+        state_cleared = []
+        sent = []
+        self._base(monkeypatch, bot_state="awaiting_qualification")
+        monkeypatch.setattr(main, "_db_set_session_state",
+                            lambda c, sid, s: state_cleared.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, **k: sent.append(text))
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="לא"))
+
+        assert r.status_code == 200
+        assert None in state_cleared                    # state cleared
+        assert any("בסדר גמור" in m for m in sent)     # graceful exit message
+
+    def test_escape_clears_state_from_awaiting_contact(self, client, monkeypatch):
+        """'בטל' while awaiting_contact → graceful exit, NOT the retry keyboard."""
+        state_cleared = []
+        sent = []
+        self._base(monkeypatch, bot_state="awaiting_contact:1")
+        monkeypatch.setattr(main, "_db_set_session_state",
+                            lambda c, sid, s: state_cleared.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, **k: sent.append(text))
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="בטל"))
+
+        assert r.status_code == 200
+        assert None in state_cleared
+        assert all("לחצו על הכפתור" not in m for m in sent)   # no retry keyboard
+
+    def test_awaiting_contact_retry_counter_increments(self, client, monkeypatch):
+        """Non-phone, non-escape in awaiting_contact:0 → state becomes awaiting_contact:1."""
+        states_set = []
+        self._base(monkeypatch, bot_state="awaiting_contact:0")
+        monkeypatch.setattr(main, "_db_set_session_state",
+                            lambda c, sid, s: states_set.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_send_contact_keyboard", lambda *a, **k: None)
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="כן"))
+
+        assert r.status_code == 200
+        assert "awaiting_contact:1" in states_set
+
+    def test_retry_exhaustion_clears_state_and_sends_graceful_exit(self, client, monkeypatch):
+        """After MAX_CONTACT_RETRIES non-phone replies → graceful exit + state cleared."""
+        state_cleared = []
+        sent = []
+        self._base(monkeypatch,
+                   bot_state=f"awaiting_contact:{main._MAX_CONTACT_RETRIES}")
+        monkeypatch.setattr(main, "_db_set_session_state",
+                            lambda c, sid, s: state_cleared.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, **k: sent.append(text))
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="כן שוב"))
+
+        assert r.status_code == 200
+        assert None in state_cleared                              # state cleared
+        assert any("ללא לחץ" in m for m in sent)                 # graceful message
+
+    def test_crisis_clears_funnel_state(self, client, monkeypatch):
+        """Crisis response is sent first; bot_state is then cleared (best-effort)."""
+        state_cleared = []
+        monkeypatch.setattr(main, "_send_telegram_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_get_session_state",
+                            lambda c, sid: "awaiting_contact:0")
+        monkeypatch.setattr(main, "_db_set_session_state",
+                            lambda c, sid, s: state_cleared.append(s))
+
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="אני לא רוצה לחיות"))
+
+        assert r.status_code == 200
+        assert None in state_cleared   # state cleared after crisis response
