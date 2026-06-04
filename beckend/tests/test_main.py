@@ -692,7 +692,7 @@ class TestTelegramWebhook:
         assert r.status_code == 200
         assert len(messages_sent) == 2                        # RAG reply + qualification question
         assert messages_sent[1]["markup"] is None             # NO keyboard yet
-        assert "תוכלי לשתף" in messages_sent[1]["text"]      # qualification question text
+        assert "נשמח לשמוע" in messages_sent[1]["text"]      # qualification question text
 
     def test_no_qualification_when_lead_already_exists(self, client, monkeypatch):
         """Booking intent + existing lead → single RAG reply, no qualification question."""
