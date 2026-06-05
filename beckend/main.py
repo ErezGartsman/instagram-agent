@@ -12,6 +12,8 @@ import os
 import re
 import time
 import json
+import hashlib
+import hmac
 import threading
 import decimal
 import datetime
@@ -86,6 +88,17 @@ settings = Settings()
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
+def _secret_eq(provided: Optional[str], expected: str) -> bool:
+    """
+    Constant-time secret comparison. Uses hmac.compare_digest so the time taken
+    does not depend on how many leading characters match — closing a (small)
+    timing side-channel on bearer tokens / shared secrets.
+    """
+    if not expected:
+        return False
+    return hmac.compare_digest((provided or ""), expected)
+
+
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 def require_auth(
@@ -105,7 +118,7 @@ def require_auth(
     """
     if not settings.nexus_api_key:
         return  # dev mode — auth disabled
-    if credentials is None or credentials.credentials != settings.nexus_api_key:
+    if credentials is None or not _secret_eq(credentials.credentials, settings.nexus_api_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
 
@@ -152,6 +165,19 @@ def _audit(event: str, **kwargs) -> None:
         {"ts": time.time(), "event": event, **kwargs},
         ensure_ascii=False, default=str,
     ))
+
+
+def _redact_text(text: Optional[str]) -> str:
+    """
+    Privacy guard for logs/audit. User messages in this product are highly
+    sensitive (relationships / dating coaching), so we never write raw message
+    bodies to logs or the audit trail. Instead we record a non-reversible
+    fingerprint — length + a short salted-ish hash — which is enough to correlate
+    duplicate/abusive messages and debug flow without storing PII in cleartext.
+    """
+    s = text or ""
+    digest = hashlib.sha256(s.encode("utf-8")).hexdigest()[:10]
+    return f"<redacted len={len(s)} h={digest}>"
 
 
 # ─── Database — lazy psycopg2 pool ────────────────────────────────────────────
@@ -486,6 +512,12 @@ def check_rate_limit(ip: str) -> None:
     Raises RateLimitError if ip has exceeded settings.rate_limit_requests
     in the last settings.rate_limit_window seconds.
     Every 100 requests, stale IP keys are evicted to prevent unbounded growth.
+
+    KNOWN LIMITATION (serverless): _rate_store is in-process, so on Vercel each
+    function instance keeps its own counter and a cold start resets it. This is a
+    best-effort guard against accidental floods, NOT a hard cross-instance limit.
+    For strict global rate limiting, back this with a shared store (e.g. Upstash
+    Redis / a Supabase table). Acceptable at current volume; revisit if abused.
     """
     global _rate_req_count
     now = time.time()
@@ -601,14 +633,31 @@ def execute_query(conn, sql: str) -> tuple:
     Wrap validated SQL in a LIMIT guard and execute via psycopg2.
     Returns (rows: list[tuple], columns: list[str]).
 
+    DEFENSE-IN-DEPTH (read-only execution):
+    validate_sql() is a blocklist + SELECT/WITH allowlist, but blocklists are
+    inherently fragile. We additionally execute the untrusted/LLM-generated SQL
+    inside a read-only SAVEPOINT: `SET LOCAL transaction_read_only = on` makes
+    Postgres itself reject ANY write (INSERT/UPDATE/DELETE, data-modifying CTEs,
+    etc.) at execution time, even if one slipped past the regex. ROLLBACK TO the
+    savepoint then restores writability so the caller's legitimate writes
+    (messages/leads) in the same transaction still succeed. The SELECT rows are
+    already fetched into Python, so the rollback discards nothing we need.
+
     psycopg2 connections are thread-safe; no global lock is needed because
     each request gets its own connection from the pool.
     """
     safe_sql = f"SELECT * FROM ({sql}) AS _q LIMIT {settings.max_result_rows}"
     with conn.cursor() as cur:
-        cur.execute(safe_sql)
-        columns = [desc[0] for desc in cur.description]
-        rows    = cur.fetchall()
+        cur.execute("SAVEPOINT _ro_guard")
+        cur.execute("SET LOCAL transaction_read_only = on")
+        try:
+            cur.execute(safe_sql)
+            columns = [desc[0] for desc in cur.description]
+            rows    = cur.fetchall()
+        finally:
+            # Undo SET LOCAL (restores read_only = off) without losing fetched rows.
+            cur.execute("ROLLBACK TO SAVEPOINT _ro_guard")
+            cur.execute("RELEASE SAVEPOINT _ro_guard")
     return rows, columns
 
 
@@ -949,7 +998,7 @@ def run_pipeline(question: str, conn, history: list = None) -> dict:
     schema       = get_schema_description(conn)
     history_block = _build_history_block(history)
 
-    logger.info(f"[pipeline] Question: {question!r}")
+    logger.info(f"[pipeline] Question: {_redact_text(question)}")
     prompt = COMBINED_PROMPT_TEMPLATE.format(
         schema=schema, history_block=history_block, question=question
     )
@@ -1125,10 +1174,10 @@ def db_test():
             "message": "Supabase connection successful.",
         }
     except Exception as e:
+        # Detail to server logs only — do not leak driver/DSN internals to clients.
         logger.error(f"[db-test] Connection failed: {e}")
         return {
             "status":  "error",
-            "detail":  str(e),
             "message": "Could not connect to Supabase.",
         }
 
@@ -1204,8 +1253,8 @@ def chat(request: ChatRequest, http_request: Request):
         )
 
     session_id = request.session_id
-    logger.info(f"[chat] {client_ip!r} session={session_id!r}: {question!r}")
-    _audit("chat_request", ip=client_ip, question=question, session_id=session_id)
+    logger.info(f"[chat] {client_ip!r} session={session_id!r}: {_redact_text(question)}")
+    _audit("chat_request", ip=client_ip, question=_redact_text(question), session_id=session_id)
 
     try:
         with get_db_conn() as conn:
@@ -1242,13 +1291,14 @@ def chat(request: ChatRequest, http_request: Request):
         return ChatResponse(status="success", session_id=session_id, **result)
 
     except SQLValidationError as e:
+        # Full detail to server logs only; never echo the rejected SQL / matched
+        # rule back to the client (information disclosure).
         logger.warning(f"[chat] SQL validation blocked: {e}")
         _audit("sql_error", ip=client_ip, detail=str(e))
         return ChatResponse(
             status="error",
             reply="I generated a query that isn't allowed for safety reasons. Try rephrasing.",
             error_code="validation_error",
-            sql_used=str(e),
         )
 
     except psycopg2.Error as e:
@@ -1551,7 +1601,7 @@ def rag_query(request: RagQueryRequest, http_request: Request):
             error_code="rate_limit_error",
         )
 
-    _audit("rag_request", ip=client_ip, question=question)
+    _audit("rag_request", ip=client_ip, question=_redact_text(question))
 
     try:
         # Embed first, then hold the pooled connection only for the vector
@@ -1667,9 +1717,9 @@ def _parse_contact_retry(state: str | None) -> int:
 
 def _format_lead_thanks(name: str | None) -> str:
     """
-    Build the lead confirmation message without a double-space when no name is given.
-    `_TG_LEAD_THANKS.format(name='')` produces 'תודה  🙏' (double space); this
-    helper inserts 'name + space' only when a non-empty name is available.
+    Build the lead confirmation message without a double-space when no name is
+    given (a naive "תודה {name} 🙏".format(name='') would yield a double space);
+    this helper inserts 'name + space' only when a non-empty name is available.
     """
     prefix = f"{name.strip()} " if name and name.strip() else ""
     return (
@@ -1700,8 +1750,6 @@ _TG_CONTACT_PROMPT = (
     "(אם קפצה לכם מקלדת רגילה והכפתור נעלם, לחצו על סמל הריבועים הקטן "
     "בצד שורת ההודעה כדי להחזיר אותו)."
 )
-_TG_LEAD_THANKS = "תודה {name} 🙏 הפנייה התקבלה וארז יחזור אליכם בהקדם. בינתיים, אם יש עוד שאלות — אני כאן."
-_TG_LEAD_DUPLICATE = None   # silent — we already have this person's number; don't re-ask
 
 # Deterministic reply for a user we ALREADY captured who shows booking intent
 # again. already_lead suppresses the qualification funnel, so without this the
@@ -2228,7 +2276,7 @@ def telegram_webhook(
     """
     # ── 1. Verify the shared secret ───────────────────────────────────────────
     if settings.telegram_webhook_secret:
-        if x_telegram_bot_api_secret_token != settings.telegram_webhook_secret:
+        if not _secret_eq(x_telegram_bot_api_secret_token, settings.telegram_webhook_secret):
             logger.warning("[telegram] Rejected webhook: bad/missing secret token.")
             return {"ok": True}   # 200, but do nothing
 
@@ -2263,17 +2311,17 @@ def telegram_webhook(
                     )
                     conn.commit()
 
+                # Warm confirmation FIRST so the user gets instant feedback —
+                # the slow owner-alert + CRM sync must never delay it (P1).
+                _send_telegram_message(chat_id, _format_lead_thanks(name),
+                                       reply_markup=_REMOVE_KEYBOARD)
                 if lead_id:
-                    # Owner alert + CRM sync + bookkeeping (best-effort).
+                    # Owner alert + CRM sync + bookkeeping (best-effort, post-ack).
                     _finalize_lead(lead_id, name, phone, intent_summary, chat_id_str)
                     _audit("lead_captured", chat_id=chat_id_str,
                            lead_id=lead_id, phone_len=len(phone))
                 else:
                     logger.info(f"[leads] Duplicate contact from {chat_id_str} — skipped.")
-
-                # Warm confirmation + remove the keyboard regardless of dedup
-                _send_telegram_message(chat_id, _format_lead_thanks(name),
-                                       reply_markup=_REMOVE_KEYBOARD)
             except Exception as e:
                 logger.error(f"[leads] Contact capture failed: {e}", exc_info=True)
                 _send_telegram_message(chat_id, _TG_ERROR,
@@ -2281,10 +2329,12 @@ def telegram_webhook(
         return {"ok": True}
 
     # ── 2b. Parse text ────────────────────────────────────────────────────────
-    text = (message.get("text") or "").strip()
+    # Fall back to a photo/document caption so a user who types their question in
+    # an image caption is understood instead of being told "text only".
+    text = (message.get("text") or message.get("caption") or "").strip()
 
     if not text:
-        _send_telegram_message(chat_id, _TG_NON_TEXT)   # sticker / photo / voice
+        _send_telegram_message(chat_id, _TG_NON_TEXT)   # sticker / voice / image w/o caption
         return {"ok": True}
     if text.startswith("/start"):
         _send_telegram_message(chat_id, _get_config("telegram.greeting"))
@@ -2308,7 +2358,7 @@ def telegram_webhook(
             pass   # non-critical — never let this block or delay the crisis response
         return {"ok": True}
 
-    _audit("telegram_request", chat_id=chat_id_str, question=text)
+    _audit("telegram_request", chat_id=chat_id_str, question=_redact_text(text))
 
     # ── 3. Rate limit (in-memory — runs before DB checkout) ───────────────────
     try:
@@ -2367,11 +2417,12 @@ def telegram_webhook(
                         _db_set_session_state(conn, session_id, None)
                         conn.commit()
                     if lead_id:
+                        # Confirm first (instant ack), then sync (P1).
+                        _send_telegram_message(chat_id, _format_lead_thanks(None),
+                                               reply_markup=_REMOVE_KEYBOARD)
                         _finalize_lead(lead_id, None, phone, intent_summary, chat_id_str)
                         _audit("lead_captured_regex_awaiting", chat_id=chat_id_str,
                                lead_id=lead_id)
-                        _send_telegram_message(chat_id, _format_lead_thanks(None),
-                                               reply_markup=_REMOVE_KEYBOARD)
                 except Exception as e:
                     logger.error(f"[leads] awaiting_contact capture: {e}", exc_info=True)
                     _send_telegram_message(chat_id, _TG_ERROR, reply_markup=_REMOVE_KEYBOARD)
@@ -2436,60 +2487,67 @@ def telegram_webhook(
                                             None, phone_in_text, intent_summary)
                     conn.commit()
                 if lead_id:
+                    # Confirm first (instant ack), then sync (P1).
+                    _send_telegram_message(chat_id, _format_lead_thanks(None))
                     _finalize_lead(lead_id, None, phone_in_text, intent_summary, chat_id_str)
                     _audit("lead_captured_regex", chat_id=chat_id_str, lead_id=lead_id)
-                    _send_telegram_message(chat_id, _format_lead_thanks(None))
                     return {"ok": True}
             except Exception as e:
                 logger.error(f"[leads] Regex capture failed: {e}", exc_info=True)
 
-        # ── PATH A2: returning lead shows booking intent again ────────────────
-        # already_lead suppresses the qualification funnel (trigger below is
-        # gated on `not already_lead`). Without an explicit branch, such a user
-        # drops into the generic RAG model, which has no booking script and
-        # rambles. Answer deterministically and skip the LLM entirely — this
-        # also avoids the slow embed + generate round-trip for a known contact.
-        if already_lead and bot_state is None and _has_booking_intent(text):
+        # ── BOOKING INTENT: deterministic funnel entry (no RAG) ───────────────
+        # A scheduling request is owned by the STATE MACHINE, not the LLM.
+        # Previously PATH B ran RAG and THEN appended the scripted question, so
+        # the persona-driven LLM produced its own closing ("the team will get
+        # back to you") that contradicted the follow-up question — the
+        # double-message bug. We now answer with a single deterministic message
+        # and skip the embed+LLM round-trip entirely:
+        #   • existing lead → short on-brand ack (we already have their details).
+        #   • new lead      → the qualification question; advance to
+        #                     awaiting_qualification so their NEXT reply opens the
+        #                     contact keyboard (handled by PATH A above).
+        if bot_state is None and _has_booking_intent(text):
+            if already_lead:
+                reply_text  = _TG_ALREADY_LEAD_BOOKING
+                new_state   = None
+                audit_event = "telegram_already_lead_booking"
+            else:
+                reply_text  = _TG_QUALIFICATION_QUESTION
+                new_state   = "awaiting_qualification"
+                audit_event = "telegram_qualification_triggered"
+
             with get_db_conn() as conn:
                 _db_save_message(conn, session_id, "user", text)
-                _db_save_message(conn, session_id, "assistant", _TG_ALREADY_LEAD_BOOKING)
+                _db_save_message(conn, session_id, "assistant", reply_text)
+                if new_state:
+                    _db_set_session_state(conn, session_id, new_state)
                 _db_touch_session(conn, session_id)
                 conn.commit()
-            _send_telegram_message(chat_id, _TG_ALREADY_LEAD_BOOKING)
-            _audit("telegram_already_lead_booking", chat_id=chat_id_str,
-                   session_id=session_id)
+
+            _send_telegram_message(chat_id, reply_text)
+            _audit(audit_event, chat_id=chat_id_str, session_id=session_id)
             return {"ok": True}
 
-        # ── PATH B / C: normal RAG + optional qualification trigger ───────────
-        # Embedding is the slowest step — only reached here (not for PATH A or
-        # awaiting_contact, which return early with scripted responses).
+        # ── PATH B / C: normal RAG (booking intent already handled above) ──────
+        # Embedding is the slowest step — only reached here (not for PATH A,
+        # awaiting_contact, or booking intent, which return early with scripted
+        # responses).
         query_vector = _embed_text(text)
         with get_db_conn() as conn:
             chunks = _retrieve_chunks(conn, query_vector, top_k=5)
 
         reply, sources = _rag_generate(text, chunks, history=history)
 
-        trigger_qualification = (
-            _has_booking_intent(text)
-            and not already_lead
-            and bot_state is None
-        )
-
         with get_db_conn() as conn:
             _db_save_message(conn, session_id, "user", text)
             _db_save_message(conn, session_id, "assistant", reply)
-            if trigger_qualification:
-                _db_set_session_state(conn, session_id, "awaiting_qualification")
             _db_touch_session(conn, session_id)
             conn.commit()
 
         _audit("telegram_success", chat_id=chat_id_str, session_id=session_id,
-               sources=sources, chunks=len(chunks),
-               qualification_triggered=trigger_qualification)
+               sources=sources, chunks=len(chunks))
 
         _send_telegram_message(chat_id, reply)
-        if trigger_qualification:
-            _send_telegram_message(chat_id, _TG_QUALIFICATION_QUESTION)
 
     except TimeoutError:
         logger.error("[telegram] LLM timeout")
@@ -2520,7 +2578,8 @@ def cron_crm_sync(
         bearer = (authorization or "")
         if bearer.startswith("Bearer "):
             bearer = bearer[len("Bearer "):].strip()
-        if bearer != settings.cron_secret and x_cron_secret != settings.cron_secret:
+        if not (_secret_eq(bearer, settings.cron_secret)
+                or _secret_eq(x_cron_secret, settings.cron_secret)):
             raise HTTPException(status_code=401, detail="Invalid cron secret.")
 
     if not _crm_enabled():
@@ -2606,7 +2665,12 @@ def raw_query(request: RawQueryRequest, http_request: Request):
 
     except psycopg2.Error as e:
         logger.error(f"[raw_query] PostgreSQL error: {e}")
-        return {"status": "error", "reply": f"SQL error: {e}",
+        # Authenticated SQL editor needs error feedback, but surface ONLY the
+        # primary Postgres message line (truncated) — never the full driver
+        # context, query echo, position, or internal hints.
+        pg_msg = (getattr(getattr(e, "diag", None), "message_primary", None)
+                  or "Query failed").strip()
+        return {"status": "error", "reply": f"SQL error: {pg_msg[:200]}",
                 "error_code": "db_error"}
 
     except Exception as e:

@@ -16,8 +16,7 @@ Test categories:
 """
 
 import json
-from contextlib import contextmanager
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -638,7 +637,11 @@ class TestTelegramWebhook:
             return "תשובה"
         monkeypatch.setattr(main, "_call_llm", _capture_llm)
 
-        r = client.post("/api/webhook/telegram", json=self._update(text="ומה המחיר?"))
+        # NOTE: must be a NON-booking-intent question, otherwise the message is
+        # handled deterministically by the funnel and never reaches RAG. ("מחיר"
+        # would trigger booking intent.)
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="ספר לי עוד על הגישה של ארז"))
 
         assert r.status_code == 200
         # The previous turns appear in the prompt context block.
@@ -685,34 +688,50 @@ class TestTelegramWebhook:
         monkeypatch.setattr(main, "_db_touch_session", lambda c, sid: None)
 
     def test_booking_intent_triggers_qualification_question(self, client, monkeypatch):
-        """Booking intent + no lead → RAG reply then qualification question (no keyboard yet)."""
+        """Booking intent + no lead → ONE deterministic qualification question,
+        no RAG, state advanced to awaiting_qualification (P0 double-message fix)."""
         messages_sent = []
+        states_set    = []
         monkeypatch.setattr(main, "_send_telegram_message",
                             lambda cid, text, reply_markup=None:
                                 messages_sent.append({"text": text, "markup": reply_markup}))
         self._base_rag_patches(monkeypatch, already_lead=False, bot_state=None)
+        # Spies: the LLM/embedding must NOT run, and state must advance.
+        embed = MagicMock()
+        llm   = MagicMock()
+        monkeypatch.setattr(main, "_embed_text", embed)
+        monkeypatch.setattr(main, "_call_llm", llm)
+        monkeypatch.setattr(main, "_db_set_session_state",
+                            lambda c, sid, s: states_set.append(s))
 
         r = client.post("/api/webhook/telegram",
                         json=self._update(text="אני מעוניין בפגישת ייעוץ"))
 
         assert r.status_code == 200
-        assert len(messages_sent) == 2                        # RAG reply + qualification question
-        assert messages_sent[1]["markup"] is None             # NO keyboard yet
-        assert "נשמח לשמוע" in messages_sent[1]["text"]      # qualification question text
+        assert len(messages_sent) == 1                        # ONE message — no contradiction
+        assert messages_sent[0]["markup"] is None             # no keyboard yet
+        assert "נשמח לשמוע" in messages_sent[0]["text"]      # the qualification question
+        assert "awaiting_qualification" in states_set         # funnel advanced
+        embed.assert_not_called()                             # RAG skipped entirely…
+        llm.assert_not_called()                               # …no double message possible
 
     def test_no_qualification_when_lead_already_exists(self, client, monkeypatch):
-        """Booking intent + existing lead → single RAG reply, no qualification question."""
+        """Booking intent + existing lead → ONE deterministic ack, no RAG, no funnel."""
         messages_sent = []
         monkeypatch.setattr(main, "_send_telegram_message",
                             lambda cid, text, reply_markup=None:
                                 messages_sent.append({"text": text}))
         self._base_rag_patches(monkeypatch, already_lead=True, bot_state=None)
+        llm = MagicMock()
+        monkeypatch.setattr(main, "_call_llm", llm)
 
         r = client.post("/api/webhook/telegram",
                         json=self._update(text="אני מעוניין בפגישת ייעוץ"))
 
         assert r.status_code == 200
-        assert len(messages_sent) == 1                        # RAG reply only
+        assert len(messages_sent) == 1                        # single deterministic message
+        assert messages_sent[0]["text"] == main._TG_ALREADY_LEAD_BOOKING
+        llm.assert_not_called()                               # no RAG for a known lead
 
     def test_qualification_answer_sends_contact_keyboard(self, client, monkeypatch):
         """When state='awaiting_qualification' any user reply triggers the contact keyboard
@@ -1293,3 +1312,123 @@ class TestCronCrmSync:
         body = r.json()
         assert body["status"] == "ok" and body["synced"] == 1
         assert synced == [("lead1", "cX")]
+
+
+# ─── 14. Sprint 1C — hardening (QA & security) ────────────────────────────────
+
+class TestRedactText:
+    """PII guard: user message bodies must never appear in logs/audit."""
+    def test_no_raw_content_leaked(self):
+        secret = "אני עוברת גירושין קשים"
+        out = main._redact_text(secret)
+        assert secret not in out
+        assert "len=" in out and "h=" in out
+
+    def test_stable_and_distinct(self):
+        assert main._redact_text("hello") == main._redact_text("hello")
+        assert main._redact_text("a") != main._redact_text("b")
+
+    def test_handles_none(self):
+        assert "len=0" in main._redact_text(None)
+
+
+class TestSecretEq:
+    """Constant-time secret comparison."""
+    def test_match(self):          assert main._secret_eq("abc", "abc") is True
+    def test_mismatch(self):       assert main._secret_eq("abc", "abd") is False
+    def test_none_provided(self):  assert main._secret_eq(None, "abc") is False
+    def test_empty_expected(self): assert main._secret_eq("abc", "") is False   # unset config never matches
+
+
+class TestReadOnlyGuard:
+    """execute_query must run untrusted SQL inside a read-only savepoint."""
+    def test_wraps_in_readonly_savepoint(self):
+        mock_conn, mock_cursor = _make_mock_conn(fetchall_return=[(1,)],
+                                                 description=[("c",)])
+        rows, cols = main.execute_query(mock_conn, "SELECT 1")
+        executed = " ".join(str(c.args[0]).lower()
+                            for c in mock_cursor.execute.call_args_list)
+        assert "savepoint _ro_guard" in executed
+        assert "transaction_read_only = on" in executed
+        assert "rollback to savepoint _ro_guard" in executed
+        assert "release savepoint _ro_guard" in executed
+        assert rows == [(1,)]
+
+
+class TestConfirmBeforeFinalize:
+    """P1: the user's confirmation is sent BEFORE the slow owner-alert/CRM sync."""
+    def test_contact_share_confirms_first(self, client, monkeypatch):
+        order = []
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, reply_markup=None: order.append("ack"))
+        monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: [])
+        monkeypatch.setattr(main, "_db_save_lead", lambda *a, **k: "lead-1")
+        monkeypatch.setattr(main, "_finalize_lead",
+                            lambda *a, **k: order.append("finalize"))
+
+        contact_update = {"update_id": 5,
+                          "message": {"chat": {"id": 999},
+                                      "contact": {"phone_number": "+972501112222",
+                                                  "first_name": "דנה"}}}
+        r = client.post("/api/webhook/telegram", json=contact_update)
+        assert r.status_code == 200
+        assert order == ["ack", "finalize"]   # confirmation first, sync after
+
+
+class TestErrorExposure:
+    """P2: internal error detail must not leak to clients."""
+    def test_db_test_hides_exception_detail(self, client, monkeypatch):
+        def boom(*a, **k):
+            raise RuntimeError("password=supersecret host=db.internal")
+        monkeypatch.setattr(main, "get_db_conn", boom)
+        r = client.get("/db-test")
+        body = r.json()
+        assert body["status"] == "error"
+        assert "detail" not in body
+        assert "supersecret" not in json.dumps(body)
+
+    def test_raw_query_returns_only_primary_pg_message(self, client, monkeypatch):
+        import psycopg2
+        monkeypatch.setattr(main.settings, "nexus_api_key", "")   # auth disabled (dev)
+
+        class _Diag:
+            message_primary = 'relation "nope" does not exist'
+
+        class _PgErr(psycopg2.Error):
+            diag = _Diag()
+
+        def boom_exec(conn, sql):
+            raise _PgErr("FULL DRIVER CONTEXT: LINE 1 ... internal hint ...")
+        monkeypatch.setattr(main, "execute_query", boom_exec)
+
+        r = client.post("/api/raw_query", json={"sql": "SELECT * FROM nope"})
+        body = r.json()
+        assert body["error_code"] == "db_error"
+        assert "does not exist" in body["reply"]      # useful primary line kept
+        assert "internal hint" not in body["reply"]   # full driver context NOT leaked
+
+
+class TestCaptionFallback:
+    """P3: a photo/document with a caption is understood, not rejected as non-text."""
+    def test_photo_caption_used_as_question(self, client, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(main, "_send_telegram_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_get_session_state", lambda c, sid: None)
+        monkeypatch.setattr(main, "_db_has_lead", lambda c, cid: False)
+        monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: [])
+        monkeypatch.setattr(main, "_db_save_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_db_touch_session", lambda c, sid: None)
+        monkeypatch.setattr(main, "_embed_text", lambda t: [0.1] * 768)
+        monkeypatch.setattr(main, "_retrieve_chunks", lambda c, v, top_k=5: [])
+        monkeypatch.setattr(main, "_rag_generate",
+                            lambda q, chunks, history=None: (seen.update({"q": q}) or ("ok", [])))
+
+        photo_update = {"update_id": 7,
+                        "message": {"chat": {"id": 321, "type": "private"},
+                                    "photo": [{"file_id": "x"}],
+                                    "caption": "ספר לי על הגישה של ארז"}}
+        r = client.post("/api/webhook/telegram", json=photo_update)
+        assert r.status_code == 200
+        assert seen.get("q") == "ספר לי על הגישה של ארז"   # caption became the question
