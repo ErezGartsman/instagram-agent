@@ -42,6 +42,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # ── 3b. Lint (ruff) ───────────────────────────────────────────────────────
+      # Installed only in CI (not in requirements.txt) to keep the serverless
+      # bundle lean. Config in beckend/ruff.toml. Catches unused imports / dead
+      # code / undefined names before they accumulate as debt.
+      - name: Lint with ruff
+        run: |
+          pip install ruff
+          ruff check .
+
       # ── 4. Run test suite ─────────────────────────────────────────────────────
       # Real DB and Gemini calls are mocked — no secrets needed for tests.
       # GEMINI_API_KEY and SUPABASE_DB_URL are fake values that satisfy

@@ -1,0 +1,18 @@
+# Ruff config for the Nexus backend.
+# Scope is intentionally conservative — this is a debt-prevention guardrail, not
+# a style crusade. We enforce the high-signal correctness rules (pyflakes) that
+# catch unused imports, redefined names, and undefined references, plus syntax
+# errors. Expand the rule set deliberately as the codebase matures.
+
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = [
+    "F",    # pyflakes — unused imports/vars, undefined names, f-string issues
+    "E9",   # syntax / runtime errors
+]
+
+[lint.per-file-ignores]
+# Tests intentionally bind unused values for readability in some assertions.
+"tests/*" = ["F841"]
