@@ -440,10 +440,21 @@ def _db_touch_session(conn, session_id: str) -> None:
 # Guard against clearly harmful or off-topic input before it reaches the LLM.
 # Deliberately narrow — SQL keywords are handled downstream by validate_sql().
 
+# Harm-only blocklist. This product is an emotional / relationships & dating
+# coaching assistant, so its users legitimately use profanity, intimacy
+# vocabulary, and raw negative language while venting ("he treats me like shit",
+# "our sex life died", "he sent nudes to someone else"). Blocking those would
+# reject genuine stories — the exact systemic failure this guard must avoid.
+# We therefore block ONLY content the assistant must never engage with at all,
+# regardless of empathy: hate slurs, CSAM, incitement to violence against
+# others, terror/weapons, and cyber-harm. Acute self-harm / suicidality is NOT
+# moderated here — it is handled compassionately and FIRST by is_crisis().
 _BLOCKED_TERMS = re.compile(
-    r"\b(porn|sex(?:ual)?|nude|naked|xxx|fuck|shit|cunt|nigger|faggot"
-    r"|kill\s+(?:me|yourself|him|her|them)|bomb(?:ing)?"
-    r"|terrorist|suicide|self[_\-]harm|malware|ransomware)\b",
+    r"\b(nigger|faggot|kike|"                     # hate slurs
+    r"child\s*por\w*|"                            # CSAM
+    r"kill\s+(?:yourself|him|her|them)|"          # incitement to violence against others
+    r"bomb(?:ing)?|terrorist|"                    # terror / weapons
+    r"malware|ransomware)\b",                     # cyber-harm
     re.IGNORECASE,
 )
 
@@ -1694,9 +1705,24 @@ _ESCAPE_INTENT = re.compile(
     re.IGNORECASE,
 )
 
+# A genuine opt-out is SHORT ("לא", "לא עכשיו", "stop", "never mind"). A long
+# message that merely contains a negative word ("הוא לא נתן לי סיבה ואני לא
+# אסמוך שוב…") is a real answer, not a cancellation. Capping the word count is
+# what stops emotional venting from being misread as a refusal anywhere the
+# escape gate is consulted.
+_ESCAPE_MAX_WORDS = 4
+
 def _is_escape_intent(text: str) -> bool:
-    """True when the message is a clear opt-out from the current funnel step."""
-    return bool(_ESCAPE_INTENT.search(text or ""))
+    """
+    True only when the message is a SHORT, clear opt-out from the current funnel
+    step. Substantive messages (more than _ESCAPE_MAX_WORDS words) are treated as
+    content, never as an opt-out — so a long emotional story can never trip the
+    cancellation path even if it contains words like "לא"/"stop".
+    """
+    t = (text or "").strip()
+    if not t or len(t.split()) > _ESCAPE_MAX_WORDS:
+        return False
+    return bool(_ESCAPE_INTENT.search(t))
 
 
 def _make_contact_state(retry: int = 0) -> str:
@@ -2254,6 +2280,22 @@ def _send_contact_keyboard(chat_id, preamble: str) -> None:
     )
 
 
+def _tg_clear_state(chat_id_str: str) -> None:
+    """
+    Best-effort: clear any funnel bot_state for this chat. Used by the explicit
+    exit commands (/start, /cancel) and the crisis handler. Never raises — a DB
+    hiccup must not block the user-facing reply that accompanies the reset.
+    """
+    try:
+        with get_db_conn() as conn:
+            sid = _db_get_or_create_telegram_session(conn, chat_id_str)
+            if _db_get_session_state(conn, sid):   # only write when there's state to clear
+                _db_set_session_state(conn, sid, None)
+                conn.commit()
+    except Exception:
+        pass
+
+
 @app.post("/api/webhook/telegram")
 def telegram_webhook(
     update: dict = Body(default={}),
@@ -2336,8 +2378,18 @@ def telegram_webhook(
     if not text:
         _send_telegram_message(chat_id, _TG_NON_TEXT)   # sticker / voice / image w/o caption
         return {"ok": True}
+    # ── Explicit commands are the ONLY way to exit a funnel state ─────────────
+    # In a funnel (e.g. awaiting_qualification) free text is always treated as
+    # the user's answer — never as a cancellation — so the deliberate /start and
+    # /cancel commands are the sole, unambiguous escape hatch. Both reset state.
     if text.startswith("/start"):
+        _tg_clear_state(chat_id_str)
         _send_telegram_message(chat_id, _get_config("telegram.greeting"))
+        return {"ok": True}
+    if text.startswith("/cancel"):
+        _tg_clear_state(chat_id_str)
+        _send_telegram_message(chat_id, _TG_ESCAPE_RESPONSE)
+        _audit("telegram_cancel_command", chat_id=chat_id_str)
         return {"ok": True}
 
     # ── Crisis check — always first among text handlers ───────────────────────
@@ -2348,14 +2400,7 @@ def telegram_webhook(
     if is_crisis(text):
         _audit("telegram_crisis", chat_id=chat_id_str)
         _send_telegram_message(chat_id, _get_config("crisis.message"))
-        try:
-            with get_db_conn() as conn:
-                sid = _db_get_or_create_telegram_session(conn, chat_id_str)
-                if _db_get_session_state(conn, sid):   # only write if there's state to clear
-                    _db_set_session_state(conn, sid, None)
-                    conn.commit()
-        except Exception:
-            pass   # non-critical — never let this block or delay the crisis response
+        _tg_clear_state(chat_id_str)   # best-effort; never blocks the crisis reply
         return {"ok": True}
 
     _audit("telegram_request", chat_id=chat_id_str, question=_redact_text(text))
@@ -2377,12 +2422,39 @@ def telegram_webhook(
             history      = _db_load_history(conn, session_id, limit=12)
             conn.commit()
 
-        # ── Escape-intent gate ────────────────────────────────────────────────────
-        # Runs BEFORE validate_question and all state checks.
-        # If a user in any funnel state sends an opt-out signal ("לא", "בטל",
-        # "cancel"…) we clear state gracefully and let them ask freely.
-        # Short signals like "לא" (2 chars) would fail the length guard if we
-        # checked escape intent after validate_question — so we check here.
+        # ── STATE: awaiting_qualification — capture the story (empathy-first) ──
+        # CRITICAL UX INVARIANT: the user was just asked to share what they want
+        # to talk about. ANY free text is their answer — however long, emotional,
+        # or full of negative words ("הוא לא נתן לי סיבה", "I'll never trust").
+        # This is intentionally handled BEFORE the escape gate and the moderation
+        # guard so a genuine, raw story can never be misread as a cancellation or
+        # rejected as "inappropriate". The ONLY way out of this state is the
+        # explicit /start or /cancel command (handled above).
+        if bot_state == "awaiting_qualification":
+            if not already_lead:
+                with get_db_conn() as conn:
+                    _db_save_message(conn, session_id, "user", text)
+                    _db_set_session_state(conn, session_id, _make_contact_state(0))
+                    _db_touch_session(conn, session_id)
+                    conn.commit()
+                _send_contact_keyboard(chat_id, _TG_QUALIFICATION_ACK)
+                _audit("telegram_qualification_answered", chat_id=chat_id_str,
+                       session_id=session_id)
+                return {"ok": True}
+            # Already a lead — nothing to capture; clear stale state and continue
+            # to normal conversation below.
+            with get_db_conn() as conn:
+                _db_set_session_state(conn, session_id, None)
+                conn.commit()
+            bot_state = None
+
+        # ── Escape-intent gate (short opt-outs only; awaiting_contact etc.) ────
+        # A SHORT opt-out ("לא", "בטל", "stop") while still in a funnel state
+        # clears it gracefully. awaiting_qualification is already handled above,
+        # so this primarily serves awaiting_contact. The word-count guard inside
+        # _is_escape_intent guarantees a long emotional message is never treated
+        # as an opt-out here either. Checked before validate_question so a 2-char
+        # "לא" isn't rejected by the length guard first.
         if bot_state and _is_escape_intent(text):
             with get_db_conn() as conn:
                 _db_set_session_state(conn, session_id, None)
@@ -2446,7 +2518,11 @@ def telegram_webhook(
                 return {"ok": True}
 
         # ── 5. Content guards (only reached when not in a state machine branch) ─
-        if len(text) > 500:
+        # Generous cap: this audience sends long, heartfelt messages. The funnel
+        # states (handled above) have NO length limit at all; this only bounds
+        # free-form RAG chat to keep the LLM token cost sane while still letting a
+        # full emotional paragraph through (Telegram's own hard limit is 4096).
+        if len(text) > 1500:
             _send_telegram_message(chat_id, _TG_TOO_LONG)
             return {"ok": True}
         try:
@@ -2456,26 +2532,8 @@ def telegram_webhook(
             _send_telegram_message(chat_id, _TG_MODERATION)
             return {"ok": True}
 
-        # ── PATH A: qualification answer ──────────────────────────────────────
-        # User replied to "what would you like to talk about?".
-        # Skip the LLM: acknowledge warmly, show the contact keyboard, advance
-        # state to awaiting_contact:0 (retry counter starts at zero).
-        if bot_state == "awaiting_qualification":
-            if not already_lead:
-                with get_db_conn() as conn:
-                    _db_save_message(conn, session_id, "user", text)
-                    _db_set_session_state(conn, session_id, _make_contact_state(0))
-                    _db_touch_session(conn, session_id)
-                    conn.commit()
-                _send_contact_keyboard(chat_id, _TG_QUALIFICATION_ACK)
-                _audit("telegram_qualification_answered", chat_id=chat_id_str,
-                       session_id=session_id)
-            else:
-                with get_db_conn() as conn:
-                    _db_set_session_state(conn, session_id, None)
-                    conn.commit()
-            if not already_lead:
-                return {"ok": True}
+        # (awaiting_qualification is handled earlier — before the escape gate and
+        # moderation — so a raw emotional story is captured, never rejected.)
 
         # ── Regex phone fallback for normal conversation ───────────────────────
         phone_in_text = _extract_phone_from_text(text)

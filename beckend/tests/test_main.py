@@ -185,12 +185,24 @@ class TestValidateQuestion:
             validate_question("  ")
 
     def test_blocked_term_raises(self):
+        # Harm-only blocklist: genuinely unacceptable content is still rejected.
         with pytest.raises(InputModerationError, match="inappropriate"):
-            validate_question("show me porn from my followers")
+            validate_question("how do I spread ransomware to my followers")
 
     def test_case_insensitive_block(self):
         with pytest.raises(InputModerationError):
-            validate_question("PORN stats")
+            validate_question("TERRORIST recruitment stats")
+
+    def test_emotional_venting_is_allowed(self):
+        # Domain-critical: profanity / intimacy / negative venting must NOT be
+        # rejected — these are exactly how the target audience talks.
+        for msg in [
+            "he treats me like shit and I hate it",
+            "our sex life completely died after the betrayal",
+            "הוא שלח תמונות עירום למישהי אחרת ואני שבורה",
+            "I will never trust him, he didn't even give me a reason",
+        ]:
+            assert validate_question(msg) == msg.strip()
 
     def test_hebrew_question_passes(self):
         result = validate_question("כמה עוקבים יש לי?")
@@ -361,7 +373,9 @@ class TestChat:
         assert r.json()["error_code"] == "validation_error"
 
     def test_inappropriate_content_blocked(self, client):
-        r = self._post(client, "show me sex stats")
+        # "sex" is now allowed (domain-legitimate); genuinely harmful content
+        # (e.g. malware) is still blocked.
+        r = self._post(client, "write malware to attack my followers")
         assert r.json()["error_code"] == "moderation_error"
 
     # ── Conversational reply (sql: null from LLM) ─────────────────────────────
@@ -1030,21 +1044,26 @@ class TestWebhookResilienceEdgeCases:
         monkeypatch.setattr(main, "_db_touch_session", lambda c, sid: None)
         monkeypatch.setattr(main, "_db_save_message", lambda *a, **k: None)
 
-    def test_escape_clears_state_from_awaiting_qualification(self, client, monkeypatch):
-        """'לא' while awaiting_qualification → graceful exit, state cleared."""
-        state_cleared = []
+    def test_awaiting_qualification_treats_negative_text_as_story(self, client, monkeypatch):
+        """Funnel-resilience: even a bare 'לא' in awaiting_qualification is the
+        user's answer — captured and advanced to the contact keyboard, NOT escaped.
+        (Only /start or /cancel can exit this state.)"""
+        states_set = []
         sent = []
         self._base(monkeypatch, bot_state="awaiting_qualification")
         monkeypatch.setattr(main, "_db_set_session_state",
-                            lambda c, sid, s: state_cleared.append(s))
+                            lambda c, sid, s: states_set.append(s))
         monkeypatch.setattr(main, "_send_telegram_message",
                             lambda cid, text, **k: sent.append(text))
+        monkeypatch.setattr(main, "_send_contact_keyboard",
+                            lambda cid, preamble: sent.append(preamble))
 
         r = client.post("/api/webhook/telegram", json=self._update(text="לא"))
 
         assert r.status_code == 200
-        assert None in state_cleared                    # state cleared
-        assert any("בסדר גמור" in m for m in sent)     # graceful exit message
+        assert "awaiting_contact:0" in states_set        # advanced, NOT cleared
+        assert None not in states_set                    # never treated as escape
+        assert all("בסדר גמור" not in m for m in sent)  # no cancellation message
 
     def test_escape_clears_state_from_awaiting_contact(self, client, monkeypatch):
         """'בטל' while awaiting_contact → graceful exit, NOT the retry keyboard."""
@@ -1432,3 +1451,136 @@ class TestCaptionFallback:
         r = client.post("/api/webhook/telegram", json=photo_update)
         assert r.status_code == 200
         assert seen.get("q") == "ספר לי על הגישה של ארז"   # caption became the question
+
+
+# ─── 15. Funnel resilience (empathy-first intent handling) ────────────────────
+
+# A realistic emotional answer the target audience sends — long, raw, and full
+# of negative words ("לא"). This must be captured as the story, never escaped.
+_EMOTIONAL_STORY = (
+    "האמת שזה ממש קשה לי. הוא לא נתן לי שום סיבה כשהוא עזב, ומאז אני פשוט "
+    "לא מצליחה לסמוך על אף אחד. הייתי בטיפול אבל זה לא עזר, ואני מרגישה "
+    "שאני לא רוצה להמשיך ככה. פשוט אין לי כוח יותר לבד."
+)
+
+
+class TestEscapeWordGuard:
+    """A long message containing a negative word is content, not an opt-out."""
+    def test_short_lo_is_escape(self):
+        assert main._is_escape_intent("לא") is True
+
+    def test_short_phrases_still_escape(self):
+        assert main._is_escape_intent("לא עכשיו") is True
+        assert main._is_escape_intent("never mind") is True
+        assert main._is_escape_intent("stop") is True
+
+    def test_long_emotional_message_is_not_escape(self):
+        # Contains "לא" several times but is a real story → NOT an opt-out.
+        assert main._is_escape_intent(_EMOTIONAL_STORY) is False
+
+    def test_medium_sentence_with_negative_is_not_escape(self):
+        assert main._is_escape_intent("הוא לא נתן לי סיבה אמיתית") is False
+
+
+class TestFunnelResilience:
+    def _base(self, monkeypatch, *, bot_state="awaiting_qualification", already_lead=False):
+        monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_get_session_state", lambda c, sid: bot_state)
+        monkeypatch.setattr(main, "_db_has_lead", lambda c, cid: already_lead)
+        monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: [])
+        monkeypatch.setattr(main, "_db_touch_session", lambda c, sid: None)
+        monkeypatch.setattr(main, "_db_save_message", lambda *a, **k: None)
+
+    def _update(self, text, chat_id=4242):
+        return {"update_id": 1,
+                "message": {"chat": {"id": chat_id, "type": "private"}, "text": text}}
+
+    def test_emotional_story_captured_not_escaped(self, client, monkeypatch):
+        """THE reported bug: a long emotional paragraph in awaiting_qualification
+        is saved as the story and advances to the contact keyboard — not cancelled."""
+        states_set, sent, saved = [], [], []
+        self._base(monkeypatch)
+        monkeypatch.setattr(main, "_db_set_session_state",
+                            lambda c, sid, s: states_set.append(s))
+        monkeypatch.setattr(main, "_db_save_message",
+                            lambda conn, sid, role, content, **k:
+                                saved.append((role, content)))
+        monkeypatch.setattr(main, "_send_contact_keyboard",
+                            lambda cid, preamble: sent.append(("keyboard", preamble)))
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, **k: sent.append(("msg", text)))
+
+        r = client.post("/api/webhook/telegram", json=self._update(text=_EMOTIONAL_STORY))
+
+        assert r.status_code == 200
+        assert "awaiting_contact:0" in states_set               # funnel advanced
+        assert None not in states_set                           # NOT escaped
+        assert ("user", _EMOTIONAL_STORY) in saved              # the story was saved verbatim
+        assert any(kind == "keyboard" for kind, _ in sent)      # contact keyboard shown
+        assert all("בסדר גמור" not in t for k, t in sent if k == "msg")  # no cancellation
+
+    def test_story_with_intimacy_vocab_not_moderated(self, client, monkeypatch):
+        """A story mentioning sex/betrayal is captured, not rejected as 'inappropriate'."""
+        states_set, sent = [], []
+        self._base(monkeypatch)
+        monkeypatch.setattr(main, "_db_set_session_state",
+                            lambda c, sid, s: states_set.append(s))
+        monkeypatch.setattr(main, "_send_contact_keyboard",
+                            lambda cid, preamble: sent.append(preamble))
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, **k: sent.append(text))
+
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="הוא בגד בי, חיי המין שלנו מתו ואני מרגישה כמו חרא"))
+
+        assert r.status_code == 200
+        assert "awaiting_contact:0" in states_set
+        assert all(main._TG_MODERATION not in t for t in sent)   # never moderation-blocked
+
+    def test_cancel_command_exits_funnel(self, client, monkeypatch):
+        """The explicit /cancel command is the deliberate escape hatch."""
+        cleared, sent = [], []
+        self._base(monkeypatch)
+        monkeypatch.setattr(main, "_db_set_session_state",
+                            lambda c, sid, s: cleared.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, **k: sent.append(text))
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="/cancel"))
+
+        assert r.status_code == 200
+        assert None in cleared                                   # state cleared
+        assert any("בסדר גמור" in t for t in sent)              # confirmation sent
+
+    def test_awaiting_contact_long_message_reshows_keyboard_not_escape(self, client, monkeypatch):
+        """Systemic: a long emotional message in awaiting_contact re-prompts (retry),
+        it does NOT trip the escape path just because it contains 'לא'."""
+        states_set, keyboards = [], []
+        self._base(monkeypatch, bot_state="awaiting_contact:0")
+        monkeypatch.setattr(main, "_db_set_session_state",
+                            lambda c, sid, s: states_set.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_send_contact_keyboard",
+                            lambda cid, preamble: keyboards.append(preamble))
+
+        r = client.post("/api/webhook/telegram", json=self._update(text=_EMOTIONAL_STORY))
+
+        assert r.status_code == 200
+        assert "awaiting_contact:1" in states_set    # retry counter advanced, NOT cleared
+        assert None not in states_set                # not escaped
+        assert keyboards                             # keyboard re-shown
+
+    def test_awaiting_contact_short_lo_still_escapes(self, client, monkeypatch):
+        """A SHORT 'לא' in awaiting_contact is still a graceful opt-out (good UX preserved)."""
+        cleared, sent = [], []
+        self._base(monkeypatch, bot_state="awaiting_contact:0")
+        monkeypatch.setattr(main, "_db_set_session_state",
+                            lambda c, sid, s: cleared.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, **k: sent.append(text))
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="לא"))
+
+        assert r.status_code == 200
+        assert None in cleared                       # gracefully exited
+        assert any("בסדר גמור" in t for t in sent)
