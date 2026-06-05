@@ -1441,8 +1441,9 @@ class TestCaptionFallback:
         monkeypatch.setattr(main, "_db_touch_session", lambda c, sid: None)
         monkeypatch.setattr(main, "_embed_text", lambda t: [0.1] * 768)
         monkeypatch.setattr(main, "_retrieve_chunks", lambda c, v, top_k=5: [])
-        monkeypatch.setattr(main, "_rag_generate",
-                            lambda q, chunks, history=None: (seen.update({"q": q}) or ("ok", [])))
+        monkeypatch.setattr(main, "_bot_triage_reply",
+                            lambda q, chunks, history=None:
+                                (seen.update({"q": q}) or ("ok", "ANSWER", [])))
 
         photo_update = {"update_id": 7,
                         "message": {"chat": {"id": 321, "type": "private"},
@@ -1451,6 +1452,239 @@ class TestCaptionFallback:
         r = client.post("/api/webhook/telegram", json=photo_update)
         assert r.status_code == 200
         assert seen.get("q") == "ספר לי על הגישה של ארז"   # caption became the question
+
+
+# ─── 16. Sprint 1D — triage engine ("LLM proposes, state machine disposes") ───
+
+class TestTruncateReply:
+    def test_short_unchanged(self):
+        assert main._truncate_reply("שלום, אני כאן") == "שלום, אני כאן"
+
+    def test_long_truncated(self):
+        out = main._truncate_reply("מילה " * 300)            # ~1500 chars
+        assert len(out) <= main._BOT_REPLY_MAX_CHARS + 5
+        assert out.endswith("…")
+
+    def test_none(self):
+        assert main._truncate_reply(None) == ""
+
+
+class TestAffirmationFastPath:
+    def test_obvious_affirmations(self):
+        for m in ["אשמח", "כן", "בטח", "נשמע טוב", "yes", "sure", "אשמח מאוד"]:
+            assert main._is_affirmation(m) is True, m
+
+    def test_lo_is_not_affirmation(self):
+        assert main._is_affirmation("לא") is False
+
+    def test_long_message_not_fastpath(self):
+        # Ambiguous long message → must defer to the LLM, not the keyword path.
+        assert main._is_affirmation("אני חושבת שאולי כן אבל אני ממש לא בטוחה בקשר לזה") is False
+
+
+class TestBotTriageReply:
+    def test_offer_intent_parsed(self, monkeypatch):
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: '{"reply":"אני שומע כמה זה כואב.","intent":"OFFER_MEETING"}')
+        reply, intent, _ = main._bot_triage_reply("הוא עזב אותי", [], history=[])
+        assert intent == "OFFER_MEETING"
+        assert "כואב" in reply
+        assert main._TG_MEETING_CTA not in reply        # the LLM must NOT write the CTA
+
+    def test_answer_intent_parsed(self, monkeypatch):
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: '{"reply":"הליווי הוא אישי.","intent":"ANSWER"}')
+        _, intent, _ = main._bot_triage_reply("מה השירות?",
+                                              [{"content": "x", "source": "a.txt"}], history=[])
+        assert intent == "ANSWER"
+
+    def test_bad_json_degrades_to_answer(self, monkeypatch):
+        monkeypatch.setattr(main, "_call_llm", lambda p: "totally not json")
+        reply, intent, _ = main._bot_triage_reply("שלום", [], history=[])
+        assert intent == "ANSWER"            # fail-safe: never fabricates an OFFER
+        assert reply                         # raw text still delivered
+
+    def test_invalid_intent_value_coerced_to_answer(self, monkeypatch):
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: '{"reply":"ok","intent":"BOOK_NOW"}')
+        _, intent, _ = main._bot_triage_reply("hi", [], history=[])
+        assert intent == "ANSWER"
+
+    def test_empty_reply_uses_fallback(self, monkeypatch):
+        monkeypatch.setattr(main, "_call_llm", lambda p: '{"reply":"","intent":"ANSWER"}')
+        reply, _, _ = main._bot_triage_reply("hi", [], history=[])
+        assert reply == main._BOT_FALLBACK_REPLY
+
+
+class TestClassifyOfferResponse:
+    def test_fastpath_affirm_skips_llm(self, monkeypatch):
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: pytest.fail("LLM must not run for an obvious affirm"))
+        assert main._bot_classify_offer_response("אשמח!", history=[]) == ("AFFIRM", "")
+
+    def test_fastpath_decline_skips_llm(self, monkeypatch):
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: pytest.fail("LLM must not run for an obvious decline"))
+        assert main._bot_classify_offer_response("לא", history=[])[0] == "DECLINE"
+
+    def test_llm_classifies_ambiguous_as_other(self, monkeypatch):
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: '{"decision":"OTHER","reply":"שאלה טובה."}')
+        decision, reply = main._bot_classify_offer_response(
+            "כמה זמן נמשכת השיחה ומה הפורמט שלה בדיוק?", history=[])
+        assert decision == "OTHER" and "שאלה" in reply
+
+    def test_llm_bad_json_degrades_to_other(self, monkeypatch):
+        monkeypatch.setattr(main, "_call_llm", lambda p: "garbage")
+        decision, _ = main._bot_classify_offer_response(
+            "אני באמת צריכה לחשוב על זה רגע אחד בבקשה", history=[])
+        assert decision == "OTHER"           # fail-safe: never a false capture/close
+
+
+class TestTriageFunnel:
+    """End-to-end webhook behavior of the triage + offered_meeting state machine."""
+    def _base(self, monkeypatch, *, bot_state=None, already_lead=False):
+        monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_get_session_state", lambda c, sid: bot_state)
+        monkeypatch.setattr(main, "_db_has_lead", lambda c, cid: already_lead)
+        monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: [])
+        monkeypatch.setattr(main, "_db_touch_session", lambda c, sid: None)
+        monkeypatch.setattr(main, "_db_save_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_embed_text", lambda t: [0.1] * 768)
+        monkeypatch.setattr(main, "_retrieve_chunks", lambda c, v, top_k=5: [])
+
+    def _update(self, text, chat_id=909):
+        return {"update_id": 1,
+                "message": {"chat": {"id": chat_id, "type": "private"}, "text": text}}
+
+    def test_emotional_message_offers_meeting(self, client, monkeypatch):
+        states, sent = [], []
+        self._base(monkeypatch)
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: states.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message", lambda cid, t, **k: sent.append(t))
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: '{"reply":"אני שומע כמה זה כואב, ואת/ה לא לבד בזה.","intent":"OFFER_MEETING"}')
+
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="בעלי בגד בי ואני מרגישה שבורה לגמרי"))
+        assert r.status_code == 200
+        assert "offered_meeting:0" in states           # funnel armed by CODE
+        assert len(sent) == 1                           # single message
+        assert "כואב" in sent[0]                         # brief validation
+        assert main._TG_MEETING_CTA in sent[0]          # CTA appended by code
+
+    def test_info_question_answers_without_offer(self, client, monkeypatch):
+        states, sent = [], []
+        self._base(monkeypatch)
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: states.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message", lambda cid, t, **k: sent.append(t))
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: '{"reply":"הליווי הוא אישי ומותאם.","intent":"ANSWER"}')
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="מה השירותים שאתם מציעים?"))
+        assert r.status_code == 200
+        assert states == []                             # no funnel state
+        assert main._TG_MEETING_CTA not in sent[0]      # no CTA
+
+    def test_llm_cannot_close_funnel_via_prose(self, client, monkeypatch):
+        """Architectural guarantee: even if the LLM's TEXT claims it'll arrange
+        contact, NO keyboard/state happens unless the structured intent + code do."""
+        states, keyboards, sent = [], [], []
+        self._base(monkeypatch)
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: states.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message", lambda cid, t, **k: sent.append(t))
+        monkeypatch.setattr(main, "_send_contact_keyboard",
+                            lambda cid, preamble: keyboards.append(preamble))
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: '{"reply":"מעולה, הצוות שלי ייצור איתך קשר בקרוב!","intent":"ANSWER"}')
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="טוב, אז מה עכשיו?"))
+        assert r.status_code == 200
+        assert keyboards == []                           # no keyboard from hallucinated prose
+        assert states == []                              # no state change
+
+    def test_offered_meeting_affirm_opens_keyboard(self, client, monkeypatch):
+        """THE reported bug: agreement after an offer reliably enters the funnel."""
+        states, keyboards = [], []
+        self._base(monkeypatch, bot_state="offered_meeting:0")
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: states.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_send_contact_keyboard",
+                            lambda cid, preamble: keyboards.append(preamble))
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: pytest.fail("obvious affirm should not need the LLM"))
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="אשמח, נשמע מצוין"))
+        assert r.status_code == 200
+        assert "awaiting_contact:0" in states            # funnel entered
+        assert keyboards                                  # contact keyboard shown
+
+    def test_offered_meeting_natural_agreement_via_llm(self, client, monkeypatch):
+        states, keyboards = [], []
+        self._base(monkeypatch, bot_state="offered_meeting:0")
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: states.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_send_contact_keyboard",
+                            lambda cid, preamble: keyboards.append(preamble))
+        monkeypatch.setattr(main, "_call_llm", lambda p: '{"decision":"AFFIRM","reply":""}')
+
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="אני חושבת שזה בדיוק מה שאני צריכה עכשיו"))
+        assert r.status_code == 200
+        assert "awaiting_contact:0" in states
+        assert keyboards
+
+    def test_offered_meeting_decline(self, client, monkeypatch):
+        cleared, sent = [], []
+        self._base(monkeypatch, bot_state="offered_meeting:0")
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: cleared.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message", lambda cid, t, **k: sent.append(t))
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="לא"))
+        assert r.status_code == 200
+        assert None in cleared
+        assert any(main._TG_OFFER_DECLINED in t for t in sent)
+
+    def test_offered_meeting_other_reoffers(self, client, monkeypatch):
+        states, sent = [], []
+        self._base(monkeypatch, bot_state="offered_meeting:0")
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: states.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message", lambda cid, t, **k: sent.append(t))
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: '{"decision":"OTHER","reply":"שאלה טובה, ארז ירחיב בשיחה."}')
+
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="כמה זמן נמשכת כל שיחה ומה העלות הכוללת?"))
+        assert r.status_code == 200
+        assert "offered_meeting:1" in states             # counter advanced, still in funnel
+        assert main._TG_MEETING_CTA in sent[-1]          # gently re-offered
+
+    def test_offered_meeting_reoffer_cap_backs_off(self, client, monkeypatch):
+        states, sent = [], []
+        self._base(monkeypatch, bot_state=f"offered_meeting:{main._MAX_REOFFERS - 1}")
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: states.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message", lambda cid, t, **k: sent.append(t))
+        monkeypatch.setattr(main, "_call_llm", lambda p: '{"decision":"OTHER","reply":"אני כאן."}')
+
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="אני עדיין מתלבטת לגבי כל העניין הזה כרגע"))
+        assert r.status_code == 200
+        assert None in states                            # backed off, state cleared
+        assert all(main._TG_MEETING_CTA not in t for t in sent)   # stopped pushing
+
+    def test_already_lead_emotional_message_no_offer(self, client, monkeypatch):
+        states, sent = [], []
+        self._base(monkeypatch, already_lead=True)
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: states.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message", lambda cid, t, **k: sent.append(t))
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: '{"reply":"אני איתך 🤍","intent":"OFFER_MEETING"}')
+
+        r = client.post("/api/webhook/telegram",
+                        json=self._update(text="שוב קשה לי היום ואני עצובה מאוד"))
+        assert r.status_code == 200
+        assert states == []                              # existing lead never re-funneled
+        assert main._TG_MEETING_CTA not in sent[0]       # no CTA for a captured lead
 
 
 # ─── 15. Funnel resilience (empathy-first intent handling) ────────────────────

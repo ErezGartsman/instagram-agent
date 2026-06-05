@@ -1437,6 +1437,78 @@ If the question is in Hebrew, reply in Hebrew. If English, reply in English.
 User message: "{question}"
 """
 
+
+# ─── Telegram triage prompts ("LLM proposes, state machine disposes") ─────────
+# These are deliberately SELF-CONTAINED (they do NOT inject persona.system) so
+# the Telegram funnel persona is isolated from the web /api/rag_query path. The
+# LLM only ever VALIDATES briefly and CLASSIFIES an intent — it never writes the
+# call-to-action or transitions the funnel. Code owns every CTA and state change,
+# which makes a hallucinated funnel-closure structurally impossible.
+
+_BOT_TRIAGE_PROMPT = """\
+You are the warm, grounded front-desk assistant for Erez Gartsman (ארז גרצמן), a \
+mentor for relationships, couplehood, and the psychology of dating. You are a \
+caring RECEPTIONIST, not a therapist. You NEVER analyse, diagnose, or try to \
+solve the person's situation in chat, and you never write more than two short \
+sentences.
+
+YOUR JOB for this message:
+1) VALIDATE the person's feeling in ONE or TWO short, human sentences — at eye \
+   level, no advice, no analysis, no lists, no multi-paragraph breakdowns.
+2) CLASSIFY whether this is a moment to gently connect them to Erez:
+   • intent = "OFFER_MEETING" — the person shares anything personal, emotional, \
+     or relational, or where Erez's personal guidance would help. This is the \
+     DEFAULT for personal messages (lead-gen bias).
+   • intent = "ANSWER" — the message is purely factual/logistical (price, hours, \
+     what the services are, who Erez is). Answer it briefly from the context.
+
+GROUNDING: For any factual claim about Erez, prices, services, or availability, \
+use ONLY the context excerpts below. If they don't contain the answer, say so \
+warmly. Never invent facts.
+
+=== CONTEXT FROM KNOWLEDGE BASE ===
+{context}
+
+{history_block}=== LANGUAGE ===
+Reply in the SAME language as the user (Hebrew → Hebrew).
+
+=== OUTPUT — STRICT JSON, NOTHING ELSE ===
+Return ONLY one JSON object, no markdown fences:
+{{"reply": "<your 1-2 sentence validation or brief factual answer>", "intent": "OFFER_MEETING" or "ANSWER"}}
+Rules: "reply" is at most two short sentences. Do NOT mention booking, a meeting, \
+or any call-to-action inside "reply" — the SYSTEM appends that. Double-quoted \
+keys and values only. No trailing commas. No text outside the JSON object.
+
+User message: "{question}"
+"""
+
+_BOT_OFFER_RESPONSE_PROMPT = """\
+Context: Erez's assistant has just offered the user a personal consultation with \
+Erez. Read the user's reply and classify it.
+
+DECISION:
+• "AFFIRM"  — the user agrees, accepts, or shows willingness (e.g. "אשמח", "כן", \
+  "בטח", "נשמע טוב", "למה לא", "בוא/י נעשה את זה"). Any positive/willing answer.
+• "DECLINE" — the user clearly refuses or opts out ("לא", "לא עכשיו", \
+  "לא מעוניין", "stop").
+• "OTHER"   — neither a clear yes nor no: they ask a question, hesitate \
+  ("אני לא בטוחה", "אולי", "תני לי לחשוב"), or keep sharing more.
+
+{history_block}=== LANGUAGE ===
+Reply in the SAME language as the user.
+
+=== OUTPUT — STRICT JSON, NOTHING ELSE ===
+{{"decision": "AFFIRM" or "DECLINE" or "OTHER", "reply": "<see below>"}}
+- For OTHER: ONE short warm sentence that acknowledges and gently re-invites \
+  (do NOT solve or analyse).
+- For DECLINE: ONE short, no-pressure sentence.
+- For AFFIRM: an empty string "".
+Double-quoted keys and values only. No trailing commas. No text outside the JSON.
+
+User reply: "{question}"
+"""
+
+
 class RagQueryRequest(BaseModel):
     message:    str
     session_id: Optional[str] = None   # optional — for session-aware RAG in the future
@@ -1550,6 +1622,105 @@ def _rag_generate(question: str, chunks: list, history: list = None) -> tuple:
     reply   = _call_llm(prompt)
     sources = sorted({c["source"] for c in chunks if c["source"]})
     return reply, sources
+
+
+# ─── Telegram triage engine ───────────────────────────────────────────────────
+# Used ONLY by the Telegram webhook (the web /api/rag_query path keeps using
+# _rag_generate above, unchanged). The LLM returns structured JSON; the webhook
+# state machine is the sole actuator of CTAs and state transitions.
+
+_BOT_REPLY_MAX_CHARS = 320   # hard brevity backstop — even prompt drift can't wall-of-text
+
+# Last-resort warm line if the model returns an empty reply.
+_BOT_FALLBACK_REPLY = "אני כאן ואיתך 🤍 ספרו לי עוד על מה שעובר עליכם."
+
+
+def _truncate_reply(text: str) -> str:
+    """
+    Enforce the triage brevity contract structurally. Cuts at a sentence/word
+    boundary near the cap so a verbose answer can never reach the user as a wall
+    of text, regardless of what the LLM produced.
+    """
+    t = (text or "").strip()
+    if len(t) <= _BOT_REPLY_MAX_CHARS:
+        return t
+    cut = t[:_BOT_REPLY_MAX_CHARS]
+    # Prefer the last sentence end; otherwise the last space.
+    boundary = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"),
+                   cut.rfind("\n"), cut.rfind("…"))
+    if boundary < _BOT_REPLY_MAX_CHARS // 2:
+        boundary = cut.rfind(" ")
+    return (cut[:boundary + 1] if boundary > 0 else cut).strip() + " …"
+
+
+def _bot_triage_reply(question: str, chunks: list, history: list = None) -> tuple:
+    """
+    One triage turn: the LLM validates briefly and classifies the intent.
+    Returns (reply, intent, sources) where intent ∈ {"OFFER_MEETING", "ANSWER"}.
+
+    FAIL-SAFE: on any JSON/parse failure we degrade to a plain ANSWER (send the
+    text, change no state) — we never crash and never fabricate an OFFER, so a
+    parsing glitch can't spuriously enter or skip the funnel.
+    """
+    if chunks:
+        context = "\n\n".join(
+            f"[{i}] (from {c['source'] or 'unknown'}):\n{c['content']}"
+            for i, c in enumerate(chunks, 1)
+        )
+    else:
+        context = "(no specific knowledge-base match — lead with warmth.)"
+
+    prompt = _BOT_TRIAGE_PROMPT.format(
+        context=context,
+        history_block=_build_rag_history_block(history or []),
+        question=question,
+    )
+    raw = _call_llm(prompt)
+    sources = sorted({c["source"] for c in chunks if c["source"]})
+
+    try:
+        parsed = _parse_llm_json(raw)
+        reply  = _truncate_reply(parsed.get("reply") or "")
+        intent = parsed.get("intent")
+        if intent not in ("OFFER_MEETING", "ANSWER"):
+            intent = "ANSWER"
+    except (ValueError, AttributeError) as e:
+        logger.warning(f"[triage] JSON parse failed, degrading to ANSWER: {e}")
+        reply, intent = _truncate_reply(raw), "ANSWER"
+
+    return (reply or _BOT_FALLBACK_REPLY), intent, sources
+
+
+def _bot_classify_offer_response(question: str, history: list = None) -> tuple:
+    """
+    Interpret the user's reply to an offered meeting. Returns (decision, reply)
+    with decision ∈ {"AFFIRM", "DECLINE", "OTHER"}.
+
+    A short, obvious yes/no is resolved instantly (no LLM round-trip); everything
+    else is classified by the LLM IN CONTEXT — robust to any natural phrasing,
+    not a brittle keyword list. FAIL-SAFE: a parse failure degrades to "OTHER"
+    (re-offer), never a false capture or false close.
+    """
+    if _is_affirmation(question):
+        return "AFFIRM", ""
+    if _is_escape_intent(question):        # short, length-guarded opt-out
+        return "DECLINE", ""
+
+    prompt = _BOT_OFFER_RESPONSE_PROMPT.format(
+        history_block=_build_rag_history_block(history or []),
+        question=question,
+    )
+    raw = _call_llm(prompt)
+    try:
+        parsed   = _parse_llm_json(raw)
+        decision = parsed.get("decision")
+        reply    = _truncate_reply(parsed.get("reply") or "")
+        if decision not in ("AFFIRM", "DECLINE", "OTHER"):
+            decision = "OTHER"
+    except (ValueError, AttributeError) as e:
+        logger.warning(f"[triage] offer-response parse failed, degrading to OTHER: {e}")
+        decision, reply = "OTHER", ""
+    return decision, reply
 
 
 @app.post(
@@ -1725,6 +1896,25 @@ def _is_escape_intent(text: str) -> bool:
     return bool(_ESCAPE_INTENT.search(t))
 
 
+# Obvious-affirmation fast-path for the offered_meeting turn. This is ONLY a
+# latency optimisation for unmistakable short replies — the LLM classifier in
+# _bot_classify_offer_response is the authoritative, natural-language-robust
+# detector. Length-guarded (same as escape) so a long message always goes to
+# the LLM rather than matching on a single word.
+_AFFIRM_INTENT = re.compile(
+    r"(\bכן\b|אשמח|בשמחה|בטח|סבבה|יאללה|בהחלט|נשמע\s*טוב|בוא[יו]?\s*נעשה|"
+    r"\bok\b|\bokay\b|\byes\b|\bsure\b|sounds\s*good)",
+    re.IGNORECASE,
+)
+
+def _is_affirmation(text: str) -> bool:
+    """True for a SHORT, unmistakable acceptance (fast-path only; LLM is primary)."""
+    t = (text or "").strip()
+    if not t or len(t.split()) > _ESCAPE_MAX_WORDS:
+        return False
+    return bool(_AFFIRM_INTENT.search(t))
+
+
 def _make_contact_state(retry: int = 0) -> str:
     """Encode the awaiting_contact state with its retry counter."""
     return f"awaiting_contact:{retry}"
@@ -1735,6 +1925,24 @@ def _is_awaiting_contact(state: str | None) -> bool:
 
 def _parse_contact_retry(state: str | None) -> int:
     """Extract the retry count from 'awaiting_contact:N'. Returns 0 for any edge case."""
+    try:
+        return int((state or "").split(":", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+# ── offered_meeting state — the bot has offered a consultation and is awaiting
+#    the user's response. Encodes a re-offer counter so we never nag. (bot_state
+#    is TEXT, so this new value needs no DB migration.) ──────────────────────────
+_MAX_REOFFERS = 2
+
+def _make_offer_state(n: int = 0) -> str:
+    return f"offered_meeting:{n}"
+
+def _is_offered_meeting(state: str | None) -> bool:
+    return bool(state and state.startswith("offered_meeting"))
+
+def _parse_offer_count(state: str | None) -> int:
     try:
         return int((state or "").split(":", 1)[1])
     except (IndexError, ValueError):
@@ -1761,6 +1969,26 @@ _TG_QUALIFICATION_QUESTION = (
 _TG_QUALIFICATION_ACK = (
     "תודה על השיתוף 🙏 ממה שעלה, נראה שיש מקום ממשי לעבוד על זה יחד. "
     "נשמח לקבל פרטי קשר כדי שארז יוכל לחזור אליכם:"
+)
+# Code-owned call-to-action appended after the LLM's brief validation when the
+# triage step chooses OFFER_MEETING. The LLM is explicitly told NOT to write this
+# itself — so the offer can never be hallucinated or malformed.
+_TG_MEETING_CTA = (
+    "אם זה מרגיש לכם נכון, אשמח לחבר אתכם לארז לשיחה אישית ורגועה — "
+    "רוצים שאתאם?"
+)
+# Preamble shown with the contact keyboard once the user accepts the offer.
+_TG_OFFER_ACK = (
+    "יופי, אני שמח 🙏 רק נשאיר פרטים קצרים כדי שארז יחזור אליכם בעצמו:"
+)
+# No-pressure step-back when the user declines the offer.
+_TG_OFFER_DECLINED = (
+    "לגמרי בסדר, בלי שום לחץ 😊 אני כאן להמשיך לדבר על מה שתרצו, "
+    "ואם תרצו לחזור לזה בעתיד — פשוט תגידו."
+)
+# Gentle close after the re-offer cap, so we never nag.
+_TG_OFFER_BACKOFF = (
+    "אני כאן בכל רגע שתרצו 🤍 אפשר להמשיך לדבר, ומתי שתהיו מוכנים — נתאם."
 )
 # Gentle redirect when the user types text (e.g. "כן") instead of tapping the
 # contact button while bot_state == 'awaiting_contact'.
@@ -2448,6 +2676,66 @@ def telegram_webhook(
                 conn.commit()
             bot_state = None
 
+        # ── STATE: offered_meeting — interpret the reply to our consultation offer ─
+        # The bot offered a meeting last turn. We classify the reply IN CONTEXT
+        # (LLM-driven, natural-language-robust — see _bot_classify_offer_response)
+        # and the STATE MACHINE acts: this is what makes a casual "אשמח" reliably
+        # enter the funnel instead of the LLM hallucinating a closure. Handled
+        # before the escape gate / moderation so a raw reply is never mishandled.
+        if _is_offered_meeting(bot_state):
+            if already_lead:
+                with get_db_conn() as conn:
+                    _db_set_session_state(conn, session_id, None)
+                    conn.commit()
+                bot_state = None   # already captured — fall through to normal chat
+            else:
+                decision, offer_reply = _bot_classify_offer_response(text, history)
+
+                if decision == "AFFIRM":
+                    # Code (not the LLM) opens the funnel: show the contact keyboard.
+                    with get_db_conn() as conn:
+                        _db_save_message(conn, session_id, "user", text)
+                        _db_set_session_state(conn, session_id, _make_contact_state(0))
+                        _db_touch_session(conn, session_id)
+                        conn.commit()
+                    _send_contact_keyboard(chat_id, _TG_OFFER_ACK)
+                    _audit("telegram_offer_accepted", chat_id=chat_id_str,
+                           session_id=session_id)
+                    return {"ok": True}
+
+                if decision == "DECLINE":
+                    with get_db_conn() as conn:
+                        _db_save_message(conn, session_id, "user", text)
+                        _db_set_session_state(conn, session_id, None)
+                        _db_touch_session(conn, session_id)
+                        conn.commit()
+                    _send_telegram_message(chat_id, _TG_OFFER_DECLINED)
+                    _audit("telegram_offer_declined", chat_id=chat_id_str,
+                           session_id=session_id)
+                    return {"ok": True}
+
+                # OTHER (question / hesitation / more sharing): warm reply + ONE
+                # more soft offer, until the re-offer cap — then back off so we
+                # never nag.
+                count = _parse_offer_count(bot_state)
+                with get_db_conn() as conn:
+                    _db_save_message(conn, session_id, "user", text)
+                    if count + 1 < _MAX_REOFFERS:
+                        out = (f"{offer_reply}\n\n{_TG_MEETING_CTA}".strip()
+                               if offer_reply else _TG_MEETING_CTA)
+                        _db_set_session_state(conn, session_id,
+                                              _make_offer_state(count + 1))
+                    else:
+                        out = offer_reply or _TG_OFFER_BACKOFF
+                        _db_set_session_state(conn, session_id, None)
+                    _db_save_message(conn, session_id, "assistant", out)
+                    _db_touch_session(conn, session_id)
+                    conn.commit()
+                _send_telegram_message(chat_id, out)
+                _audit("telegram_offer_other", chat_id=chat_id_str,
+                       session_id=session_id, reoffers=count + 1)
+                return {"ok": True}
+
         # ── Escape-intent gate (short opt-outs only; awaiting_contact etc.) ────
         # A SHORT opt-out ("לא", "בטל", "stop") while still in a funnel state
         # clears it gracefully. awaiting_qualification is already handled above,
@@ -2586,26 +2874,34 @@ def telegram_webhook(
             _audit(audit_event, chat_id=chat_id_str, session_id=session_id)
             return {"ok": True}
 
-        # ── PATH B / C: normal RAG (booking intent already handled above) ──────
-        # Embedding is the slowest step — only reached here (not for PATH A,
-        # awaiting_contact, or booking intent, which return early with scripted
-        # responses).
+        # ── PATH B: triage receptionist (LLM proposes, state machine disposes) ─
+        # The LLM returns {reply, intent}: it VALIDATES briefly and CLASSIFIES
+        # whether to connect the user to Erez — it never writes the call-to-action
+        # or transitions the funnel. Code owns the CTA + state change, so a funnel
+        # closure can't be hallucinated and the persona can't drift into therapy.
         query_vector = _embed_text(text)
         with get_db_conn() as conn:
             chunks = _retrieve_chunks(conn, query_vector, top_k=5)
 
-        reply, sources = _rag_generate(text, chunks, history=history)
+        reply, intent, sources = _bot_triage_reply(text, chunks, history=history)
+
+        # Enter the funnel only for a NEW lead; an existing lead just gets the
+        # brief validation (Erez already has their details).
+        make_offer = (intent == "OFFER_MEETING" and not already_lead)
+        out = f"{reply}\n\n{_TG_MEETING_CTA}" if make_offer else reply
 
         with get_db_conn() as conn:
             _db_save_message(conn, session_id, "user", text)
-            _db_save_message(conn, session_id, "assistant", reply)
+            _db_save_message(conn, session_id, "assistant", out)
+            if make_offer:
+                _db_set_session_state(conn, session_id, _make_offer_state(0))
             _db_touch_session(conn, session_id)
             conn.commit()
 
-        _audit("telegram_success", chat_id=chat_id_str, session_id=session_id,
-               sources=sources, chunks=len(chunks))
+        _audit("telegram_triage", chat_id=chat_id_str, session_id=session_id,
+               intent=intent, offered=make_offer, sources=sources, chunks=len(chunks))
 
-        _send_telegram_message(chat_id, reply)
+        _send_telegram_message(chat_id, out)
 
     except TimeoutError:
         logger.error("[telegram] LLM timeout")
