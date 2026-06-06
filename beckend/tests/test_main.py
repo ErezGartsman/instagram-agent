@@ -1483,35 +1483,42 @@ class TestAffirmationFastPath:
 
 
 class TestBotTriageReply:
-    def test_offer_intent_parsed(self, monkeypatch):
+    def test_emotional_intent_parsed(self, monkeypatch):
         monkeypatch.setattr(main, "_call_llm",
-                            lambda p: '{"reply":"אני שומע כמה זה כואב.","intent":"OFFER_MEETING"}')
+                            lambda p: '{"reply":"אני שומע כמה זה כואב.","intent":"EMOTIONAL"}')
         reply, intent, _ = main._bot_triage_reply("הוא עזב אותי", [], history=[])
-        assert intent == "OFFER_MEETING"
+        assert intent == "EMOTIONAL"
         assert "כואב" in reply
         assert main._TG_MEETING_CTA not in reply        # the LLM must NOT write the CTA
 
-    def test_answer_intent_parsed(self, monkeypatch):
+    def test_faq_intent_parsed(self, monkeypatch):
         monkeypatch.setattr(main, "_call_llm",
-                            lambda p: '{"reply":"הליווי הוא אישי.","intent":"ANSWER"}')
+                            lambda p: '{"reply":"הליווי הוא אישי.","intent":"FAQ"}')
         _, intent, _ = main._bot_triage_reply("מה השירות?",
                                               [{"content": "x", "source": "a.txt"}], history=[])
-        assert intent == "ANSWER"
+        assert intent == "FAQ"
 
-    def test_bad_json_degrades_to_answer(self, monkeypatch):
+    def test_smalltalk_intent_parsed(self, monkeypatch):
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: '{"reply":"תמיד בשמחה 🤍","intent":"SMALLTALK"}')
+        _, intent, _ = main._bot_triage_reply("תודה רבה!", [], history=[])
+        assert intent == "SMALLTALK"
+
+    def test_bad_json_degrades_to_smalltalk(self, monkeypatch):
         monkeypatch.setattr(main, "_call_llm", lambda p: "totally not json")
         reply, intent, _ = main._bot_triage_reply("שלום", [], history=[])
-        assert intent == "ANSWER"            # fail-safe: never fabricates an OFFER
+        assert intent == "SMALLTALK"         # fail-safe: never fabricates an offer
         assert reply                         # raw text still delivered
 
-    def test_invalid_intent_value_coerced_to_answer(self, monkeypatch):
+    def test_invalid_intent_value_coerced_to_faq(self, monkeypatch):
+        # Parsed but unknown label → substantive default (offer), per lead-gen bias.
         monkeypatch.setattr(main, "_call_llm",
                             lambda p: '{"reply":"ok","intent":"BOOK_NOW"}')
         _, intent, _ = main._bot_triage_reply("hi", [], history=[])
-        assert intent == "ANSWER"
+        assert intent == "FAQ"
 
     def test_empty_reply_uses_fallback(self, monkeypatch):
-        monkeypatch.setattr(main, "_call_llm", lambda p: '{"reply":"","intent":"ANSWER"}')
+        monkeypatch.setattr(main, "_call_llm", lambda p: '{"reply":"","intent":"SMALLTALK"}')
         reply, _, _ = main._bot_triage_reply("hi", [], history=[])
         assert reply == main._BOT_FALLBACK_REPLY
 
@@ -1563,7 +1570,7 @@ class TestTriageFunnel:
         monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: states.append(s))
         monkeypatch.setattr(main, "_send_telegram_message", lambda cid, t, **k: sent.append(t))
         monkeypatch.setattr(main, "_call_llm",
-                            lambda p: '{"reply":"אני שומע כמה זה כואב, ואת/ה לא לבד בזה.","intent":"OFFER_MEETING"}')
+                            lambda p: '{"reply":"אני שומע כמה זה כואב, ואת/ה לא לבד בזה.","intent":"EMOTIONAL"}')
 
         r = client.post("/api/webhook/telegram",
                         json=self._update(text="בעלי בגד בי ואני מרגישה שבורה לגמרי"))
@@ -1573,22 +1580,39 @@ class TestTriageFunnel:
         assert "כואב" in sent[0]                         # brief validation
         assert main._TG_MEETING_CTA in sent[0]          # CTA appended by code
 
-    def test_info_question_answers_without_offer(self, client, monkeypatch):
+    def test_faq_answers_and_offers(self, client, monkeypatch):
+        """Gap 2: an FAQ (e.g. price) is ANSWERED and then pivots to a CTA."""
         states, sent = [], []
         self._base(monkeypatch)
         monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: states.append(s))
         monkeypatch.setattr(main, "_send_telegram_message", lambda cid, t, **k: sent.append(t))
         monkeypatch.setattr(main, "_call_llm",
-                            lambda p: '{"reply":"הליווי הוא אישי ומותאם.","intent":"ANSWER"}')
+                            lambda p: '{"reply":"העלות תלויה בסוג התהליך, והצוות יעביר פרטים.","intent":"FAQ"}')
 
-        r = client.post("/api/webhook/telegram", json=self._update(text="מה השירותים שאתם מציעים?"))
+        r = client.post("/api/webhook/telegram", json=self._update(text="כמה עולה שיחה עם ארז?"))
+        assert r.status_code == 200
+        assert "offered_meeting:0" in states            # FAQ pivots into the funnel
+        assert "העלות תלויה" in sent[0]                 # the price answer
+        assert main._TG_MEETING_CTA in sent[0]          # …followed by the CTA
+
+    def test_smalltalk_stays_out_of_funnel(self, client, monkeypatch):
+        """Gap 1 boundary: greetings/thanks get a reply but NO offer."""
+        states, sent = [], []
+        self._base(monkeypatch)
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: states.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message", lambda cid, t, **k: sent.append(t))
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: '{"reply":"תמיד בשמחה 🤍","intent":"SMALLTALK"}')
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="תודה רבה!"))
         assert r.status_code == 200
         assert states == []                             # no funnel state
         assert main._TG_MEETING_CTA not in sent[0]      # no CTA
 
     def test_llm_cannot_close_funnel_via_prose(self, client, monkeypatch):
         """Architectural guarantee: even if the LLM's TEXT claims it'll arrange
-        contact, NO keyboard/state happens unless the structured intent + code do."""
+        contact, NO keyboard/state happens unless the structured intent + code do.
+        (SMALLTALK is the only no-offer intent, so we use it here.)"""
         states, keyboards, sent = [], [], []
         self._base(monkeypatch)
         monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: states.append(s))
@@ -1596,7 +1620,7 @@ class TestTriageFunnel:
         monkeypatch.setattr(main, "_send_contact_keyboard",
                             lambda cid, preamble: keyboards.append(preamble))
         monkeypatch.setattr(main, "_call_llm",
-                            lambda p: '{"reply":"מעולה, הצוות שלי ייצור איתך קשר בקרוב!","intent":"ANSWER"}')
+                            lambda p: '{"reply":"מעולה, הצוות שלי ייצור איתך קשר בקרוב!","intent":"SMALLTALK"}')
 
         r = client.post("/api/webhook/telegram", json=self._update(text="טוב, אז מה עכשיו?"))
         assert r.status_code == 200
@@ -1678,7 +1702,7 @@ class TestTriageFunnel:
         monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: states.append(s))
         monkeypatch.setattr(main, "_send_telegram_message", lambda cid, t, **k: sent.append(t))
         monkeypatch.setattr(main, "_call_llm",
-                            lambda p: '{"reply":"אני איתך 🤍","intent":"OFFER_MEETING"}')
+                            lambda p: '{"reply":"אני איתך 🤍","intent":"EMOTIONAL"}')
 
         r = client.post("/api/webhook/telegram",
                         json=self._update(text="שוב קשה לי היום ואני עצובה מאוד"))
@@ -1818,3 +1842,88 @@ class TestFunnelResilience:
         assert r.status_code == 200
         assert None in cleared                       # gracefully exited
         assert any("בסדר גמור" in t for t in sent)
+
+
+# ─── 17. Sprint 1D-polish — intent-mapping fixes (Gaps 1–3) ───────────────────
+
+class TestBookingVsFaqSeparation:
+    """Gap 2: price / FAQ vocabulary must NOT trigger the booking funnel."""
+    def test_price_questions_are_not_booking(self):
+        for m in ["כמה עולה שיחה עם ארז?", "מה המחיר?", "כמה זה עולה?",
+                  "how much does a session cost?", "what's the consultation price?"]:
+            assert main._has_booking_intent(m) is False, m
+
+    def test_explicit_scheduling_still_books(self):
+        for m in ["אני רוצה לקבוע פגישה", "אפשר לתאם פגישת ייעוץ?",
+                  "אשמח לקבוע תור", "I'd like to schedule an appointment"]:
+            assert main._has_booking_intent(m) is True, m
+
+    def test_pgisha_construct_forms_match(self):
+        # "פגישת" (construct) must still match now that bare "ייעוץ" was removed.
+        assert main._has_booking_intent("מעוניין בפגישת ייעוץ") is True
+
+
+class TestLastBotMessageOffered:
+    def test_detects_offer_in_last_assistant_msg(self):
+        history = [
+            {"role": "user", "content": "סיפור"},
+            {"role": "assistant", "content": "אני שומע. " + main._TG_MEETING_CTA},
+        ]
+        assert main._last_bot_message_offered(history) is True
+
+    def test_no_offer_in_last_assistant_msg(self):
+        history = [{"role": "assistant", "content": "הנה מידע כללי."}]
+        assert main._last_bot_message_offered(history) is False
+
+    def test_empty_history(self):
+        assert main._last_bot_message_offered([]) is False
+
+
+class TestAgreementSafetyNet:
+    """Gap 3: 'אשמח' is foolproof — it enters the funnel even when offered_meeting
+    was lost (e.g. the 24h TTL expired), as long as our last message offered."""
+    def _base(self, monkeypatch, *, history):
+        monkeypatch.setattr(main, "_db_get_or_create_telegram_session", lambda c, cid: "s1")
+        monkeypatch.setattr(main, "_db_get_session_state", lambda c, sid: None)   # state LOST
+        monkeypatch.setattr(main, "_db_has_lead", lambda c, cid: False)
+        monkeypatch.setattr(main, "_db_load_history", lambda c, sid, limit=12: history)
+        monkeypatch.setattr(main, "_db_touch_session", lambda c, sid: None)
+        monkeypatch.setattr(main, "_db_save_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_embed_text", lambda t: [0.1] * 768)
+        monkeypatch.setattr(main, "_retrieve_chunks", lambda c, v, top_k=5: [])
+
+    def _update(self, text, chat_id=606):
+        return {"update_id": 1,
+                "message": {"chat": {"id": chat_id, "type": "private"}, "text": text}}
+
+    def test_affirm_after_lost_offer_opens_keyboard(self, client, monkeypatch):
+        history = [{"role": "assistant", "content": "אני איתך. " + main._TG_MEETING_CTA}]
+        states, keyboards = [], []
+        self._base(monkeypatch, history=history)
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: states.append(s))
+        monkeypatch.setattr(main, "_send_telegram_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_send_contact_keyboard",
+                            lambda cid, preamble: keyboards.append(preamble))
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: pytest.fail("safety net should fire before any LLM call"))
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="אשמח"))
+        assert r.status_code == 200
+        assert "awaiting_contact:0" in states            # funnel recovered
+        assert keyboards                                  # contact keyboard shown
+
+    def test_affirm_without_prior_offer_does_not_trigger(self, client, monkeypatch):
+        # No offer in history → "כן" is just normal chat, must NOT open the keyboard.
+        history = [{"role": "assistant", "content": "הנה מידע כללי על ארז."}]
+        keyboards = []
+        self._base(monkeypatch, history=history)
+        monkeypatch.setattr(main, "_db_set_session_state", lambda c, sid, s: None)
+        monkeypatch.setattr(main, "_send_telegram_message", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_send_contact_keyboard",
+                            lambda cid, preamble: keyboards.append(preamble))
+        monkeypatch.setattr(main, "_call_llm",
+                            lambda p: '{"reply":"בשמחה 🤍","intent":"SMALLTALK"}')
+
+        r = client.post("/api/webhook/telegram", json=self._update(text="כן"))
+        assert r.status_code == 200
+        assert keyboards == []                            # no false funnel entry
