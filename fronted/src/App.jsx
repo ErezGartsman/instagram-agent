@@ -953,6 +953,96 @@ const SessionContextMenu = ({ onRename, onDelete, onClose }) => {
 }
 
 // ─── Root App ─────────────────────────────────────────────────────────────────
+// ── Auth gate ────────────────────────────────────────────────────────────────
+// Zero-cost replacement for paid Vercel deployment protection. The owner types
+// the backend API key once; it is validated against /api/stats and persisted in
+// localStorage. The secret NEVER appears in the source or the built bundle — it
+// only exists at runtime in the browser of whoever knows it.
+function LoginScreen({ onAuthenticated }) {
+  const [key, setKey]       = useState('')
+  const [status, setStatus] = useState('idle')   // idle | checking | error
+  const [error, setError]   = useState('')
+
+  const submit = async (e) => {
+    e.preventDefault()
+    const token = key.trim()
+    if (!token || status === 'checking') return
+    setStatus('checking'); setError('')
+    try {
+      // Validate the key before storing it: a 200 means it's good, 401 means
+      // wrong key. This avoids persisting an invalid token and bouncing the user.
+      const res = await fetch(`${API_BASE}/api/stats`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(15_000),
+      })
+      if (res.status === 401) {
+        setStatus('error'); setError('Invalid API key — access denied.')
+        return
+      }
+      if (!res.ok) {
+        setStatus('error'); setError(`Backend error (${res.status}). Please try again.`)
+        return
+      }
+      onAuthenticated(token)   // valid → persist + unlock the app
+    } catch (err) {
+      setStatus('error')
+      setError(err?.name === 'TimeoutError'
+        ? 'Backend timed out — check that the server is running.'
+        : 'Could not reach the backend.')
+    }
+  }
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, display: 'flex', alignItems: 'center',
+      justifyContent: 'center', background: '#0a0d14', zIndex: 9999, padding: 24,
+    }}>
+      <form onSubmit={submit} style={{
+        width: '100%', maxWidth: 380, background: '#141925',
+        border: '1px solid #232a3a', borderRadius: 16, padding: 32,
+        boxShadow: '0 20px 60px rgba(0,0,0,.5)',
+      }}>
+        <div style={{ fontSize: 22, fontWeight: 700, color: '#f1f5f9', marginBottom: 6 }}>
+          Nexus
+        </div>
+        <div style={{ fontSize: 13, color: '#8a93a6', marginBottom: 24 }}>
+          Enter your API key to access the dashboard.
+        </div>
+        <input
+          type="password"
+          value={key}
+          onChange={e => setKey(e.target.value)}
+          placeholder="API key"
+          autoFocus
+          autoComplete="current-password"
+          style={{
+            width: '100%', boxSizing: 'border-box', padding: '12px 14px',
+            background: '#0a0d14',
+            border: `1px solid ${status === 'error' ? '#b4453a' : '#2a3346'}`,
+            borderRadius: 10, color: '#f1f5f9', fontSize: 14, outline: 'none',
+            marginBottom: 12,
+          }}
+        />
+        {error && (
+          <div style={{ color: '#f08a7f', fontSize: 12.5, marginBottom: 12 }}>{error}</div>
+        )}
+        <button
+          type="submit"
+          disabled={status === 'checking' || !key.trim()}
+          style={{
+            width: '100%', padding: '12px 14px', borderRadius: 10, border: 'none',
+            background: status === 'checking' ? '#2a3346' : '#3b82f6',
+            color: '#fff', fontSize: 14, fontWeight: 600,
+            cursor: status === 'checking' ? 'default' : 'pointer',
+          }}
+        >
+          {status === 'checking' ? 'Verifying…' : 'Unlock'}
+        </button>
+      </form>
+    </div>
+  )
+}
+
 export default function App() {
   const [sessions, setSessions] = useState(() => {
     try {
@@ -1035,6 +1125,41 @@ export default function App() {
     setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 4000)
   }, [])
 
+  // ── Auth (zero-cost API-key gate; replaces paid Vercel protection) ───────────
+  // The key is entered at runtime via <LoginScreen/> and kept in localStorage —
+  // it never appears in the source or the built bundle. authedFetch injects it
+  // as a Bearer header and treats any 401 as "key revoked → re-show login".
+  const [authToken, setAuthToken] = useState(() => {
+    try { return localStorage.getItem('nexus_auth_token') || '' } catch { return '' }
+  })
+
+  const handleLogout = useCallback(() => {
+    try { localStorage.removeItem('nexus_auth_token') } catch { /* private mode */ }
+    setAuthToken('')
+  }, [])
+
+  const handleAuthenticated = useCallback((token) => {
+    try { localStorage.setItem('nexus_auth_token', token) } catch { /* private mode */ }
+    setAuthToken(token)
+  }, [])
+
+  // Wrapper around fetch that adds the Bearer token and converts a 401 into a
+  // forced logout (clears the stored key and re-renders the login overlay).
+  const authedFetch = useCallback(async (url, options = {}) => {
+    const res = await fetch(url, {
+      ...options,
+      headers: {
+        ...(options.headers || {}),
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
+    })
+    if (res.status === 401) {
+      handleLogout()
+      throw new Error('unauthorized')
+    }
+    return res
+  }, [authToken, handleLogout])
+
   const handleNewChat = useCallback(() => {
     const newSession = { id: crypto.randomUUID(), title: 'New Chat', messages: [], backendSessionId: null }
     setSessions(prev => [newSession, ...prev])
@@ -1088,15 +1213,9 @@ export default function App() {
   // degradation — chat still works, messages just won't be persisted to DB).
   const createBackendSession = useCallback(async (frontendSessionId) => {
     try {
-      const res = await fetch(`${API_BASE}/api/sessions`, {
+      const res = await authedFetch(`${API_BASE}/api/sessions`, {
         method: 'POST',
-        headers: {
-          // No Authorization header — auth is handled by Vercel password
-          // protection on the frontend deployment. The NEXUS_API_KEY must be
-          // set to "" in the Vercel backend env vars after this change.
-          // See: https://vercel.com/docs/security/deployment-protection
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         // Pass the frontend UUID as contact_id so the backend can enforce
         // session ownership on GET /api/sessions/{id}/history (R4 fix).
         body: JSON.stringify({ channel: 'web', contact_id: frontendSessionId }),
@@ -1113,7 +1232,7 @@ export default function App() {
     } catch {
       return null   // non-fatal — chat works without persistence
     }
-  }, [])   // no deps: API_BASE is a build-time constant
+  }, [authedFetch])
 
   const handleShare = useCallback(() => {
     const url = window.location.href
@@ -1188,9 +1307,9 @@ export default function App() {
     // if the view unmounts before the fetch resolves (fast navigation, HMR,
     // React Strict Mode double-invoke), the .catch sees AbortError and bails
     // out cleanly instead of calling setStats / setDbStatus on stale state.
+    if (!authToken) return   // not logged in yet — LoginScreen validates the key
     const controller = new AbortController()
-    fetch(`${API_BASE}/api/stats`, {
-      headers: {},
+    authedFetch(`${API_BASE}/api/stats`, {
       signal: controller.signal,
     })
       .then(r => r.json())
@@ -1209,12 +1328,13 @@ export default function App() {
         }
       })
       .catch(err => {
-        if (err?.name === 'AbortError') return  // unmounted — discard silently
+        if (err?.name === 'AbortError') return       // unmounted — discard silently
+        if (err?.message === 'unauthorized') return  // 401 → logout already triggered
         setDbStatus('error')
         addToast('Backend is offline — check that the server is running', 'error')
       })
     return () => controller.abort()
-  }, [addToast])
+  }, [addToast, authToken, authedFetch])
 
   useEffect(() => {
     // Also fires when currentView becomes 'query' (tab switch back to chat).
@@ -1323,6 +1443,7 @@ export default function App() {
     // Nothing to restore: no backend session, already has local messages,
     // or we already fetched for this session in this page-load.
     if (
+      !authToken ||
       !session?.backendSessionId ||
       session.messages.length > 0 ||
       restoredSessionsRef.current.has(activeSessionId)
@@ -1333,7 +1454,7 @@ export default function App() {
 
     const controller = new AbortController()
 
-    fetch(`${API_BASE}/api/sessions/${session.backendSessionId}/history`, {
+    authedFetch(`${API_BASE}/api/sessions/${session.backendSessionId}/history`, {
       headers: {
         // Echo the frontend session UUID so the backend can verify ownership
         // of the session (R4: IDOR fix). Matches the contact_id stored at
@@ -1445,7 +1566,7 @@ export default function App() {
 
     try {
       // 38 s gives the backend's 30 s LLM timeout full room before we give up.
-      const res = await fetch(`${API_BASE}${endpoint}`, {
+      const res = await authedFetch(`${API_BASE}${endpoint}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1509,7 +1630,7 @@ export default function App() {
         pipelineTimerRef.current = null
       }, 1500)
     }
-  }, [loading, activeSessionId, sessions, addToast, createBackendSession, ragMode])
+  }, [loading, activeSessionId, sessions, addToast, createBackendSession, ragMode, authedFetch])
 
   // ── Raw SQL Execution (bypasses LLM — used by SQL Editor mode) ────────────
   const runRawSql = useCallback(async (sql) => {
@@ -1528,7 +1649,7 @@ export default function App() {
     setPipelineStage('db')
 
     try {
-      const res = await fetch(`${API_BASE}/api/raw_query`, {
+      const res = await authedFetch(`${API_BASE}/api/raw_query`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1587,7 +1708,7 @@ export default function App() {
         pipelineTimerRef.current = null
       }, 1500)
     }
-  }, [loading, activeSessionId, addToast])
+  }, [loading, activeSessionId, addToast, authedFetch])
 
   const handleSend = () => {
     const q = input.trim()
@@ -1612,6 +1733,12 @@ export default function App() {
     { id: 'arch',      icon: 'arch',      label: 'Architecture'   },
     { id: 'schema',    icon: 'schema',    label: 'Schema & Stats' },
   ]
+
+  // Gate the entire app behind the API-key login until authenticated. All hooks
+  // above run unconditionally; this early return is safe (no hooks below it).
+  if (!authToken) {
+    return <LoginScreen onAuthenticated={handleAuthenticated} />
+  }
 
   return (
     <div className="app-shell">
