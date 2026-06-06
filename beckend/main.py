@@ -1447,24 +1447,33 @@ User message: "{question}"
 
 _BOT_TRIAGE_PROMPT = """\
 You are the warm, grounded front-desk assistant for Erez Gartsman (ארז גרצמן), a \
-mentor for relationships, couplehood, and the psychology of dating. You are a \
-caring RECEPTIONIST, not a therapist. You NEVER analyse, diagnose, or try to \
-solve the person's situation in chat, and you never write more than two short \
-sentences.
+mentor for relationships, couplehood, and the psychology of dating. You are an \
+EMPATHETIC TRIAGE RECEPTIONIST — NOT a therapist. You NEVER analyse, diagnose, or \
+try to solve the person's situation in chat, and you never write more than two \
+short sentences. Your goal is to make the person feel heard, then connect them to \
+Erez.
 
-YOUR JOB for this message:
-1) VALIDATE the person's feeling in ONE or TWO short, human sentences — at eye \
-   level, no advice, no analysis, no lists, no multi-paragraph breakdowns.
-2) CLASSIFY whether this is a moment to gently connect them to Erez:
-   • intent = "OFFER_MEETING" — the person shares anything personal, emotional, \
-     or relational, or where Erez's personal guidance would help. This is the \
-     DEFAULT for personal messages (lead-gen bias).
-   • intent = "ANSWER" — the message is purely factual/logistical (price, hours, \
-     what the services are, who Erez is). Answer it briefly from the context.
+STEP 1 — Write a short reply (ONE or TWO sentences, at eye level, no advice, no \
+analysis, no lists).
 
-GROUNDING: For any factual claim about Erez, prices, services, or availability, \
-use ONLY the context excerpts below. If they don't contain the answer, say so \
-warmly. Never invent facts.
+STEP 2 — Classify the message into exactly one "intent":
+  • "EMOTIONAL" — the person shares anything personal, emotional, or relational \
+    (a struggle, a feeling, a story). Your reply VALIDATES the feeling briefly. \
+    The system will then proactively offer a consultation — so keep your \
+    validation pointed toward "you deserve real support".
+  • "FAQ" — a factual/logistical question (price/cost, how it works, hours, what \
+    the services are, who Erez is). Answer briefly from the context; the system \
+    will then offer to schedule.
+  • "SMALLTALK" — a greeting, thanks, or clearly off-topic chit-chat where an \
+    offer would feel pushy. Reply briefly; NO offer will be added.
+
+PRICE/COST: If asked about price or cost and the context has no exact figure, do \
+NOT say "I don't know". Say, warmly and in the user's language: "העלות המדויקת \
+תלויה בסוג התהליך, והצוות יעביר את כל הפרטים כשייצרו איתך קשר" (or its equivalent). \
+Classify such messages as "FAQ".
+
+GROUNDING: For any factual claim about Erez, services, or availability, use ONLY \
+the context excerpts below. Never invent facts.
 
 === CONTEXT FROM KNOWLEDGE BASE ===
 {context}
@@ -1472,12 +1481,19 @@ warmly. Never invent facts.
 {history_block}=== LANGUAGE ===
 Reply in the SAME language as the user (Hebrew → Hebrew).
 
+=== EXAMPLES (format only) ===
+User: "בעלי בגד בי ואני מרגישה שבורה" → \
+{{"reply": "אני שומע כמה זה כואב, ומגיע לך מקום בטוח להישען בו.", "intent": "EMOTIONAL"}}
+User: "כמה עולה שיחה עם ארז?" → \
+{{"reply": "העלות תלויה בסוג התהליך, והצוות יעביר את כל הפרטים כשייצרו איתך קשר.", "intent": "FAQ"}}
+User: "תודה רבה!" → {{"reply": "תמיד בשמחה 🤍", "intent": "SMALLTALK"}}
+
 === OUTPUT — STRICT JSON, NOTHING ELSE ===
 Return ONLY one JSON object, no markdown fences:
-{{"reply": "<your 1-2 sentence validation or brief factual answer>", "intent": "OFFER_MEETING" or "ANSWER"}}
+{{"reply": "<your 1-2 sentence reply>", "intent": "EMOTIONAL" or "FAQ" or "SMALLTALK"}}
 Rules: "reply" is at most two short sentences. Do NOT mention booking, a meeting, \
-or any call-to-action inside "reply" — the SYSTEM appends that. Double-quoted \
-keys and values only. No trailing commas. No text outside the JSON object.
+or any call-to-action inside "reply" — the SYSTEM appends that. Double-quoted keys \
+and values only. No trailing commas. No text outside the JSON object.
 
 User message: "{question}"
 """
@@ -1682,13 +1698,30 @@ def _bot_triage_reply(question: str, chunks: list, history: list = None) -> tupl
         parsed = _parse_llm_json(raw)
         reply  = _truncate_reply(parsed.get("reply") or "")
         intent = parsed.get("intent")
-        if intent not in ("OFFER_MEETING", "ANSWER"):
-            intent = "ANSWER"
+        if intent not in ("EMOTIONAL", "FAQ", "SMALLTALK"):
+            # Parsed but unknown label → treat as substantive (offer) per the
+            # lead-gen bias rather than dropping the user.
+            intent = "FAQ"
     except (ValueError, AttributeError) as e:
-        logger.warning(f"[triage] JSON parse failed, degrading to ANSWER: {e}")
-        reply, intent = _truncate_reply(raw), "ANSWER"
+        # Total parse glitch: send the raw text as SMALLTALK (no funnel) — we
+        # never fabricate intent or force an offer on uncertain output.
+        logger.warning(f"[triage] JSON parse failed, degrading to SMALLTALK: {e}")
+        reply, intent = _truncate_reply(raw), "SMALLTALK"
 
     return (reply or _BOT_FALLBACK_REPLY), intent, sources
+
+
+# Stable phrase from _TG_MEETING_CTA, used to recognise that our most recent
+# message was an offer (so a later "אשמח" can be honoured even if the
+# offered_meeting state was lost — e.g. the 24h bot_state TTL expired).
+_OFFER_MARKER = "לחבר אתכם לארז"
+
+def _last_bot_message_offered(history: list) -> bool:
+    """True if the most recent assistant message in history was a meeting offer."""
+    for m in reversed(history or []):
+        if m.get("role") == "assistant":
+            return _OFFER_MARKER in (m.get("content") or "")
+    return False
 
 
 def _bot_classify_offer_response(question: str, history: list = None) -> tuple:
@@ -1831,12 +1864,16 @@ def rag_query(request: RagQueryRequest, http_request: Request):
 
 # ─── Lead capture ─────────────────────────────────────────────────────────────
 
-# Booking-intent detector — triggers the native contact-share keyboard after
-# the RAG reply so the steering feels conversational, not pushy.
+# Booking-intent detector — fires the deterministic funnel ONLY for an explicit
+# scheduling request. It deliberately excludes FAQ / price / consultation-info
+# vocabulary (מחיר, "כמה עולה", ייעוץ, consultation, session): those are
+# questions, not booking requests, and must flow to the triage engine to be
+# answered (and then pivoted to a CTA) — never short-circuited into the funnel.
+# "פגיש\w*" covers פגישה / פגישת / פגישות / לפגישה.
 _BOOKING_INTENT = re.compile(
-    r"(פגישה|ייעוץ|לקבוע|להירשם|להתייעץ|הרשמה|קביעת\s*תור|שיחה\s*אישית|"
-    r"לדבר\s*עם\s*ארז|ליצור\s*קשר|לפגוש|תור\b|מחיר|כמה\s*עולה|"
-    r"book|booking|appointment|consultation|session|schedule|sign\s*up|contact)",
+    r"(פגיש\w*|לקבוע|לתאם|קביעת\s*תור|להירשם|הרשמה|שיחה\s*אישית|"
+    r"לדבר\s*עם\s*ארז|ליצור\s*קשר|לפגוש|\bתור\b|"
+    r"book|booking|appointment|schedule|sign\s*up)",
     re.IGNORECASE,
 )
 
@@ -2841,6 +2878,25 @@ def telegram_webhook(
             except Exception as e:
                 logger.error(f"[leads] Regex capture failed: {e}", exc_info=True)
 
+        # ── SAFETY NET: agreement to an offer whose state was lost ─────────────
+        # Normally an offer arms 'offered_meeting', so the agreement turn is
+        # handled above. But the state can be lost — most commonly when the 24h
+        # bot_state TTL expires before the user replies. If we are NOT in a funnel
+        # state yet the user clearly affirms AND our last message was an offer,
+        # honour it and open the contact keyboard. This makes "אשמח" foolproof
+        # regardless of how (or how long after) the conversation flowed.
+        if (bot_state is None and not already_lead
+                and _is_affirmation(text) and _last_bot_message_offered(history)):
+            with get_db_conn() as conn:
+                _db_save_message(conn, session_id, "user", text)
+                _db_set_session_state(conn, session_id, _make_contact_state(0))
+                _db_touch_session(conn, session_id)
+                conn.commit()
+            _send_contact_keyboard(chat_id, _TG_OFFER_ACK)
+            _audit("telegram_offer_accepted_recovered", chat_id=chat_id_str,
+                   session_id=session_id)
+            return {"ok": True}
+
         # ── BOOKING INTENT: deterministic funnel entry (no RAG) ───────────────
         # A scheduling request is owned by the STATE MACHINE, not the LLM.
         # Previously PATH B ran RAG and THEN appended the scripted question, so
@@ -2885,9 +2941,10 @@ def telegram_webhook(
 
         reply, intent, sources = _bot_triage_reply(text, chunks, history=history)
 
-        # Enter the funnel only for a NEW lead; an existing lead just gets the
-        # brief validation (Erez already has their details).
-        make_offer = (intent == "OFFER_MEETING" and not already_lead)
+        # Offer is the default for anything SUBSTANTIVE (EMOTIONAL or FAQ) — only
+        # SMALLTALK stays out of the funnel — and only for a NEW lead (an existing
+        # lead just gets the brief reply; Erez already has their details).
+        make_offer = (intent in ("EMOTIONAL", "FAQ") and not already_lead)
         out = f"{reply}\n\n{_TG_MEETING_CTA}" if make_offer else reply
 
         with get_db_conn() as conn:
