@@ -1091,10 +1091,15 @@ export default function App() {
       const res = await fetch(`${API_BASE}/api/sessions`, {
         method: 'POST',
         headers: {
+          // No Authorization header — auth is handled by Vercel password
+          // protection on the frontend deployment. The NEXUS_API_KEY must be
+          // set to "" in the Vercel backend env vars after this change.
+          // See: https://vercel.com/docs/security/deployment-protection
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${import.meta.env.VITE_API_KEY || ''}`,
         },
-        body: JSON.stringify({ channel: 'web' }),
+        // Pass the frontend UUID as contact_id so the backend can enforce
+        // session ownership on GET /api/sessions/{id}/history (R4 fix).
+        body: JSON.stringify({ channel: 'web', contact_id: frontendSessionId }),
       })
       if (!res.ok) return null
       const data = await res.json()
@@ -1108,7 +1113,7 @@ export default function App() {
     } catch {
       return null   // non-fatal — chat works without persistence
     }
-  }, [])   // no deps: API_BASE and VITE_API_KEY are build-time constants
+  }, [])   // no deps: API_BASE is a build-time constant
 
   const handleShare = useCallback(() => {
     const url = window.location.href
@@ -1185,7 +1190,7 @@ export default function App() {
     // out cleanly instead of calling setStats / setDbStatus on stale state.
     const controller = new AbortController()
     fetch(`${API_BASE}/api/stats`, {
-      headers: { 'Authorization': `Bearer ${import.meta.env.VITE_API_KEY || ''}` },
+      headers: {},
       signal: controller.signal,
     })
       .then(r => r.json())
@@ -1329,7 +1334,12 @@ export default function App() {
     const controller = new AbortController()
 
     fetch(`${API_BASE}/api/sessions/${session.backendSessionId}/history`, {
-      headers: { 'Authorization': `Bearer ${import.meta.env.VITE_API_KEY || ''}` },
+      headers: {
+        // Echo the frontend session UUID so the backend can verify ownership
+        // of the session (R4: IDOR fix). Matches the contact_id stored at
+        // session creation time in createBackendSession above.
+        'X-Session-Contact': session.id,
+      },
       signal: controller.signal,
     })
       .then(r => r.ok ? r.json() : null)
@@ -1439,7 +1449,6 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${import.meta.env.VITE_API_KEY || ''}`
         },
         body: JSON.stringify(reqBody),
         signal: AbortSignal.timeout(38_000)
@@ -1523,7 +1532,6 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${import.meta.env.VITE_API_KEY || ''}`,
         },
         body: JSON.stringify({ sql }),
         signal: AbortSignal.timeout(30_000),
