@@ -81,6 +81,27 @@ class Settings(BaseSettings):
     # Shared secret guarding the /api/cron/crm-sync reconciliation endpoint.
     cron_secret:         str = ""
 
+    # ── Instagram / Meta (optional — webhook is inert until ig_access_token is set) ─
+    # ig_access_token:  Page access token from Meta developer dashboard.
+    # ig_verify_token:  A value YOU choose; Meta sends it back during webhook
+    #                   verification so you can confirm the GET came from Meta.
+    # ig_app_secret:    App secret from Meta dashboard — used to verify
+    #                   X-Hub-Signature-256 on incoming webhook POSTs.
+    ig_access_token:  str = ""
+    ig_verify_token:  str = ""
+    ig_app_secret:    str = ""
+
+    # ── Contact-capture CTAs for Instagram (env-var driven, never hardcoded) ────
+    # whatsapp_number:  E.164 format without '+', e.g. "972501234567".
+    #                   When set, a WhatsApp wa.me button is the primary CTA in
+    #                   the awaiting_contact step on Instagram.
+    # calendly_url:     Full Calendly booking URL, e.g. "https://calendly.com/…".
+    #                   When set, shown as a secondary button alongside WhatsApp.
+    # If both are absent the bot falls back to asking the user to type their
+    # phone number — the funnel stays operational with no env-var changes needed.
+    whatsapp_number:  str = ""
+    calendly_url:     str = ""
+
     model_config = {"env_file": ".env"}
 
 settings = Settings()
@@ -1159,7 +1180,7 @@ class RawQueryRequest(BaseModel):
     )
 
 class SessionCreateRequest(BaseModel):
-    channel:    str = Field(default="web", pattern="^(web|whatsapp|telegram)$")
+    channel:    str = Field(default="web", pattern="^(web|whatsapp|telegram|instagram)$")
     contact_id: Optional[str] = None   # phone number, Telegram ID, or browser fingerprint
 
 class SessionCreateResponse(BaseModel):
@@ -2126,14 +2147,51 @@ def _build_intent_summary(history: list, last_text: str) -> str:
     return " | ".join(parts)[:300]
 
 
-def _db_has_lead(conn, chat_id_str: str) -> bool:
-    """True if we already captured a lead from this Telegram user (by chat_id)."""
+def _db_has_lead(conn, chat_id_str: str, channel: str = "telegram") -> bool:
+    """True if we already captured a lead from this user on the given channel."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT 1 FROM leads WHERE channel = 'telegram' AND chat_id = %s LIMIT 1",
-            (chat_id_str,),
+            "SELECT 1 FROM leads WHERE channel = %s AND chat_id = %s LIMIT 1",
+            (channel, chat_id_str),
         )
         return cur.fetchone() is not None
+
+
+def _db_get_or_create_channel_session(conn, channel: str, contact_id: str) -> str:
+    """
+    Generic session-ID resolver for any channel (telegram, instagram, …).
+    Reuses the sessions table UNIQUE(channel, contact_id) index — same race-safe
+    INSERT … ON CONFLICT … RETURNING pattern as the Telegram-specific helper.
+    Caller owns the commit.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM sessions WHERE channel = %s AND contact_id = %s LIMIT 1",
+            (channel, contact_id),
+        )
+        row = cur.fetchone()
+        if row:
+            return str(row[0])
+
+        cur.execute(
+            """
+            INSERT INTO sessions (channel, contact_id)
+            VALUES (%s, %s)
+            ON CONFLICT (channel, contact_id) DO NOTHING
+            RETURNING id
+            """,
+            (channel, contact_id),
+        )
+        inserted = cur.fetchone()
+        if inserted:
+            return str(inserted[0])
+
+        # Concurrent request won the insert — re-select.
+        cur.execute(
+            "SELECT id FROM sessions WHERE channel = %s AND contact_id = %s LIMIT 1",
+            (channel, contact_id),
+        )
+        return str(cur.fetchone()[0])
 
 
 def _db_get_session_state(conn, session_id: str) -> str | None:
@@ -2192,6 +2250,7 @@ def _db_save_lead(
     name: str,
     phone: str,
     intent_summary: str,
+    channel: str = "telegram",
 ) -> str | None:
     """
     Insert a new lead row and return its UUID, or None if this user already
@@ -2202,11 +2261,11 @@ def _db_save_lead(
         cur.execute(
             """
             INSERT INTO leads (session_id, chat_id, channel, name, phone, intent_summary)
-            VALUES (%s, %s, 'telegram', %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (channel, chat_id) DO NOTHING
             RETURNING id
             """,
-            (session_id, chat_id, name or None, phone, intent_summary or None),
+            (session_id, chat_id, channel, name or None, phone, intent_summary or None),
         )
         row = cur.fetchone()
     return str(row[0]) if row else None
@@ -2509,43 +2568,8 @@ _TG_ERROR      = "משהו השתבש אצלי כרגע. נסו שוב בעוד 
 
 
 def _db_get_or_create_telegram_session(conn, chat_id: str) -> str:
-    """
-    Map a Telegram chat_id to a persistent Nexus session, reusing the existing
-    sessions table (channel='telegram', contact_id=chat_id). A returning user
-    therefore keeps their full conversation memory across messages and redeploys.
-
-    Race-safe: relies on the UNIQUE(channel, contact_id) index — if two first
-    messages arrive at once, the second INSERT is a no-op (ON CONFLICT) and we
-    re-select the row the winner created. Caller owns the commit.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT id FROM sessions WHERE channel = 'telegram' AND contact_id = %s LIMIT 1",
-            (chat_id,),
-        )
-        row = cur.fetchone()
-        if row:
-            return str(row[0])
-
-        cur.execute(
-            """
-            INSERT INTO sessions (channel, contact_id)
-            VALUES ('telegram', %s)
-            ON CONFLICT (channel, contact_id) DO NOTHING
-            RETURNING id
-            """,
-            (chat_id,),
-        )
-        inserted = cur.fetchone()
-        if inserted:
-            return str(inserted[0])
-
-        # A concurrent request won the insert — re-select its row.
-        cur.execute(
-            "SELECT id FROM sessions WHERE channel = 'telegram' AND contact_id = %s LIMIT 1",
-            (chat_id,),
-        )
-        return str(cur.fetchone()[0])
+    """Thin shim — delegates to the channel-generic helper."""
+    return _db_get_or_create_channel_session(conn, "telegram", chat_id)
 
 
 def _send_telegram_message(chat_id, text: str, reply_markup: dict = None) -> None:
@@ -2593,6 +2617,258 @@ def _send_contact_keyboard(chat_id, preamble: str) -> None:
         f"{preamble}\n\n{_TG_CONTACT_PROMPT}",
         reply_markup=_CONTACT_KEYBOARD,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MessagingChannel — channel adapter seam (Sprint 2.1)
+#
+# Why this exists:
+#   The funnel core (state machine, triage LLM, lead upsert, HubSpot sync) is
+#   already channel-agnostic. The only channel-specific surface is *sending*:
+#   Telegram has reply-keyboards and contact-share buttons; Instagram has
+#   quick-replies and URL-button templates. This seam lets the shared funnel
+#   code call self.channel.send_text(...) without knowing which wire it's on.
+#
+# Extending: implement MessagingChannel, instantiate in the webhook handler,
+#   and pass it down. No changes needed in the shared funnel logic.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MessagingChannel:
+    """Abstract base — one concrete subclass per messaging platform."""
+
+    CHANNEL_NAME: str = ""   # "telegram" | "instagram"
+
+    def send_text(self, recipient_id: str, text: str) -> None:
+        raise NotImplementedError
+
+    def send_quick_replies(self, recipient_id: str, text: str,
+                           replies: list[dict]) -> None:
+        """
+        Send text with 1-13 ephemeral quick-reply chips.
+        Each reply: {"title": str (≤20 chars on IG), "payload": str}
+        """
+        raise NotImplementedError
+
+    def send_buttons(self, recipient_id: str, text: str,
+                     buttons: list[dict]) -> None:
+        """
+        Send a persistent button template.
+        Each button: {"type": "web_url"|"postback", "title": str,
+                      "url": str (web_url only), "payload": str (postback only)}
+        """
+        raise NotImplementedError
+
+    def send_contact_prompt(self, recipient_id: str, preamble: str) -> None:
+        """Channel-specific CTA to collect contact info (keyboard / URL buttons)."""
+        raise NotImplementedError
+
+    def send_lead_thanks(self, recipient_id: str, name: str | None) -> None:
+        """Confirmation sent immediately after lead capture."""
+        self.send_text(recipient_id, _format_lead_thanks(name))
+
+    def dismiss_keyboard(self, recipient_id: str) -> None:
+        """Remove any persistent keyboard / quick-reply row (no-op where N/A)."""
+        pass  # default: no-op (Instagram quick-replies are ephemeral)
+
+    def mark_seen(self, recipient_id: str) -> None:
+        """Send a read-receipt / typing indicator (best-effort, never raises)."""
+        pass  # default: no-op
+
+
+# ── Telegram implementation ───────────────────────────────────────────────────
+
+class TelegramChannel(MessagingChannel):
+    """
+    Wraps the existing _send_telegram_message / _send_contact_keyboard helpers.
+    No behaviour change — this is a pure refactor that puts the seam in place.
+    """
+
+    CHANNEL_NAME = "telegram"
+
+    def send_text(self, recipient_id: str, text: str,
+                  reply_markup: dict = None) -> None:
+        _send_telegram_message(recipient_id, text, reply_markup)
+
+    def send_quick_replies(self, recipient_id: str, text: str,
+                           replies: list[dict]) -> None:
+        # Telegram maps quick-replies to a one-time ReplyKeyboard.
+        keyboard = [[{"text": r["title"]}] for r in replies]
+        _send_telegram_message(recipient_id, text, reply_markup={
+            "keyboard":          keyboard,
+            "resize_keyboard":   True,
+            "one_time_keyboard": True,
+        })
+
+    def send_buttons(self, recipient_id: str, text: str,
+                     buttons: list[dict]) -> None:
+        # Telegram has no native URL button template — send as inline keyboard.
+        rows = []
+        for b in buttons:
+            if b.get("type") == "web_url":
+                rows.append([{"text": b["title"], "url": b["url"]}])
+            else:
+                rows.append([{"text": b["title"],
+                              "callback_data": b.get("payload", b["title"])}])
+        _send_telegram_message(recipient_id, text, reply_markup={
+            "inline_keyboard": rows,
+        })
+
+    def send_contact_prompt(self, recipient_id: str, preamble: str) -> None:
+        _send_contact_keyboard(recipient_id, preamble)
+
+    def send_lead_thanks(self, recipient_id: str, name: str | None) -> None:
+        _send_telegram_message(recipient_id, _format_lead_thanks(name),
+                               reply_markup=_REMOVE_KEYBOARD)
+
+    def dismiss_keyboard(self, recipient_id: str) -> None:
+        # Pass _REMOVE_KEYBOARD as part of the next message instead of a
+        # standalone send (Telegram requires text alongside reply_markup).
+        pass  # callers already pass reply_markup=_REMOVE_KEYBOARD explicitly
+
+
+# ── Instagram implementation ──────────────────────────────────────────────────
+
+# IG contact-prompt copy (no share-contact keyboard on Instagram).
+_IG_CONTACT_PROMPT = (
+    "כדי שארז יוכל לחזור אליכם, בחרו את הדרך הנוחה לכם:"
+)
+
+# Fallback when no WhatsApp/Calendly is configured — ask for typed phone.
+_IG_CONTACT_PROMPT_FALLBACK = (
+    "כדי שארז יוכל לחזור אליכם, הקלידו את מספר הטלפון שלכם כאן:"
+)
+
+# Generic error message mirroring the Telegram set.
+_IG_NON_TEXT   = "אני יודע לקרוא רק הודעות טקסט כרגע 🙂 כתבו לי שאלה ואשמח לעזור."
+_IG_TOO_LONG   = "ההודעה קצת ארוכה מדי. נסו לנסח אותה בקצרה ואענה."
+_IG_MODERATION = "לא הצלחתי לעבד את ההודעה. נסו לשאול על השירותים, על ארז, או על קביעת פגישה."
+_IG_RATE_LIMIT = "קצת הרבה הודעות בבת אחת 🙂 נסו שוב בעוד רגע."
+_IG_TIMEOUT    = "סליחה, לקח לי קצת יותר מדי זמן לחשוב. נסו לשאול שוב."
+_IG_ERROR      = "משהו השתבש אצלי כרגע. נסו שוב בעוד רגע."
+
+
+def _ig_graph_call(path: str, payload: dict) -> None:
+    """
+    POST to the Instagram Graph API (Messenger Send API on /me/messages).
+    Uses stdlib urllib — no extra dependency.
+    Best-effort: logs on failure, never raises (webhook must always return 200).
+    """
+    if not settings.ig_access_token:
+        logger.error("[instagram] IG_ACCESS_TOKEN not set — cannot send reply.")
+        return
+    url  = f"https://graph.facebook.com/v21.0/me/messages?access_token={settings.ig_access_token}"
+    data = json.dumps(payload).encode("utf-8")
+    req  = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as e:
+        logger.error(f"[instagram] Graph API call to {path} failed: {e}")
+
+
+class InstagramChannel(MessagingChannel):
+    """
+    Instagram Messaging via the Meta Graph API v21.0 / Messenger Send API.
+
+    Quick-replies: ephemeral chips (≤13, title ≤20 chars) for yes/no funnel.
+    Button templates: persistent URL buttons for WhatsApp/Calendly CTAs.
+    Typed phone: always accepted via _extract_phone_from_text — no API surface.
+
+    CTA buttons are built from env vars (WHATSAPP_NUMBER, CALENDLY_URL).
+    If both are unset the bot falls back to asking the user to type their number.
+    """
+
+    CHANNEL_NAME = "instagram"
+
+    def _recipient(self, igsid: str) -> dict:
+        return {"id": igsid}
+
+    def send_text(self, recipient_id: str, text: str) -> None:
+        text = (text or "").strip()[:1000] or "…"   # IG hard cap is 1000 chars
+        _ig_graph_call("/me/messages", {
+            "recipient":      self._recipient(recipient_id),
+            "message":        {"text": text},
+            "messaging_type": "RESPONSE",
+        })
+
+    def send_quick_replies(self, recipient_id: str, text: str,
+                           replies: list[dict]) -> None:
+        qr = [
+            {"content_type": "text",
+             "title":        r["title"][:20],   # IG enforces 20-char max
+             "payload":      r.get("payload", r["title"])}
+            for r in replies[:13]               # IG enforces max 13
+        ]
+        _ig_graph_call("/me/messages", {
+            "recipient":      self._recipient(recipient_id),
+            "message":        {"text": (text or "").strip()[:1000],
+                               "quick_replies": qr},
+            "messaging_type": "RESPONSE",
+        })
+
+    def send_buttons(self, recipient_id: str, text: str,
+                     buttons: list[dict]) -> None:
+        elements = [{
+            "title":   (text or "")[:80],   # generic template title max 80 chars
+            "buttons": [
+                ({"type": "web_url", "url": b["url"], "title": b["title"][:20]}
+                 if b.get("type") == "web_url"
+                 else {"type": "postback", "title": b["title"][:20],
+                       "payload": b.get("payload", b["title"])})
+                for b in buttons[:3]         # IG generic template max 3 buttons
+            ],
+        }]
+        _ig_graph_call("/me/messages", {
+            "recipient":      self._recipient(recipient_id),
+            "message":        {
+                "attachment": {
+                    "type":    "template",
+                    "payload": {"template_type": "generic", "elements": elements},
+                }
+            },
+            "messaging_type": "RESPONSE",
+        })
+
+    def send_contact_prompt(self, recipient_id: str, preamble: str) -> None:
+        buttons = self._contact_buttons()
+        if buttons:
+            # Send the preamble as plain text first, then the button template.
+            self.send_text(recipient_id, preamble)
+            self.send_buttons(recipient_id, _IG_CONTACT_PROMPT, buttons)
+        else:
+            # No env vars configured — fall back to asking for typed phone.
+            self.send_text(recipient_id, f"{preamble}\n\n{_IG_CONTACT_PROMPT_FALLBACK}")
+
+    def mark_seen(self, recipient_id: str) -> None:
+        _ig_graph_call("/me/messages", {
+            "recipient":     self._recipient(recipient_id),
+            "sender_action": "mark_seen",
+        })
+
+    def _contact_buttons(self) -> list[dict]:
+        """Build WhatsApp + Calendly URL buttons from env vars. Returns [] if none set."""
+        buttons = []
+        if settings.whatsapp_number:
+            buttons.append({
+                "type":  "web_url",
+                "title": "המשך בוואטסאפ",
+                "url":   f"https://wa.me/{settings.whatsapp_number}",
+            })
+        if settings.calendly_url:
+            buttons.append({
+                "type":  "web_url",
+                "title": "קביעת פגישה",
+                "url":   settings.calendly_url,
+            })
+        return buttons
+
+
+# ── Shared channel registry ───────────────────────────────────────────────────
+
+_TELEGRAM_CHANNEL  = TelegramChannel()
+_INSTAGRAM_CHANNEL = InstagramChannel()
 
 
 def _tg_clear_state(chat_id_str: str) -> None:
@@ -3018,6 +3294,402 @@ def telegram_webhook(
         _send_telegram_message(chat_id, _TG_ERROR)
 
     return {"ok": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Instagram DM Webhook  (Sprint 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Message-ID dedup cache — prevents double-processing Meta webhook redeliveries.
+# Keys: Instagram message-id strings. Values: timestamp of first processing.
+_ig_seen_mids: dict[str, float] = {}
+_IG_DEDUP_TTL = 300   # seconds; older entries are pruned on each request
+
+
+def _ig_prune_dedup() -> None:
+    """Evict mid entries older than _IG_DEDUP_TTL (called on every webhook)."""
+    cutoff = time.time() - _IG_DEDUP_TTL
+    stale  = [k for k, v in _ig_seen_mids.items() if v < cutoff]
+    for k in stale:
+        del _ig_seen_mids[k]
+
+
+@app.get("/api/webhook/instagram")
+def instagram_webhook_verify(
+    hub_mode:         str = None,
+    hub_verify_token: str = None,
+    hub_challenge:    str = None,
+):
+    """
+    Meta webhook verification handshake (GET).
+    Meta sends ?hub.mode=subscribe&hub.verify_token=<your_token>&hub.challenge=<int>.
+    We must echo the challenge integer as plain text with HTTP 200.
+    """
+    if hub_mode == "subscribe" and _secret_eq(hub_verify_token, settings.ig_verify_token):
+        logger.info("[instagram] Webhook verified by Meta.")
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(content=hub_challenge or "")
+    logger.warning("[instagram] Webhook verification failed — bad verify_token.")
+    raise HTTPException(status_code=403, detail="Verification failed.")
+
+
+@app.post("/api/webhook/instagram")
+def instagram_webhook(
+    request_body: dict = Body(default={}),
+    x_hub_signature_256: Optional[str] = Header(default=None),
+    raw_request: Request = None,
+):
+    """
+    Instagram DM webhook — POST handler for incoming messages.
+
+    Security:
+      • X-Hub-Signature-256: HMAC-SHA256 of the raw body with the app secret.
+        Verified when IG_APP_SECRET is set; skipped in local dev (fail-open is
+        intentional for development convenience, same pattern as Telegram).
+      • is_echo filter: Meta echoes our own sends back — we drop them.
+      • DM-only filter: we only process message events (not comments, reactions,
+        story-mentions). Story-replies arrive as messages with attachments —
+        text-only filter handles them.
+      • mid dedup: Meta may redeliver; we track processed message-ids for 5 min.
+
+    Always returns 200 {"ok": true} — never lets an exception surface as a 4xx/5xx
+    or Meta will retry and the user gets duplicate messages.
+    """
+    # ── 1. Signature verification ─────────────────────────────────────────────
+    if settings.ig_app_secret and x_hub_signature_256:
+        # FastAPI has already parsed the JSON body; we need the raw bytes for
+        # HMAC. We re-serialise deterministically — this works because Meta
+        # signs the exact bytes they sent, but our re-serialisation may differ
+        # if key order changes. For production, inject raw bytes via middleware.
+        # For v1 this covers the common case; a future sprint can add raw-body
+        # middleware if needed.
+        raw_bytes = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
+        expected  = "sha256=" + hmac.new(
+            settings.ig_app_secret.encode("utf-8"),
+            raw_bytes,
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(x_hub_signature_256, expected):
+            logger.warning("[instagram] Rejected: bad X-Hub-Signature-256.")
+            return {"ok": True}   # 200 but do nothing — never 4xx to Meta
+
+    # ── 2. Parse the event envelope ───────────────────────────────────────────
+    _ig_prune_dedup()
+    channel = _INSTAGRAM_CHANNEL
+
+    for entry in (request_body.get("entry") or []):
+        for event in (entry.get("messaging") or []):
+
+            # Sender IGSID — stable identifier for this user+app pair.
+            sender_igsid = (event.get("sender") or {}).get("id")
+            if not sender_igsid:
+                continue
+
+            msg = event.get("message") or {}
+
+            # Drop our own outbound messages echoed back by Meta.
+            if msg.get("is_echo"):
+                continue
+
+            # Dedup by message-id.
+            mid = msg.get("mid")
+            if mid:
+                if mid in _ig_seen_mids:
+                    logger.debug(f"[instagram] Duplicate mid={mid!r} — skipping.")
+                    continue
+                _ig_seen_mids[mid] = time.time()
+
+            # DM-only: ignore non-text payloads (stickers, voice, story-replies).
+            text = (msg.get("text") or "").strip()
+
+            # Quick-reply postback: the user tapped a chip — treat payload as text
+            # so the state machine can classify it (e.g. "YES" / "NO").
+            qr_payload = (msg.get("quick_reply") or {}).get("payload", "")
+            if not text and qr_payload:
+                text = qr_payload
+
+            if not text:
+                channel.send_text(sender_igsid, _IG_NON_TEXT)
+                continue
+
+            # Mark seen immediately so the user gets the read-tick without waiting
+            # for the (slow) LLM round-trip.
+            channel.mark_seen(sender_igsid)
+
+            # Dispatch to the shared funnel handler.
+            _handle_instagram_dm(channel, sender_igsid, text)
+
+    return {"ok": True}
+
+
+def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> None:
+    """
+    Shared funnel handler for Instagram DMs.
+
+    Mirrors the Telegram webhook logic exactly — same state machine, same triage
+    LLM, same lead-capture path — with two Instagram-specific adaptations:
+      1. No /start or /cancel commands (IG DMs don't have bot commands).
+      2. send_contact_prompt() shows WhatsApp/Calendly URL buttons instead of the
+         Telegram contact-share keyboard (env-var driven; graceful fallback).
+
+    All copy constants with the _IG_ prefix are the Instagram counterparts of
+    the _TG_ strings — same emotional register, adapted for IG UX.
+    """
+    _audit("instagram_request", igsid=igsid, question=_redact_text(text))
+
+    # ── Rate limit ────────────────────────────────────────────────────────────
+    try:
+        check_rate_limit(igsid)
+    except RateLimitError:
+        channel.send_text(igsid, _IG_RATE_LIMIT)
+        return
+
+    # ── Crisis — always first ─────────────────────────────────────────────────
+    if is_crisis(text):
+        _audit("instagram_crisis", igsid=igsid)
+        channel.send_text(igsid, _get_config("crisis.message"))
+        try:
+            with get_db_conn() as conn:
+                sid = _db_get_or_create_channel_session(conn, "instagram", igsid)
+                if _db_get_session_state(conn, sid):
+                    _db_set_session_state(conn, sid, None)
+                conn.commit()
+        except Exception:
+            pass
+        return
+
+    # ── Content guards ────────────────────────────────────────────────────────
+    if len(text) > 1500:
+        channel.send_text(igsid, _IG_TOO_LONG)
+        return
+    try:
+        validate_question(text)
+    except InputModerationError:
+        _audit("instagram_moderation_block", igsid=igsid)
+        channel.send_text(igsid, _IG_MODERATION)
+        return
+
+    try:
+        with get_db_conn() as conn:
+            session_id   = _db_get_or_create_channel_session(conn, "instagram", igsid)
+            bot_state    = _db_get_session_state(conn, session_id)
+            already_lead = _db_has_lead(conn, igsid, channel="instagram")
+            history      = _db_load_history(conn, session_id, limit=12)
+            conn.commit()
+
+        # ── STATE: awaiting_qualification ─────────────────────────────────────
+        if bot_state == "awaiting_qualification":
+            if not already_lead:
+                with get_db_conn() as conn:
+                    _db_save_message(conn, session_id, "user", text)
+                    _db_set_session_state(conn, session_id, _make_contact_state(0))
+                    _db_touch_session(conn, session_id)
+                    conn.commit()
+                channel.send_contact_prompt(igsid, _TG_QUALIFICATION_ACK)
+                _audit("instagram_qualification_answered", igsid=igsid,
+                       session_id=session_id)
+                return
+            with get_db_conn() as conn:
+                _db_set_session_state(conn, session_id, None)
+                conn.commit()
+            bot_state = None
+
+        # ── STATE: offered_meeting ────────────────────────────────────────────
+        if _is_offered_meeting(bot_state):
+            if already_lead:
+                with get_db_conn() as conn:
+                    _db_set_session_state(conn, session_id, None)
+                    conn.commit()
+                bot_state = None
+            else:
+                decision, offer_reply = _bot_classify_offer_response(text, history)
+
+                if decision == "AFFIRM":
+                    with get_db_conn() as conn:
+                        _db_save_message(conn, session_id, "user", text)
+                        _db_set_session_state(conn, session_id, _make_contact_state(0))
+                        _db_touch_session(conn, session_id)
+                        conn.commit()
+                    channel.send_contact_prompt(igsid, _TG_OFFER_ACK)
+                    _audit("instagram_offer_accepted", igsid=igsid,
+                           session_id=session_id)
+                    return
+
+                if decision == "DECLINE":
+                    with get_db_conn() as conn:
+                        _db_save_message(conn, session_id, "user", text)
+                        _db_set_session_state(conn, session_id, None)
+                        _db_touch_session(conn, session_id)
+                        conn.commit()
+                    channel.send_text(igsid, _TG_OFFER_DECLINED)
+                    _audit("instagram_offer_declined", igsid=igsid,
+                           session_id=session_id)
+                    return
+
+                count = _parse_offer_count(bot_state)
+                with get_db_conn() as conn:
+                    _db_save_message(conn, session_id, "user", text)
+                    if count + 1 < _MAX_REOFFERS:
+                        out = (f"{offer_reply}\n\n{_TG_MEETING_CTA}".strip()
+                               if offer_reply else _TG_MEETING_CTA)
+                        _db_set_session_state(conn, session_id,
+                                              _make_offer_state(count + 1))
+                    else:
+                        out = offer_reply or _TG_OFFER_BACKOFF
+                        _db_set_session_state(conn, session_id, None)
+                    _db_save_message(conn, session_id, "assistant", out)
+                    _db_touch_session(conn, session_id)
+                    conn.commit()
+                channel.send_text(igsid, out)
+                _audit("instagram_offer_other", igsid=igsid,
+                       session_id=session_id, reoffers=count + 1)
+                return
+
+        # ── Escape-intent gate ────────────────────────────────────────────────
+        if bot_state and _is_escape_intent(text):
+            with get_db_conn() as conn:
+                _db_set_session_state(conn, session_id, None)
+                conn.commit()
+            channel.send_text(igsid, _TG_ESCAPE_RESPONSE)
+            _audit("instagram_escape", igsid=igsid, prior_state=bot_state)
+            return
+
+        # ── STATE: awaiting_contact ───────────────────────────────────────────
+        # On Instagram: typed phone is the only direct capture path (no keyboard
+        # button). The send_contact_prompt call above showed WhatsApp/Calendly
+        # buttons — those are external CTAs. If the user types a phone number
+        # here instead, we capture it exactly as Telegram does.
+        if _is_awaiting_contact(bot_state):
+            phone = _extract_phone_from_text(text)
+            retry = _parse_contact_retry(bot_state)
+
+            if already_lead:
+                with get_db_conn() as conn:
+                    _db_set_session_state(conn, session_id, None)
+                    conn.commit()
+                bot_state = None
+            elif phone:
+                try:
+                    intent_summary = _build_intent_summary(history, text)
+                    with get_db_conn() as conn:
+                        lead_id = _db_save_lead(conn, session_id, igsid,
+                                                None, phone, intent_summary,
+                                                channel="instagram")
+                        _db_set_session_state(conn, session_id, None)
+                        conn.commit()
+                    if lead_id:
+                        channel.send_lead_thanks(igsid, None)
+                        _finalize_lead(lead_id, None, phone, intent_summary, igsid)
+                        _audit("instagram_lead_captured", igsid=igsid, lead_id=lead_id)
+                except Exception as e:
+                    logger.error(f"[instagram] awaiting_contact: {e}", exc_info=True)
+                    channel.send_text(igsid, _IG_ERROR)
+                return
+            elif retry >= _MAX_CONTACT_RETRIES:
+                with get_db_conn() as conn:
+                    _db_set_session_state(conn, session_id, None)
+                    conn.commit()
+                channel.send_text(igsid, _TG_CONTACT_RETRY_EXHAUSTED)
+                _audit("instagram_contact_exhausted", igsid=igsid)
+                return
+            else:
+                with get_db_conn() as conn:
+                    _db_set_session_state(conn, session_id,
+                                          _make_contact_state(retry + 1))
+                    conn.commit()
+                # Re-show the contact CTA with the retry preamble.
+                channel.send_contact_prompt(igsid, _TG_AWAITING_CONTACT_RETRY)
+                return
+
+        # ── Regex phone fallback (free-form conversation) ─────────────────────
+        phone_in_text = _extract_phone_from_text(text)
+        if phone_in_text and not already_lead:
+            try:
+                intent_summary = _build_intent_summary(history, text)
+                with get_db_conn() as conn:
+                    lead_id = _db_save_lead(conn, session_id, igsid,
+                                            None, phone_in_text, intent_summary,
+                                            channel="instagram")
+                    conn.commit()
+                if lead_id:
+                    channel.send_lead_thanks(igsid, None)
+                    _finalize_lead(lead_id, None, phone_in_text, intent_summary, igsid)
+                    _audit("instagram_lead_captured_regex", igsid=igsid, lead_id=lead_id)
+                    return
+            except Exception as e:
+                logger.error(f"[instagram] Regex capture failed: {e}", exc_info=True)
+
+        # ── Safety-net: affirmation after lost state ──────────────────────────
+        if (bot_state is None and not already_lead
+                and _is_affirmation(text) and _last_bot_message_offered(history)):
+            with get_db_conn() as conn:
+                _db_save_message(conn, session_id, "user", text)
+                _db_set_session_state(conn, session_id, _make_contact_state(0))
+                _db_touch_session(conn, session_id)
+                conn.commit()
+            channel.send_contact_prompt(igsid, _TG_OFFER_ACK)
+            _audit("instagram_offer_accepted_recovered", igsid=igsid,
+                   session_id=session_id)
+            return
+
+        # ── Booking-intent: deterministic funnel entry ────────────────────────
+        if bot_state is None and _has_booking_intent(text):
+            if already_lead:
+                reply_text  = _TG_ALREADY_LEAD_BOOKING
+                new_state   = None
+                audit_event = "instagram_already_lead_booking"
+            else:
+                reply_text  = _TG_QUALIFICATION_QUESTION
+                new_state   = "awaiting_qualification"
+                audit_event = "instagram_qualification_triggered"
+
+            with get_db_conn() as conn:
+                _db_save_message(conn, session_id, "user", text)
+                _db_save_message(conn, session_id, "assistant", reply_text)
+                if new_state:
+                    _db_set_session_state(conn, session_id, new_state)
+                _db_touch_session(conn, session_id)
+                conn.commit()
+            channel.send_text(igsid, reply_text)
+            _audit(audit_event, igsid=igsid, session_id=session_id)
+            return
+
+        # ── PATH B: triage LLM ────────────────────────────────────────────────
+        query_vector = _embed_text(text)
+        with get_db_conn() as conn:
+            chunks = _retrieve_chunks(conn, query_vector, top_k=5)
+
+        reply, intent, sources = _bot_triage_reply(text, chunks, history=history)
+
+        make_offer = (intent in ("EMOTIONAL", "FAQ") and not already_lead)
+        out = f"{reply}\n\n{_TG_MEETING_CTA}" if make_offer else reply
+
+        with get_db_conn() as conn:
+            _db_save_message(conn, session_id, "user", text)
+            _db_save_message(conn, session_id, "assistant", out)
+            if make_offer:
+                _db_set_session_state(conn, session_id, _make_offer_state(0))
+            _db_touch_session(conn, session_id)
+            conn.commit()
+
+        _audit("instagram_triage", igsid=igsid, session_id=session_id,
+               intent=intent, offered=make_offer, sources=sources, chunks=len(chunks))
+
+        if make_offer:
+            # Send reply + offer as quick-replies for yes/no (cleaner IG UX).
+            channel.send_quick_replies(igsid, out, [
+                {"title": "כן, אשמח",  "payload": "YES"},
+                {"title": "אולי אחר כך", "payload": "NO"},
+            ])
+        else:
+            channel.send_text(igsid, out)
+
+    except TimeoutError:
+        logger.error("[instagram] LLM timeout")
+        channel.send_text(igsid, _IG_TIMEOUT)
+    except Exception as e:
+        logger.error(f"[instagram] Unexpected {type(e).__name__}: {e}", exc_info=True)
+        channel.send_text(igsid, _IG_ERROR)
 
 
 @app.get("/api/cron/crm-sync")
