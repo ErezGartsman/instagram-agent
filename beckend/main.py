@@ -660,13 +660,40 @@ def execute_query(conn, sql: str) -> tuple:
     safe_sql = f"SELECT * FROM ({sql}) AS _q LIMIT {settings.max_result_rows}"
     with conn.cursor() as cur:
         cur.execute("SAVEPOINT _ro_guard")
+        # Layer 1 — write-blocking: Postgres itself rejects any DML even if the
+        # regex blocklist were bypassed (e.g. via string-concatenation tricks).
         cur.execute("SET LOCAL transaction_read_only = on")
+        # Layer 2 — schema restriction: switch to the analytics-only reader role
+        # so raw user SQL can only touch posts/comments/likers/followers and cannot
+        # reach leads, messages, sessions, knowledge_base, or auth.* tables.
+        # SET LOCAL ROLE is reverted by ROLLBACK TO SAVEPOINT, so app writes in
+        # the same connection still run as the original (full-access) role.
+        # Requires the nexus_reader role to exist — see sql/sprint1e_nexus_reader.sql.
+        #
+        # FAIL-CLOSED (Sprint 1E policy): if we cannot drop to nexus_reader we MUST
+        # NOT fall back to running user SQL as the full-privilege role. A failed
+        # statement aborts the sub-transaction, so we ROLLBACK TO / RELEASE the
+        # savepoint to restore the connection to a clean state (leaving it usable
+        # for the pool), then raise — the query is blocked entirely.
+        try:
+            cur.execute("SET LOCAL ROLE nexus_reader")
+        except Exception as e:
+            cur.execute("ROLLBACK TO SAVEPOINT _ro_guard")
+            cur.execute("RELEASE SAVEPOINT _ro_guard")
+            logger.error("[db] could not assume nexus_reader role — BLOCKING raw query "
+                         "(fail-closed). Run sql/sprint1e_nexus_reader.sql in Supabase. "
+                         "err=%s", e)
+            raise HTTPException(
+                status_code=500,
+                detail="Query blocked: schema-restriction role unavailable.",
+            ) from e
         try:
             cur.execute(safe_sql)
             columns = [desc[0] for desc in cur.description]
             rows    = cur.fetchall()
         finally:
-            # Undo SET LOCAL (restores read_only = off) without losing fetched rows.
+            # ROLLBACK TO restores both transaction_read_only AND the role to their
+            # pre-savepoint values. RELEASE cleans up the savepoint record.
             cur.execute("ROLLBACK TO SAVEPOINT _ro_guard")
             cur.execute("RELEASE SAVEPOINT _ro_guard")
     return rows, columns
@@ -1104,7 +1131,9 @@ class HistoryMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     message:    str
-    history:    list[HistoryMessage] = []  # in-memory history (backward-compat)
+    # max_length guards against a history-flood attack that would stuff an
+    # enormous prompt into the Gemini token budget and exhaust API quota.
+    history:    list[HistoryMessage] = Field(default=[], max_length=20)
     session_id: Optional[str] = None       # if set, DB history is used instead
 
 class ChatResponse(BaseModel):
@@ -1386,22 +1415,43 @@ def create_session(request: SessionCreateRequest):
 
 
 @app.get("/api/sessions/{session_id}/history", dependencies=[Depends(require_auth)])
-def get_session_history(session_id: str):
+def get_session_history(
+    session_id: str,
+    x_session_contact: Optional[str] = Header(default=None),
+):
     """
     Load the full message history for a session.
 
     Used by the frontend on page-load to restore a previous conversation from
     localStorage — the frontend supplies the stored session_id and receives
     back all turns so the chat UI can be reconstructed exactly.
+
+    Ownership guard (R4): web sessions store the frontend's own UUID as
+    contact_id at creation time. Callers must echo it back in the
+    X-Session-Contact header, or the request is rejected with 403.
+    Sessions without a contact_id (Telegram sessions, legacy web sessions
+    created before this guard) are still accessible — backward compatible.
     """
     try:
         with get_db_conn() as conn:
-            # Verify the session exists before loading messages.
+            # Verify the session exists and load the ownership token.
             with conn.cursor() as cur:
-                cur.execute("SELECT channel FROM sessions WHERE id = %s", (session_id,))
+                cur.execute(
+                    "SELECT channel, contact_id FROM sessions WHERE id = %s",
+                    (session_id,),
+                )
                 row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Session not found.")
+            channel, contact_id = row[0], row[1]
+            # Ownership validation: web sessions with a stored contact_id require
+            # the caller to prove they hold that same UUID. hmac.compare_digest
+            # prevents timing side-channels on the comparison.
+            if channel == "web" and contact_id:
+                if not x_session_contact or not hmac.compare_digest(
+                    x_session_contact, contact_id
+                ):
+                    raise HTTPException(status_code=403, detail="Session access denied.")
             messages = _db_load_history(conn, session_id, limit=200)
 
         return {
@@ -2982,7 +3032,14 @@ def cron_crm_sync(
 
     Auth: guarded by CRON_SECRET. Vercel Cron sends it as
     'Authorization: Bearer <secret>'; we also accept an X-Cron-Secret header for
-    manual curl. When CRON_SECRET is unset the guard is skipped (local dev only).
+    manual curl.
+
+    FAIL-CLOSED: on a Vercel deployment (VERCEL env var is set) the endpoint
+    requires CRON_SECRET to be configured. If it is not set in production the
+    endpoint returns 503 rather than silently allowing unauthenticated access
+    (which could be used to spam HubSpot or exhaust the DB connection pool).
+    Locally (no VERCEL env var) the guard is skipped for development convenience.
+
     Batched (LIMIT 50) so a backlog can't exceed the function time budget.
     """
     if settings.cron_secret:
@@ -2992,6 +3049,12 @@ def cron_crm_sync(
         if not (_secret_eq(bearer, settings.cron_secret)
                 or _secret_eq(x_cron_secret, settings.cron_secret)):
             raise HTTPException(status_code=401, detail="Invalid cron secret.")
+    elif os.environ.get("VERCEL"):
+        # Production but CRON_SECRET not set — fail closed rather than allow
+        # unauthenticated invocations that waste HubSpot quota / DB connections.
+        logger.error("[cron] CRON_SECRET is not set — endpoint disabled in production. "
+                     "Set CRON_SECRET in Vercel env vars.")
+        raise HTTPException(status_code=503, detail="Cron endpoint not configured.")
 
     if not _crm_enabled():
         return {"status": "skipped", "reason": "CRM not configured"}
@@ -3073,6 +3136,11 @@ def raw_query(request: RawQueryRequest, http_request: Request):
             "row_count":    n,
             "execution_ms": execution_ms,
         }
+
+    except HTTPException:
+        # Fail-closed signals (e.g. nexus_reader role unavailable) must surface
+        # as a real HTTP error, not be downgraded to a 200 JSON error body.
+        raise
 
     except psycopg2.Error as e:
         logger.error(f"[raw_query] PostgreSQL error: {e}")
