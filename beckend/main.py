@@ -2755,6 +2755,27 @@ _IG_RATE_LIMIT = "קצת הרבה הודעות בבת אחת 🙂 נסו שוב 
 _IG_TIMEOUT    = "סליחה, לקח לי קצת יותר מדי זמן לחשוב. נסו לשאול שוב."
 _IG_ERROR      = "משהו השתבש אצלי כרגע. נסו שוב בעוד רגע."
 
+# ── Icebreaker flow copy (first person — Erez operates solo, there is no "team") ─
+# Exact warm reply sent the moment the configured Icebreaker is tapped. It asks
+# directly for the prospect's WhatsApp number; their next message is captured as
+# the lead (the handler jumps straight to awaiting_contact, no qualification step).
+_IG_ICEBREAKER_REPLY = (
+    "היי, איזה כיף שפנית! אשמח לתת לך את כל הפרטים. מה מספר הווטסאפ שלך? "
+    "אשלח לך לשם הודעה בהקדם ונראה יחד איך אפשר לעזור. 🙂"
+)
+# Gentle re-ask when the user is in awaiting_contact but didn't send a number.
+_IG_CONTACT_RETRY = (
+    "אשמח למספר הווטסאפ שלך כדי שאשלח לך הודעה ונתקדם משם 🙂"
+)
+# First-person confirmation once the number is captured.
+_IG_LEAD_THANKS = (
+    "תודה רבה! 🙏 קיבלתי, ואשלח לך הודעה בווטסאפ בהקדם. מחכה לדבר! 🙂"
+)
+# First-person ack for a returning lead who taps the Icebreaker again.
+_IG_ALREADY_LEAD_REPLY = (
+    "הפרטים שלך כבר אצלי 🙏 אחזור אליך בהקדם בווטסאפ. 🙂"
+)
+
 
 def _ig_graph_call(path: str, payload: dict) -> None:
     """
@@ -2853,6 +2874,10 @@ class InstagramChannel(MessagingChannel):
         else:
             # No env vars configured — fall back to asking for typed phone.
             self.send_text(recipient_id, f"{preamble}\n\n{_IG_CONTACT_PROMPT_FALLBACK}")
+
+    def send_lead_thanks(self, recipient_id: str, name: str | None = None) -> None:
+        # First-person confirmation (no "team"); overrides the base/Telegram copy.
+        self.send_text(recipient_id, _IG_LEAD_THANKS)
 
     def mark_seen(self, recipient_id: str) -> None:
         _ig_graph_call("/me/messages", {
@@ -3679,8 +3704,9 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                     _db_set_session_state(conn, session_id,
                                           _make_contact_state(retry + 1))
                     conn.commit()
-                # Re-show the contact CTA with the retry preamble.
-                channel.send_contact_prompt(igsid, _TG_AWAITING_CONTACT_RETRY)
+                # Re-ask for the WhatsApp number in plain text (this flow collects
+                # the prospect's number; it does not hand out a wa.me link).
+                channel.send_text(igsid, _IG_CONTACT_RETRY)
                 return
 
         # ─────────────────────────────────────────────────────────────────────
@@ -3693,12 +3719,16 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
         # ─────────────────────────────────────────────────────────────────────
         if _ig_is_icebreaker(text):
             if already_lead:
-                reply_text  = _TG_ALREADY_LEAD_BOOKING
+                reply_text  = _IG_ALREADY_LEAD_REPLY
                 new_state   = None
-                audit_event = "instagram_already_lead_booking"
+                audit_event = "instagram_already_lead_icebreaker"
             else:
-                reply_text  = _TG_QUALIFICATION_QUESTION
-                new_state   = "awaiting_qualification"
+                # Warm first-person reply that asks directly for the WhatsApp
+                # number, and jump STRAIGHT to awaiting_contact — so the user's
+                # next message (their number) is captured as a lead with no
+                # intermediate qualification step.
+                reply_text  = _IG_ICEBREAKER_REPLY
+                new_state   = _make_contact_state(0)
                 audit_event = "instagram_icebreaker_triggered"
             with get_db_conn() as conn:
                 _db_save_message(conn, session_id, "user", text)

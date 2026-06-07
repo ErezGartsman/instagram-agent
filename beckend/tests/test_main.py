@@ -1959,6 +1959,22 @@ class TestInstagramIcebreakerGate:
         assert main._ig_is_icebreaker("anything") is False
         assert main._ig_icebreaker_set() == set()
 
+    def test_production_icebreaker_string_matches(self, monkeypatch):
+        # The exact Icebreaker configured in Instagram must match.
+        production = "היי ארז, אשמח לפרטים על שיחת ייעוץ איתך"
+        monkeypatch.setattr(main.settings, "ig_icebreakers", production)
+        assert main._ig_is_icebreaker(production) is True
+
+    def test_icebreaker_reply_is_first_person_and_asks_for_whatsapp(self):
+        # Lock the exact warm reply; it must ask for the WhatsApp number and use
+        # first person (no "team" / no "צוות").
+        assert main._IG_ICEBREAKER_REPLY == (
+            "היי, איזה כיף שפנית! אשמח לתת לך את כל הפרטים. מה מספר הווטסאפ שלך? "
+            "אשלח לך לשם הודעה בהקדם ונראה יחד איך אפשר לעזור. 🙂"
+        )
+        assert "צוות" not in main._IG_ICEBREAKER_REPLY      # no "team"
+        assert "ווטסאפ" in main._IG_ICEBREAKER_REPLY        # asks for WhatsApp
+
 
 class TestInstagramStoryDrop:
     """Story replies and story mentions must be detected for an instant drop."""
