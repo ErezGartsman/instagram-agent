@@ -30,6 +30,7 @@ import psycopg2.pool
 from google import genai
 from google.genai import types as genai_types
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -3331,51 +3332,76 @@ def instagram_webhook_verify(
     raise HTTPException(status_code=403, detail="Verification failed.")
 
 
+def _ig_verify_signature(raw: bytes, header: Optional[str]) -> bool:
+    """
+    Verify Meta's X-Hub-Signature-256 against the RAW request body.
+
+    Meta computes the HMAC over the EXACT bytes it sent. We must hash those same
+    bytes — never a re-serialised copy of the parsed JSON, whose key order,
+    spacing, and unicode escaping can differ and break the comparison even when
+    the secret is correct. hmac.compare_digest avoids a timing side-channel.
+    """
+    if not header:
+        return False
+    expected = "sha256=" + hmac.new(
+        settings.ig_app_secret.encode("utf-8"), raw, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(header, expected)
+
+
 @app.post("/api/webhook/instagram")
-def instagram_webhook(
-    request_body: dict = Body(default={}),
+async def instagram_webhook(
+    request: Request,
     x_hub_signature_256: Optional[str] = Header(default=None),
-    raw_request: Request = None,
 ):
     """
     Instagram DM webhook — POST handler for incoming messages.
 
-    Security:
-      • X-Hub-Signature-256: HMAC-SHA256 of the raw body with the app secret.
-        Verified when IG_APP_SECRET is set; skipped in local dev (fail-open is
-        intentional for development convenience, same pattern as Telegram).
-      • is_echo filter: Meta echoes our own sends back — we drop them.
-      • DM-only filter: we only process message events (not comments, reactions,
-        story-mentions). Story-replies arrive as messages with attachments —
-        text-only filter handles them.
-      • mid dedup: Meta may redeliver; we track processed message-ids for 5 min.
+    async by design: we must read the RAW request body (await request.body())
+    to verify Meta's HMAC against the exact bytes it signed. The heavy, blocking
+    processing (DB / embedding / LLM / urllib) is then offloaded to a worker
+    thread via run_in_threadpool so it never stalls the event loop.
 
-    Always returns 200 {"ok": true} — never lets an exception surface as a 4xx/5xx
-    or Meta will retry and the user gets duplicate messages.
+    Security:
+      • X-Hub-Signature-256: HMAC-SHA256 of the RAW body with IG_APP_SECRET.
+        Verified when IG_APP_SECRET is set; skipped in local dev (fail-open,
+        same pattern as the Telegram webhook).
+      • is_echo filter: Meta echoes our own sends back — we drop them.
+      • DM-only filter: non-text payloads (stickers, voice, story-replies) ignored.
+      • mid dedup: Meta may redeliver; processed message-ids tracked for 5 min.
+
+    Always returns 200 {"ok": true} — never surfaces a 4xx/5xx or Meta retries
+    and the user gets duplicate messages.
     """
-    # ── 1. Signature verification ─────────────────────────────────────────────
-    if settings.ig_app_secret and x_hub_signature_256:
-        # FastAPI has already parsed the JSON body; we need the raw bytes for
-        # HMAC. We re-serialise deterministically — this works because Meta
-        # signs the exact bytes they sent, but our re-serialisation may differ
-        # if key order changes. For production, inject raw bytes via middleware.
-        # For v1 this covers the common case; a future sprint can add raw-body
-        # middleware if needed.
-        raw_bytes = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
-        expected  = "sha256=" + hmac.new(
-            settings.ig_app_secret.encode("utf-8"),
-            raw_bytes,
-            hashlib.sha256,
-        ).hexdigest()
-        if not hmac.compare_digest(x_hub_signature_256, expected):
+    raw = await request.body()
+
+    # ── 1. Signature verification (against the RAW bytes Meta signed) ──────────
+    if settings.ig_app_secret:
+        if not _ig_verify_signature(raw, x_hub_signature_256):
             logger.warning("[instagram] Rejected: bad X-Hub-Signature-256.")
             return {"ok": True}   # 200 but do nothing — never 4xx to Meta
 
-    # ── 2. Parse the event envelope ───────────────────────────────────────────
+    # ── 2. Parse JSON and offload processing to a worker thread ────────────────
+    try:
+        body = json.loads(raw or b"{}")
+    except Exception:
+        logger.warning("[instagram] Could not parse webhook body as JSON.")
+        return {"ok": True}
+
+    await run_in_threadpool(_process_instagram_events, body)
+    return {"ok": True}
+
+
+def _process_instagram_events(body: dict) -> None:
+    """
+    Parse the webhook envelope and dispatch each DM to the funnel handler.
+    Runs in a worker thread (offloaded from the async endpoint) so its blocking
+    DB / LLM / urllib calls never block the event loop.
+    """
     _ig_prune_dedup()
     channel = _INSTAGRAM_CHANNEL
 
-    for entry in (request_body.get("entry") or []):
+    for entry in (body.get("entry") or []):
         for event in (entry.get("messaging") or []):
 
             # Sender IGSID — stable identifier for this user+app pair.
@@ -3416,8 +3442,6 @@ def instagram_webhook(
 
             # Dispatch to the shared funnel handler.
             _handle_instagram_dm(channel, sender_igsid, text)
-
-    return {"ok": True}
 
 
 def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> None:
