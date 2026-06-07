@@ -111,6 +111,16 @@ class Settings(BaseSettings):
     #   account. When empty, the bot only ever continues active funnel turns.
     ig_icebreakers:   str = ""
 
+    # ig_trigger_words: a '|'-separated list of trigger phrases for EXISTING
+    #   followers (who never see the native Icebreaker button, which only shows
+    #   on brand-new threads). A direct DM that CONTAINS any of these (case-
+    #   insensitive substring) enters the same funnel, e.g.:
+    #       IG_TRIGGER_WORDS=ייעוץ|רוצה לקבוע|אשמח לפרטים
+    #   Substring (not exact) so Hebrew prefixes match ("ייעוץ" → "לייעוץ").
+    #   Still ZERO-LLM and deterministic; story replies are hard-dropped before
+    #   this ever runs, so it can never fire on a vulnerable story share.
+    ig_trigger_words: str = ""
+
     model_config = {"env_file": ".env"}
 
 settings = Settings()
@@ -3854,6 +3864,28 @@ def _ig_is_icebreaker(text: str) -> bool:
     return (text or "").strip() in _ig_icebreaker_set()
 
 
+def _ig_trigger_set() -> set[str]:
+    """Configured trigger phrases (lowercased, trimmed) from IG_TRIGGER_WORDS."""
+    return {
+        part.strip().lower()
+        for part in (settings.ig_trigger_words or "").split("|")
+        if part.strip()
+    }
+
+
+def _ig_matches_trigger(text: str) -> bool:
+    """
+    True if any configured trigger phrase appears as a SUBSTRING of the message
+    (case-insensitive). Substring — not exact / word-boundary — is deliberate:
+    Hebrew attaches prefixes (ל-, ב-, ה-) directly to words, so "ייעוץ" must also
+    match "לייעוץ" / "הייעוץ". This is how EXISTING followers (who never see the
+    native Icebreaker button) enter the funnel. Still ZERO-LLM; story replies are
+    hard-dropped before this runs, so it can never fire on a vulnerable share.
+    """
+    t = (text or "").lower()
+    return any(trigger in t for trigger in _ig_trigger_set())
+
+
 def _ig_is_story_message(msg: dict) -> bool:
     """
     True if this message is a story reply or story mention — which the bot must
@@ -3879,8 +3911,10 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
 
     Engagement is NEVER decided by an LLM. A message is acted on only when:
       1. it is an active funnel turn (awaiting_qualification / offered_meeting /
-         awaiting_contact for THIS user), or
-      2. it exactly matches a configured Instagram Icebreaker (cold path).
+         awaiting_contact / awaiting_context for THIS user), or
+      2. it exactly matches a configured Instagram Icebreaker (new threads), or
+      3. it contains a configured trigger phrase (existing followers — who never
+         see the native Icebreaker button).
     Everything else is dropped in total silence. Story replies/mentions are
     dropped even earlier, in _process_instagram_events.
 
@@ -4093,12 +4127,18 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
         # ─────────────────────────────────────────────────────────────────────
         # COLD MESSAGE (no active funnel state consumed it above).
         #
-        # STRICT DETERMINISTIC GATE — ZERO LLM. The bot engages ONLY when the
-        # message text exactly matches a configured Instagram Icebreaker.
+        # STRICT DETERMINISTIC GATE — ZERO LLM. The bot engages on exactly two
+        # signals, both deterministic:
+        #   • an exact Instagram Icebreaker match  → new-thread followers
+        #   • a configured trigger phrase (substring) → EXISTING followers, who
+        #     never see the native Icebreaker button
         # Everything else (random text, "hi", info questions, vulnerable shares)
         # is dropped in total silence. This is the authenticity guarantee.
         # ─────────────────────────────────────────────────────────────────────
-        if _ig_is_icebreaker(text):
+        entry = ("icebreaker"   if _ig_is_icebreaker(text)
+                 else "trigger_word" if _ig_matches_trigger(text)
+                 else None)
+        if entry:
             if already_lead:
                 reply_text  = _IG_ALREADY_LEAD_REPLY
                 new_state   = None
@@ -4110,7 +4150,7 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                 # intermediate qualification step.
                 reply_text  = _IG_ICEBREAKER_REPLY
                 new_state   = _make_contact_state(0)
-                audit_event = "instagram_icebreaker_triggered"
+                audit_event = "instagram_funnel_entry"
             with get_db_conn() as conn:
                 _db_save_message(conn, session_id, "user", text)
                 _db_save_message(conn, session_id, "assistant", reply_text)
@@ -4119,13 +4159,16 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                 _db_touch_session(conn, session_id)
                 conn.commit()
             channel.send_text(igsid, reply_text)
-            _audit(audit_event, igsid=igsid, session_id=session_id)
+            _audit(audit_event, igsid=igsid, session_id=session_id, entry=entry)
+            # entry source is tagged in meta so the dashboard can later split
+            # new-thread (icebreaker) vs existing-follower (trigger_word) funnels.
             _track("icebreaker_hit", "instagram", session_id=session_id,
-                   returning_lead=already_lead)
+                   returning_lead=already_lead, entry=entry)
             return
 
-        # Not an Icebreaker and not an active-funnel turn → stay 100% silent.
-        _audit("instagram_silent_drop", igsid=igsid, reason="not_icebreaker")
+        # Neither an Icebreaker, a trigger phrase, nor an active-funnel turn
+        # → stay 100% silent.
+        _audit("instagram_silent_drop", igsid=igsid, reason="no_trigger")
         return
 
     except TimeoutError:
