@@ -2747,14 +2747,18 @@ _IG_ERROR      = "משהו השתבש אצלי כרגע. נסו שוב בעוד 
 
 def _ig_graph_call(path: str, payload: dict) -> None:
     """
-    POST to the Instagram Graph API (Messenger Send API on /me/messages).
+    POST to the Instagram Graph API send endpoint (/me/messages).
     Uses stdlib urllib — no extra dependency.
     Best-effort: logs on failure, never raises (webhook must always return 200).
+
+    HOST: the "Instagram API with Instagram Login" flow (no Facebook Page) is
+    served by graph.instagram.com — NOT graph.facebook.com. Using the wrong host
+    returns an OAuth/permission error and the reply silently fails.
     """
     if not settings.ig_access_token:
         logger.error("[instagram] IG_ACCESS_TOKEN not set — cannot send reply.")
         return
-    url  = f"https://graph.facebook.com/v21.0/me/messages?access_token={settings.ig_access_token}"
+    url  = f"https://graph.instagram.com/v21.0/me/messages?access_token={settings.ig_access_token}"
     data = json.dumps(payload).encode("utf-8")
     req  = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
