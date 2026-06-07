@@ -1997,3 +1997,60 @@ class TestInstagramStoryDrop:
 
     def test_non_dict_is_safe(self):
         assert main._ig_is_story_message(None) is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conversion telemetry — _track() + /api/metrics
+# ─────────────────────────────────────────────────────────────────────────────
+class TestTelemetryTrack:
+    """_track persists only whitelisted events and is never allowed to raise."""
+
+    def test_ignores_non_whitelisted_event(self):
+        # No DB touch for an event outside _TRACKED_EVENTS.
+        with patch.object(main, "get_db_conn") as gdc:
+            main._track("some_random_event", "instagram")
+            gdc.assert_not_called()
+
+    def test_persists_whitelisted_event(self):
+        from contextlib import contextmanager
+        mock_conn, mock_cursor = _make_mock_conn()
+
+        @contextmanager
+        def _cm():
+            yield mock_conn
+
+        with patch.object(main, "get_db_conn", _cm):
+            main._track("icebreaker_hit", "instagram", session_id=None)
+
+        assert mock_cursor.execute.called
+        assert "bot_events" in mock_cursor.execute.call_args[0][0]
+
+    def test_swallows_db_errors(self):
+        # Telemetry is best-effort: a DB failure must never propagate.
+        with patch.object(main, "get_db_conn", side_effect=RuntimeError("db down")):
+            main._track("lead_captured", "instagram")   # must not raise
+
+
+class TestMetricsEndpoint:
+    def test_conversion_rate_computed(self, client):
+        _patch_conn(client, fetchall=[("icebreaker_hit", 10), ("lead_captured", 3)])
+        r = client.get("/api/metrics?days=30")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["icebreaker_hits"] == 10
+        assert data["lead_captures"]   == 3
+        assert data["conversion_rate"] == 0.3
+        assert data["window_days"]     == 30
+
+    def test_zero_hits_is_safe(self, client):
+        # No icebreaker hits yet → conversion rate is 0.0, not a divide-by-zero.
+        _patch_conn(client, fetchall=[])
+        r = client.get("/api/metrics")
+        assert r.status_code == 200
+        assert r.json()["conversion_rate"] == 0.0
+
+    def test_days_clamped(self, client):
+        _patch_conn(client, fetchall=[])
+        r = client.get("/api/metrics?days=99999")
+        assert r.status_code == 200
+        assert r.json()["window_days"] == 365

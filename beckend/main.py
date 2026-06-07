@@ -197,6 +197,37 @@ def _audit(event: str, **kwargs) -> None:
     ))
 
 
+# ── Persisted conversion telemetry (bot_events) ───────────────────────────────
+# _audit() goes to a logfile that is ephemeral on serverless, so it can't power
+# conversion metrics over time. _track() persists the funnel hinges to the
+# bot_events table instead. Deliberately narrow: only the two events needed for
+# the icebreaker→capture conversion rate, so the table stays lean and the
+# authenticity-critical silent path is never burdened with a DB write.
+_TRACKED_EVENTS = {"icebreaker_hit", "lead_captured"}
+
+
+def _track(event: str, channel: str, session_id: Optional[str] = None, **meta) -> None:
+    """
+    Best-effort telemetry write to bot_events. NEVER raises and NEVER blocks the
+    bot — a telemetry failure (or a missing table) is logged and swallowed.
+    Only events in _TRACKED_EVENTS are persisted; anything else is a no-op.
+    """
+    if event not in _TRACKED_EVENTS:
+        return
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO bot_events (channel, event, session_id, meta) "
+                    "VALUES (%s, %s, %s, %s::jsonb)",
+                    (channel, event, session_id,
+                     json.dumps(meta, ensure_ascii=False, default=str)),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"[telemetry] track {event!r} failed: {e}")
+
+
 def _redact_text(text: Optional[str]) -> str:
     """
     Privacy guard for logs/audit. User messages in this product are highly
@@ -3688,6 +3719,8 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                         channel.send_lead_thanks(igsid, None)
                         _finalize_lead(lead_id, None, phone, intent_summary, igsid)
                         _audit("instagram_lead_captured", igsid=igsid, lead_id=lead_id)
+                        _track("lead_captured", "instagram",
+                               session_id=session_id, lead_id=lead_id)
                 except Exception as e:
                     logger.error(f"[instagram] awaiting_contact: {e}", exc_info=True)
                     channel.send_text(igsid, _IG_ERROR)
@@ -3739,6 +3772,8 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                 conn.commit()
             channel.send_text(igsid, reply_text)
             _audit(audit_event, igsid=igsid, session_id=session_id)
+            _track("icebreaker_hit", "instagram", session_id=session_id,
+                   returning_lead=already_lead)
             return
 
         # Not an Icebreaker and not an active-funnel turn → stay 100% silent.
@@ -3751,6 +3786,49 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
     except Exception as e:
         logger.error(f"[instagram] Unexpected {type(e).__name__}: {e}", exc_info=True)
         channel.send_text(igsid, _IG_ERROR)
+
+
+@app.get("/api/metrics", dependencies=[Depends(require_auth)])
+def get_metrics(days: int = 30, channel: Optional[str] = None):
+    """
+    Conversion-funnel metrics from bot_events.
+
+    Returns icebreaker hits, lead captures, and the conversion rate over the
+    last `days` (clamped to 1..365), optionally filtered to one channel.
+    Read-only; never writes. Behind require_auth like the other data endpoints.
+    """
+    days = max(1, min(int(days), 365))
+    params: list = [days]
+    channel_clause = ""
+    if channel:
+        channel_clause = "AND channel = %s"
+        params.append(channel)
+
+    counts: dict = {}
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT event, COUNT(*) FROM bot_events "
+                    f"WHERE ts >= NOW() - make_interval(days => %s) {channel_clause} "
+                    f"GROUP BY event",
+                    tuple(params),
+                )
+                counts = {row[0]: int(row[1]) for row in cur.fetchall()}
+    except Exception as e:
+        logger.error(f"[metrics] query failed: {e}")
+        raise HTTPException(status_code=500, detail="Metrics unavailable.")
+
+    hits     = counts.get("icebreaker_hit", 0)
+    captures = counts.get("lead_captured", 0)
+    rate     = round(captures / hits, 4) if hits else 0.0
+    return {
+        "window_days":     days,
+        "channel":         channel or "all",
+        "icebreaker_hits": hits,
+        "lead_captures":   captures,
+        "conversion_rate": rate,   # captures / hits
+    }
 
 
 @app.get("/api/cron/crm-sync")
