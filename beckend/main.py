@@ -93,14 +93,12 @@ class Settings(BaseSettings):
 
     # ── Contact-capture CTAs for Instagram (env-var driven, never hardcoded) ────
     # whatsapp_number:  E.164 format without '+', e.g. "972501234567".
-    #                   When set, a WhatsApp wa.me button is the primary CTA in
-    #                   the awaiting_contact step on Instagram.
-    # calendly_url:     Full Calendly booking URL, e.g. "https://calendly.com/…".
-    #                   When set, shown as a secondary button alongside WhatsApp.
-    # If both are absent the bot falls back to asking the user to type their
-    # phone number — the funnel stays operational with no env-var changes needed.
+    #                   When set, a WhatsApp wa.me link button is shown as the
+    #                   sole contact CTA in the awaiting_contact step on Instagram.
+    #                   If absent, the bot falls back to asking the user to type
+    #                   their phone number — the funnel stays operational with no
+    #                   env-var changes needed for local dev.
     whatsapp_number:  str = ""
-    calendly_url:     str = ""
 
     model_config = {"env_file": ".env"}
 
@@ -2776,8 +2774,8 @@ class InstagramChannel(MessagingChannel):
     Button templates: persistent URL buttons for WhatsApp/Calendly CTAs.
     Typed phone: always accepted via _extract_phone_from_text — no API surface.
 
-    CTA buttons are built from env vars (WHATSAPP_NUMBER, CALENDLY_URL).
-    If both are unset the bot falls back to asking the user to type their number.
+    CTA: a single WhatsApp wa.me button built from WHATSAPP_NUMBER env var.
+    Falls back to asking the user to type their number when the var is unset.
     """
 
     CHANNEL_NAME = "instagram"
@@ -2848,21 +2846,17 @@ class InstagramChannel(MessagingChannel):
         })
 
     def _contact_buttons(self) -> list[dict]:
-        """Build WhatsApp + Calendly URL buttons from env vars. Returns [] if none set."""
-        buttons = []
+        """
+        Returns a single WhatsApp wa.me button when WHATSAPP_NUMBER is set,
+        or an empty list (triggers typed-phone fallback) when it is not.
+        """
         if settings.whatsapp_number:
-            buttons.append({
+            return [{
                 "type":  "web_url",
                 "title": "המשך בוואטסאפ",
                 "url":   f"https://wa.me/{settings.whatsapp_number}",
-            })
-        if settings.calendly_url:
-            buttons.append({
-                "type":  "web_url",
-                "title": "קביעת פגישה",
-                "url":   settings.calendly_url,
-            })
-        return buttons
+            }]
+        return []
 
 
 # ── Shared channel registry ───────────────────────────────────────────────────
@@ -3429,8 +3423,9 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
     Mirrors the Telegram webhook logic exactly — same state machine, same triage
     LLM, same lead-capture path — with two Instagram-specific adaptations:
       1. No /start or /cancel commands (IG DMs don't have bot commands).
-      2. send_contact_prompt() shows WhatsApp/Calendly URL buttons instead of the
-         Telegram contact-share keyboard (env-var driven; graceful fallback).
+      2. send_contact_prompt() shows a single WhatsApp wa.me button instead of
+         the Telegram contact-share keyboard (env-var driven; graceful fallback
+         to typed-phone when WHATSAPP_NUMBER is not set).
 
     All copy constants with the _IG_ prefix are the Instagram counterparts of
     the _TG_ strings — same emotional register, adapted for IG UX.
@@ -3555,9 +3550,9 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
             return
 
         # ── STATE: awaiting_contact ───────────────────────────────────────────
-        # On Instagram: typed phone is the only direct capture path (no keyboard
-        # button). The send_contact_prompt call above showed WhatsApp/Calendly
-        # buttons — those are external CTAs. If the user types a phone number
+        # On Instagram: typed phone is always accepted as a direct capture path.
+        # The send_contact_prompt call above showed the WhatsApp wa.me button
+        # as the primary CTA. If the user types a phone number instead,
         # here instead, we capture it exactly as Telegram does.
         if _is_awaiting_contact(bot_state):
             phone = _extract_phone_from_text(text)
