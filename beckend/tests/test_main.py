@@ -2054,3 +2054,36 @@ class TestMetricsEndpoint:
         r = client.get("/api/metrics?days=99999")
         assert r.status_code == 200
         assert r.json()["window_days"] == 365
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Channel-aware owner alert (_alert_owner)
+# ─────────────────────────────────────────────────────────────────────────────
+class TestOwnerAlertChannelAware:
+    def _capture(self, channel, chat_id, monkeypatch):
+        sent = {}
+        monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "999")
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, **k: sent.update(cid=cid, text=text))
+        main._alert_owner("lead1", "דני", "972501234567", "נושא", chat_id,
+                          channel=channel)
+        return sent
+
+    def test_instagram_alert_labels_source_and_drops_tg_link(self, monkeypatch):
+        sent = self._capture("instagram", "178000IGSID", monkeypatch)
+        assert "אינסטגרם" in sent["text"]        # labeled as Instagram
+        assert "tg://" not in sent["text"]        # broken deep link removed
+        assert "178000IGSID" in sent["text"]      # IGSID surfaced for lookup
+
+    def test_telegram_alert_keeps_deep_link(self, monkeypatch):
+        sent = self._capture("telegram", "12345", monkeypatch)
+        assert "tg://user?id=12345" in sent["text"]
+        assert "טלגרם" in sent["text"]
+
+    def test_alert_skipped_without_owner_chat_id(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "")
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda *a, **k: called.append(1))
+        main._alert_owner("lead1", None, "972", "i", "x", channel="instagram")
+        assert called == []   # no send attempt when owner chat id unset
