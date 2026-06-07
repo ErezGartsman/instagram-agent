@@ -203,7 +203,7 @@ def _audit(event: str, **kwargs) -> None:
 # bot_events table instead. Deliberately narrow: only the two events needed for
 # the icebreaker→capture conversion rate, so the table stays lean and the
 # authenticity-critical silent path is never burdened with a DB write.
-_TRACKED_EVENTS = {"icebreaker_hit", "lead_captured"}
+_TRACKED_EVENTS = {"icebreaker_hit", "lead_captured", "context_provided"}
 
 
 def _track(event: str, channel: str, session_id: Optional[str] = None, **meta) -> None:
@@ -2700,6 +2700,118 @@ def _finalize_lead(lead_id: str, name: Optional[str], phone: str,
         logger.error(f"[leads] finalize bookkeeping failed for {lead_id}: {e}")
 
 
+# ── Lead Brief — post-capture conversation intelligence ───────────────────────
+# Runs ONLY after a lead is captured and the user answers the optional topic
+# question (the awaiting_context turn). It is grounded in the lead's own words,
+# so it informs rather than hallucinates. Best-effort everywhere: a failure
+# leaves the (already-complete) lead untouched.
+
+_LEAD_BRIEF_PROMPT = """\
+You are preparing Erez Gartsman — a relationship & dating coach — for a personal
+WhatsApp conversation with a new lead. Using ONLY the lead's own words, write a
+SHORT practical briefing in HEBREW so Erez can open the conversation prepared
+and human.
+
+Lead's own words:
+\"\"\"{context}\"\"\"
+
+{history_block}Return ONLY a strict JSON object, nothing else:
+{{"topic": "<2-5 word Hebrew phrase>",
+  "emotional_state": "<2-4 Hebrew words>",
+  "urgency": <integer 1-5>,
+  "opening": "<one warm, concrete Hebrew sentence Erez could open with>"}}
+
+Rules:
+- Ground every value in their words — never invent facts.
+- urgency: 1 = casual/curious, 5 = acute distress / wants help now.
+- "opening" must be gentle and human — NOT salesy, NOT clinical.
+- No markdown, no commentary, nothing outside the JSON object.
+"""
+
+
+def _generate_lead_brief(context_text: str, history: list = None) -> Optional[dict]:
+    """
+    Turn the lead's one-line topic answer into a structured briefing dict, or None
+    on any failure. Never raises. urgency is clamped to 1..5.
+    """
+    try:
+        prompt = _LEAD_BRIEF_PROMPT.format(
+            context=(context_text or "")[:1000],
+            history_block=_build_rag_history_block(history or []),
+        )
+        parsed = _parse_llm_json(_call_llm(prompt))
+        try:
+            urgency = max(1, min(int(parsed.get("urgency")), 5))
+        except (TypeError, ValueError):
+            urgency = None
+        return {
+            "topic":           (parsed.get("topic") or "").strip()[:80] or None,
+            "emotional_state": (parsed.get("emotional_state") or "").strip()[:60] or None,
+            "urgency":         urgency,
+            "opening":         (parsed.get("opening") or "").strip()[:300] or None,
+        }
+    except Exception as e:
+        logger.warning(f"[brief] generation failed: {e}")
+        return None
+
+
+def _format_brief_message(brief: dict, context_text: str) -> str:
+    """Telegram-formatted Lead Brief (the second message Erez gets, post-capture)."""
+    urgency = brief.get("urgency")
+    return "\n".join([
+        "🧠 תקציר ליד",
+        "",
+        f"📌 נושא: {brief.get('topic') or '—'}",
+        f"❤️ מצב: {brief.get('emotional_state') or '—'}",
+        f"⚡ דחיפות: {urgency}/5" if urgency else "⚡ דחיפות: —",
+        f"🗣️ פתיח מוצע: {brief.get('opening') or '—'}",
+        "",
+        f"במילים שלהם: \"{(context_text or '').strip()[:200]}\"",
+    ])
+
+
+def _deliver_lead_brief(igsid: str, context_text: str, history: list = None) -> None:
+    """
+    Generate the brief and deliver it to BOTH channels Erez asked for:
+      1. a second Telegram DM (pops up seconds before he opens WhatsApp), and
+      2. a Note appended to the HubSpot contact (if already synced).
+    Best-effort throughout; a failure in either leg never affects the other or
+    the lead itself.
+    """
+    brief = _generate_lead_brief(context_text, history)
+    if not brief:
+        return
+
+    # 1) Telegram DM to the owner.
+    if settings.telegram_owner_chat_id:
+        try:
+            _send_telegram_message(settings.telegram_owner_chat_id,
+                                   _format_brief_message(brief, context_text))
+        except Exception as e:
+            logger.warning(f"[brief] telegram delivery failed: {e}")
+
+    # 2) HubSpot note on the contact — only if the lead is already synced
+    #    (crm_external_id holds the HubSpot contact id).
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT crm_external_id FROM leads "
+                    "WHERE channel = 'instagram' AND chat_id = %s "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (igsid,),
+                )
+                row = cur.fetchone()
+        contact_id = row[0] if row else None
+        if contact_id:
+            _hubspot_add_note(contact_id, _format_brief_message(brief, context_text))
+        else:
+            logger.info("[brief] contact not yet synced — HubSpot note deferred "
+                        "(cron will sync the lead; brief Telegram already sent).")
+    except Exception as e:
+        logger.warning(f"[brief] HubSpot note failed: {e}")
+
+
 # Bot-authored system messages are Hebrew to match the representative persona.
 # The /start greeting and the crisis response are config-driven (app_config,
 # editable live in Supabase); the short operational notices below stay in code.
@@ -2905,6 +3017,18 @@ _IG_CONTACT_RETRY = (
 # First-person confirmation once the number is captured.
 _IG_LEAD_THANKS = (
     "תודה רבה! 🙏 קיבלתי, ואשלח לך הודעה בווטסאפ בהקדם. מחכה לדבר! 🙂"
+)
+# Capture-confirmation that ALSO asks one optional topic question, so we can
+# build a Lead Brief. The lead is ALREADY captured at this point — answering is
+# pure upside and cannot affect the conversion rate ("capture first, enrich
+# second"). The "אם בא לך" framing keeps it pressure-free.
+_IG_LEAD_THANKS_CONTEXT = (
+    "תודה רבה! 🙏 קיבלתי ואשלח לך הודעה בווטסאפ בהקדם. "
+    "אם בא לך — ספרו לי במשפט אחד על מה תרצו שנדבר, וזה יעזור לי להגיע מוכן 🙂"
+)
+# Warm close after the user shares (or skips) their topic line.
+_IG_CONTEXT_ACK = (
+    "מעולה, תודה ששיתפתם 🙏 אדבר איתכם בקרוב בווטסאפ."
 )
 # First-person ack for a returning lead who taps the Icebreaker again.
 _IG_ALREADY_LEAD_REPLY = (
@@ -3817,10 +3941,16 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                         lead_id = _db_save_lead(conn, session_id, igsid,
                                                 None, phone, intent_summary,
                                                 channel="instagram")
-                        _db_set_session_state(conn, session_id, None)
+                        # New lead → advance to awaiting_context to collect ONE
+                        # optional topic line (capture-first, enrich-second).
+                        # Duplicate (lead_id None) → just clear the state.
+                        _db_set_session_state(
+                            conn, session_id,
+                            "awaiting_context" if lead_id else None)
                         conn.commit()
                     if lead_id:
-                        channel.send_lead_thanks(igsid, None)
+                        # Thanks + a soft, optional topic question in one message.
+                        channel.send_text(igsid, _IG_LEAD_THANKS_CONTEXT)
                         _finalize_lead(lead_id, None, phone, intent_summary, igsid,
                                        channel="instagram")
                         _audit("instagram_lead_captured", igsid=igsid, lead_id=lead_id)
@@ -3846,6 +3976,29 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                 # the prospect's number; it does not hand out a wa.me link).
                 channel.send_text(igsid, _IG_CONTACT_RETRY)
                 return
+
+        # ── STATE: awaiting_context (post-capture enrichment) ──────────────────
+        # The lead is ALREADY captured, alerted, and synced — this single optional
+        # turn collects one topic line so we can build a Lead Brief. Because the
+        # crisis check ran first (top of the handler), an acute disclosure here is
+        # met with the ER"AN response, never a CRM brief. Reached only after the
+        # escape gate (a short "לא" opts out cleanly); a real sentence flows here.
+        if bot_state == "awaiting_context":
+            with get_db_conn() as conn:
+                _db_save_message(conn, session_id, "user", text)
+                _db_set_session_state(conn, session_id, None)   # one-shot
+                _db_touch_session(conn, session_id)
+                conn.commit()
+            # Only spend an LLM call when there's something to analyse.
+            if len(text.strip()) >= 4:
+                _track("context_provided", "instagram", session_id=session_id)
+                _audit("instagram_context_provided", igsid=igsid, session_id=session_id)
+                try:
+                    _deliver_lead_brief(igsid, text, history)   # best-effort
+                except Exception as e:
+                    logger.error(f"[brief] delivery failed for {igsid}: {e}")
+            channel.send_text(igsid, _IG_CONTEXT_ACK)
+            return
 
         # ─────────────────────────────────────────────────────────────────────
         # COLD MESSAGE (no active funnel state consumed it above).
@@ -3924,15 +4077,19 @@ def get_metrics(days: int = 30, channel: Optional[str] = None):
         logger.error(f"[metrics] query failed: {e}")
         raise HTTPException(status_code=500, detail="Metrics unavailable.")
 
-    hits     = counts.get("icebreaker_hit", 0)
-    captures = counts.get("lead_captured", 0)
-    rate     = round(captures / hits, 4) if hits else 0.0
+    hits        = counts.get("icebreaker_hit", 0)
+    captures    = counts.get("lead_captured", 0)
+    context_n   = counts.get("context_provided", 0)
+    rate        = round(captures / hits, 4) if hits else 0.0
+    context_rate = round(context_n / captures, 4) if captures else 0.0
     return {
-        "window_days":     days,
-        "channel":         channel or "all",
-        "icebreaker_hits": hits,
-        "lead_captures":   captures,
-        "conversion_rate": rate,   # captures / hits
+        "window_days":      days,
+        "channel":          channel or "all",
+        "icebreaker_hits":  hits,
+        "lead_captures":    captures,
+        "conversion_rate":  rate,          # captures / hits
+        "context_provided": context_n,
+        "context_rate":     context_rate,  # context_provided / captures (downstream)
     }
 
 
