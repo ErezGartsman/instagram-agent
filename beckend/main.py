@@ -2526,6 +2526,11 @@ def _hubspot_upsert_contact(name: Optional[str], phone: str,
             props["instagram_psid"] = external_user_id
         if username:
             props["instagram_username"] = username
+            # Map the @username to firstname so the contact shows a name in the
+            # HubSpot contacts directory instead of "--". Only applied when no
+            # explicit name was captured (e.g. IG DMs never share a full name).
+            if not name:
+                props["firstname"] = username
 
     # Dedup: phone first, then Instagram-scoped id (catches the same person whose
     # phone differs / was reformatted, or who has no phone match yet).
@@ -2656,8 +2661,18 @@ def _finalize_lead(lead_id: str, name: Optional[str], phone: str,
     push keep crm_synced_at = NULL and are retried by /api/cron/crm-sync.
     """
     # Resolve the @username once for Instagram (used by BOTH the alert deep link
-    # and the HubSpot record), so we never make the Graph call twice.
-    username = _ig_fetch_username(chat_id) if channel == "instagram" else None
+    # and the HubSpot record) so we never make the Graph API call twice.
+    # FAIL-SAFE: the fetch is wrapped in its own try/except so that a Graph API
+    # permission error, network timeout, or any other exception can NEVER block
+    # the owner alert. If the lookup fails, username stays None and the alert
+    # fires anyway with the IGSID as a fallback identifier.
+    username = None
+    if channel == "instagram":
+        try:
+            username = _ig_fetch_username(chat_id)
+        except Exception as e:
+            logger.warning(f"[leads] username fetch failed for {chat_id}: {e} — "
+                           "alert will fire with IGSID fallback")
 
     try:
         _alert_owner(lead_id, name, phone, intent_summary, chat_id,
