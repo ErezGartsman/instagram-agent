@@ -101,6 +101,16 @@ class Settings(BaseSettings):
     #                   env-var changes needed for local dev.
     whatsapp_number:  str = ""
 
+    # ── Instagram Icebreakers (strict deterministic trigger) ────────────────────
+    # ig_icebreakers: a '|'-separated list of the EXACT Icebreaker texts you set
+    #   up in the Meta dashboard, e.g.:
+    #       IG_ICEBREAKERS=אשמח לפרטים על ייעוץ|איך קובעים פגישה?
+    #   A cold DM engages the bot ONLY if its text exactly matches one of these
+    #   (after trimming). Everything else is dropped in silence. No LLM is used
+    #   on the cold path — this is the authenticity guarantee for a personal
+    #   account. When empty, the bot only ever continues active funnel turns.
+    ig_icebreakers:   str = ""
+
     model_config = {"env_file": ".env"}
 
 settings = Settings()
@@ -3415,6 +3425,15 @@ def _process_instagram_events(body: dict) -> None:
             if msg.get("is_echo"):
                 continue
 
+            # ── HARD DROP: story replies / story mentions ─────────────────────
+            # A reply to one of our stories (or a story mention) must NEVER be
+            # processed — no LLM, no funnel, no reply. This is the #1 authenticity
+            # rule: vulnerable story-replies are not leads. Drop at the payload
+            # layer, before any handler logic runs.
+            if _ig_is_story_message(msg):
+                _audit("instagram_story_dropped", igsid=sender_igsid)
+                continue
+
             # Dedup by message-id.
             mid = msg.get("mid")
             if mid:
@@ -3423,108 +3442,95 @@ def _process_instagram_events(body: dict) -> None:
                     continue
                 _ig_seen_mids[mid] = time.time()
 
-            # DM-only: ignore non-text payloads (stickers, voice, story-replies).
+            # Resolve the message text. Quick-reply / icebreaker taps may arrive
+            # as a payload rather than free text — treat the payload as the text.
             text = (msg.get("text") or "").strip()
-
-            # Quick-reply postback: the user tapped a chip — treat payload as text
-            # so the state machine can classify it (e.g. "YES" / "NO").
             qr_payload = (msg.get("quick_reply") or {}).get("payload", "")
             if not text and qr_payload:
                 text = qr_payload
 
+            # Non-text payloads (stickers, voice, images) → silent drop, NO reply.
             if not text:
-                channel.send_text(sender_igsid, _IG_NON_TEXT)
+                _audit("instagram_nontext_dropped", igsid=sender_igsid)
                 continue
 
-            # Mark seen immediately so the user gets the read-tick without waiting
-            # for the (slow) LLM round-trip.
-            channel.mark_seen(sender_igsid)
-
-            # Dispatch to the shared funnel handler.
+            # Dispatch to the shared handler (it enforces the deterministic gate).
             _handle_instagram_dm(channel, sender_igsid, text)
 
 
-# ── The Silent Filter (Instagram only) ────────────────────────────────────────
-# On Erez's PERSONAL account the bot must behave as a discreet business assistant:
-# it replies ONLY to explicit business intent and stays completely silent on
-# greetings, story reactions, emojis, and off-topic chatter — so normal followers
-# are never spammed. This LLM gate is the enforcement point.
-_IG_ENGAGEMENT_PROMPT = """\
-You are a STRICT gatekeeper for the Instagram DM assistant of Erez Gartsman, a \
-relationship & dating coach. This is his PERSONAL Instagram account, so the \
-assistant must reply ONLY to genuine BUSINESS inquiries and stay completely \
-SILENT on everything else. Authenticity matters more than catching a lead.
+# ── Strict deterministic gating (Instagram only) ──────────────────────────────
+# On Erez's PERSONAL account the bot must NEVER guess when to stay silent — a
+# single wrong reply to a vulnerable story-reply destroys the channel. So the
+# cold path uses ZERO LLM evaluation. A cold DM engages the bot ONLY when its
+# text exactly matches a configured Instagram Icebreaker; everything else is
+# dropped in silence. Story replies/mentions are dropped even earlier, at the
+# payload layer (see _ig_is_story_message / _process_instagram_events).
 
-Classify the user's latest message into exactly one action:
-
-  • "CONSULT" — the user explicitly wants to book, schedule, or be contacted, or \
-    asks to talk to Erez personally (e.g. "אני רוצה לקבוע", "can I book a call", \
-    "איך מתאמים פגישה", "I'd like a consultation").
-
-  • "INFO" — a genuine question about the professional offering: what Erez does, \
-    his coaching / approach, the services, pricing, how it works, or who he is \
-    PROFESSIONALLY (e.g. "מי זה ארז?", "what do you offer?", "כמה זה עולה?").
-
-  • "SILENT" — EVERYTHING ELSE: greetings / small talk ("hi", "שלום", "מה נשמע", \
-    "👋"), reactions to a story, emojis, compliments, memes, personal venting \
-    that is NOT a request for coaching, off-topic chatter, spam, or anything \
-    ambiguous.
-
-When in doubt, choose "SILENT".
-
-{history_block}=== OUTPUT — STRICT JSON, NOTHING ELSE ===
-{{"action": "CONSULT" or "INFO" or "SILENT"}}
-
-User message: "{question}"
-"""
+def _ig_icebreaker_set() -> set[str]:
+    """The configured Icebreaker texts (trimmed), parsed from IG_ICEBREAKERS."""
+    return {
+        part.strip()
+        for part in (settings.ig_icebreakers or "").split("|")
+        if part.strip()
+    }
 
 
-def _ig_classify_engagement(text: str, history: list = None) -> str:
+def _ig_is_icebreaker(text: str) -> bool:
+    """True iff `text` exactly matches a configured Icebreaker (after trimming)."""
+    return (text or "").strip() in _ig_icebreaker_set()
+
+
+def _ig_is_story_message(msg: dict) -> bool:
     """
-    The Silent Filter. Returns "CONSULT", "INFO", or "SILENT".
+    True if this message is a story reply or story mention — which the bot must
+    drop instantly and unconditionally (no LLM, no funnel, no reply).
 
-    Conservative by design: any parse failure or unknown label degrades to
-    "SILENT", because on a personal account a spurious reply to a friend is worse
-    than a missed lead. The LLM sees recent history, so a business follow-up
-    ("ומה לגבי המחיר?") is still recognised mid-conversation.
+    Detects both shapes Meta uses:
+      • story reply:   message.reply_to.story  (replying to one of OUR stories)
+      • story mention: an attachment of type 'story_mention'
     """
-    prompt = _IG_ENGAGEMENT_PROMPT.format(
-        history_block=_build_rag_history_block(history or []),
-        question=text,
-    )
-    try:
-        parsed = _parse_llm_json(_call_llm(prompt))
-        action = parsed.get("action")
-        return action if action in ("CONSULT", "INFO", "SILENT") else "SILENT"
-    except Exception as e:
-        logger.warning(f"[instagram] engagement gate failed → SILENT: {e}")
-        return "SILENT"
+    if not isinstance(msg, dict):
+        return False
+    if (msg.get("reply_to") or {}).get("story"):
+        return True
+    for att in (msg.get("attachments") or []):
+        if isinstance(att, dict) and "story" in str(att.get("type", "")).lower():
+            return True
+    return False
 
 
 def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> None:
     """
-    Shared funnel handler for Instagram DMs.
+    Instagram DM handler with STRICT deterministic gating (personal account).
 
-    Mirrors the Telegram webhook logic exactly — same state machine, same triage
-    LLM, same lead-capture path — with two Instagram-specific adaptations:
-      1. No /start or /cancel commands (IG DMs don't have bot commands).
-      2. send_contact_prompt() shows a single WhatsApp wa.me button instead of
-         the Telegram contact-share keyboard (env-var driven; graceful fallback
-         to typed-phone when WHATSAPP_NUMBER is not set).
+    Engagement is NEVER decided by an LLM. A message is acted on only when:
+      1. it is an active funnel turn (awaiting_qualification / offered_meeting /
+         awaiting_contact for THIS user), or
+      2. it exactly matches a configured Instagram Icebreaker (cold path).
+    Everything else is dropped in total silence. Story replies/mentions are
+    dropped even earlier, in _process_instagram_events.
 
-    All copy constants with the _IG_ prefix are the Instagram counterparts of
-    the _TG_ strings — same emotional register, adapted for IG UX.
+    Instagram-specific funnel adaptations:
+      • No /start or /cancel commands (IG DMs have no bot commands).
+      • send_contact_prompt() shows a single WhatsApp wa.me button (env-driven;
+        falls back to asking for a typed phone when WHATSAPP_NUMBER is unset).
+
+    SAFETY EXCEPTION: crisis/self-harm language in a DIRECT DM still receives the
+    compassionate crisis.message (ER"AN hotline) — this is the one deterministic,
+    non-LLM reply allowed outside the Icebreaker/funnel paths.
     """
     _audit("instagram_request", igsid=igsid, question=_redact_text(text))
 
-    # ── Rate limit ────────────────────────────────────────────────────────────
+    # ── Rate limit → SILENT drop ───────────────────────────────────────────────
+    # A "slow down 🙂" auto-reply to a flooder would reveal automation on a
+    # personal account, so we drop silently rather than respond.
     try:
         check_rate_limit(igsid)
     except RateLimitError:
-        channel.send_text(igsid, _IG_RATE_LIMIT)
+        _audit("instagram_rate_limited_drop", igsid=igsid)
         return
 
-    # ── Crisis — always first ─────────────────────────────────────────────────
+    # ── Crisis — checked first; the one deterministic non-Icebreaker reply ─────
     if is_crisis(text):
         _audit("instagram_crisis", igsid=igsid)
         channel.send_text(igsid, _get_config("crisis.message"))
@@ -3679,63 +3685,13 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
 
         # ─────────────────────────────────────────────────────────────────────
         # COLD MESSAGE (no active funnel state consumed it above).
-        # Everything below runs only for messages that are NOT mid-funnel.
+        #
+        # STRICT DETERMINISTIC GATE — ZERO LLM. The bot engages ONLY when the
+        # message text exactly matches a configured Instagram Icebreaker.
+        # Everything else (random text, "hi", info questions, vulnerable shares)
+        # is dropped in total silence. This is the authenticity guarantee.
         # ─────────────────────────────────────────────────────────────────────
-
-        # ── Regex phone fallback: a typed phone number is strong, explicit
-        #    business intent — capture it even on a cold message. Runs BEFORE the
-        #    guards so a bare number isn't blocked, and BEFORE the gate to save a
-        #    classifier call. ───────────────────────────────────────────────────
-        phone_in_text = _extract_phone_from_text(text)
-        if phone_in_text and not already_lead:
-            try:
-                intent_summary = _build_intent_summary(history, text)
-                with get_db_conn() as conn:
-                    lead_id = _db_save_lead(conn, session_id, igsid,
-                                            None, phone_in_text, intent_summary,
-                                            channel="instagram")
-                    conn.commit()
-                if lead_id:
-                    channel.send_lead_thanks(igsid, None)
-                    _finalize_lead(lead_id, None, phone_in_text, intent_summary, igsid)
-                    _audit("instagram_lead_captured_regex", igsid=igsid, lead_id=lead_id)
-                    return
-            except Exception as e:
-                logger.error(f"[instagram] Regex capture failed: {e}", exc_info=True)
-
-        # ── Safety-net: WE offered earlier (state since expired) and the user
-        #    now affirms — honour it. Runs BEFORE the guards/gate because "כן" is
-        #    short and would otherwise be filtered out. ──────────────────────────
-        if (bot_state is None and not already_lead
-                and _is_affirmation(text) and _last_bot_message_offered(history)):
-            with get_db_conn() as conn:
-                _db_save_message(conn, session_id, "user", text)
-                _db_set_session_state(conn, session_id, _make_contact_state(0))
-                _db_touch_session(conn, session_id)
-                conn.commit()
-            channel.send_contact_prompt(igsid, _TG_OFFER_ACK)
-            _audit("instagram_offer_accepted_recovered", igsid=igsid,
-                   session_id=session_id)
-            return
-
-        # ── Cheap pre-filter: silently drop trivially short or harmful cold
-        #    messages (e.g. "hi" < 3 chars, blocked terms) with NO reply. ────────
-        try:
-            validate_question(text)
-        except InputModerationError:
-            _audit("instagram_silent_drop", igsid=igsid, reason="prefilter")
-            return   # SILENT
-
-        # ── THE SILENT FILTER ─────────────────────────────────────────────────
-        # Only explicit business intent earns a reply; everything else is dropped
-        # silently so normal followers are never spammed.
-        action = _ig_classify_engagement(text, history)
-        if action == "SILENT":
-            _audit("instagram_silent_drop", igsid=igsid, reason="gate")
-            return   # do NOT reply
-
-        # ── CONSULT: explicit scheduling intent → deterministic booking funnel ─
-        if action == "CONSULT":
+        if _ig_is_icebreaker(text):
             if already_lead:
                 reply_text  = _TG_ALREADY_LEAD_BOOKING
                 new_state   = None
@@ -3743,7 +3699,7 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
             else:
                 reply_text  = _TG_QUALIFICATION_QUESTION
                 new_state   = "awaiting_qualification"
-                audit_event = "instagram_qualification_triggered"
+                audit_event = "instagram_icebreaker_triggered"
             with get_db_conn() as conn:
                 _db_save_message(conn, session_id, "user", text)
                 _db_save_message(conn, session_id, "assistant", reply_text)
@@ -3755,25 +3711,9 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
             _audit(audit_event, igsid=igsid, session_id=session_id)
             return
 
-        # ── INFO: answer accurately from the knowledge base. ──────────────────
-        # Deliberately NO scheduling CTA and NO funnel state: this keeps answering
-        # follow-up questions instead of hijacking them into a yes/no offer loop
-        # (the "aggressive routing" bug). The user enters the funnel only when
-        # they explicitly ask to book (→ CONSULT above).
-        query_vector = _embed_text(text)
-        with get_db_conn() as conn:
-            chunks = _retrieve_chunks(conn, query_vector, top_k=5)
-        reply, intent, sources = _bot_triage_reply(text, chunks, history=history)
-
-        with get_db_conn() as conn:
-            _db_save_message(conn, session_id, "user", text)
-            _db_save_message(conn, session_id, "assistant", reply)
-            _db_touch_session(conn, session_id)
-            conn.commit()
-
-        _audit("instagram_info_answer", igsid=igsid, session_id=session_id,
-               intent=intent, sources=sources, chunks=len(chunks))
-        channel.send_text(igsid, reply)
+        # Not an Icebreaker and not an active-funnel turn → stay 100% silent.
+        _audit("instagram_silent_drop", igsid=igsid, reason="not_icebreaker")
+        return
 
     except TimeoutError:
         logger.error("[instagram] LLM timeout")
