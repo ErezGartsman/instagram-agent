@@ -1304,6 +1304,23 @@ class TestFinalizeLead:
         main._finalize_lead("lead3", None, "0521234567", "y", "777")   # must not raise
         assert synced == ["c1"]
 
+    def test_username_fetch_failure_still_sends_alert(self, client, monkeypatch):
+        # This tests the exact production bug: if _ig_fetch_username raises,
+        # the alert must still fire (with username=None / IGSID fallback).
+        monkeypatch.setattr(main, "_ig_fetch_username",
+                            lambda igsid: (_ for _ in ()).throw(RuntimeError("403")))
+        alerts = []
+        monkeypatch.setattr(main, "_alert_owner",
+                            lambda *a, **k: alerts.append(k.get("username")))
+        monkeypatch.setattr(main, "_crm_sync_lead", lambda *a, **k: None)
+        monkeypatch.setattr(main, "_db_mark_lead_notified", lambda c, l: None)
+        monkeypatch.setattr(main, "_db_mark_lead_synced", lambda c, l, e: None)
+        main._finalize_lead("leadX", None, "0521234567", "y", "IGSID9",
+                            channel="instagram")
+        # Alert fired exactly once, with username=None (fallback to IGSID in alert text)
+        assert len(alerts) == 1
+        assert alerts[0] is None
+
 
 class TestCronCrmSync:
     def test_rejects_bad_secret(self, client, monkeypatch):
@@ -2094,18 +2111,19 @@ class TestOwnerAlertChannelAware:
 # HubSpot Instagram sync — channel tagging, IG-id dedup, username resolution
 # ─────────────────────────────────────────────────────────────────────────────
 class TestHubSpotInstagram:
-    def test_upsert_sets_ig_props_and_creates_when_new(self, monkeypatch):
-        calls = []
-
+    def _fake_new_contact_req(self, calls):
         def fake_req(method, path, payload=None):
             calls.append((method, path, payload))
             if path.endswith("/search"):
-                return {"results": []}                 # no existing match
+                return {"results": []}
             if method == "POST" and path == "/crm/v3/objects/contacts":
                 return {"id": "C1"}
             return {}
+        return fake_req
 
-        monkeypatch.setattr(main, "_hubspot_request", fake_req)
+    def test_upsert_sets_ig_props_and_creates_when_new(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(main, "_hubspot_request", self._fake_new_contact_req(calls))
         monkeypatch.setattr(main.settings, "hubspot_intent_property", "")
         cid = main._hubspot_upsert_contact(
             "דני", "0501234567", "נושא",
@@ -2116,6 +2134,34 @@ class TestHubSpotInstagram:
         props = create[2]["properties"]
         assert props["instagram_psid"]      == "IG123"
         assert props["instagram_username"]  == "dani"
+        # explicit name was provided → firstname stays as-provided, not overwritten
+        assert props["firstname"]           == "דני"
+
+    def test_username_mapped_to_firstname_when_no_name(self, monkeypatch):
+        # No captured name → username fills the HubSpot firstname so the contact
+        # directory shows "@handle" instead of "--".
+        calls = []
+        monkeypatch.setattr(main, "_hubspot_request", self._fake_new_contact_req(calls))
+        monkeypatch.setattr(main.settings, "hubspot_intent_property", "")
+        cid = main._hubspot_upsert_contact(
+            None, "0501234567", None,
+            channel="instagram", external_user_id="IG99", username="erez_gersman")
+        assert cid == "C1"
+        create = [c for c in calls
+                  if c[0] == "POST" and c[1] == "/crm/v3/objects/contacts"][0]
+        props = create[2]["properties"]
+        assert props["firstname"]          == "erez_gersman"
+        assert props["instagram_username"] == "erez_gersman"
+
+    def test_firstname_not_set_when_username_and_name_both_absent(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(main, "_hubspot_request", self._fake_new_contact_req(calls))
+        monkeypatch.setattr(main.settings, "hubspot_intent_property", "")
+        main._hubspot_upsert_contact(
+            None, "0501234567", None, channel="instagram", external_user_id="IGX")
+        create = [c for c in calls
+                  if c[0] == "POST" and c[1] == "/crm/v3/objects/contacts"][0]
+        assert "firstname" not in create[2]["properties"]
 
     def test_dedup_by_instagram_psid_when_phone_misses(self, monkeypatch):
         def fake_req(method, path, payload=None):
