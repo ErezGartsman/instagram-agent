@@ -2366,3 +2366,29 @@ class TestLeadAlertFormatting:
         assert "תקציר ליד" in txt
         assert "בגידה" in txt
         assert "4/5" in txt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trigger words — funnel entry for existing followers (substring, zero-LLM)
+# ─────────────────────────────────────────────────────────────────────────────
+class TestInstagramTriggerWords:
+    def test_substring_match_handles_hebrew_prefix(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "ig_trigger_words", "ייעוץ|רוצה לקבוע")
+        assert main._ig_matches_trigger("ייעוץ") is True
+        assert main._ig_matches_trigger("אשמח לייעוץ זוגי") is True      # ל- prefix
+        assert main._ig_matches_trigger("כמה עולה הייעוץ?") is True       # ה- prefix
+        assert main._ig_matches_trigger("רוצה לקבוע פגישה") is True
+
+    def test_case_insensitive(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "ig_trigger_words", "Consultation")
+        assert main._ig_matches_trigger("I'd like a CONSULTATION please") is True
+
+    def test_non_trigger_is_silent(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "ig_trigger_words", "ייעוץ")
+        assert main._ig_matches_trigger("היי מה נשמע") is False
+        assert main._ig_matches_trigger("תודה על הסטורי") is False
+
+    def test_empty_config_matches_nothing(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "ig_trigger_words", "")
+        assert main._ig_matches_trigger("ייעוץ") is False
+        assert main._ig_trigger_set() == set()
