@@ -2320,30 +2320,46 @@ def _db_mark_lead_notified(conn, lead_id: str) -> None:
         )
 
 
-def _alert_owner(lead_id: str, name: str, phone: str, intent_summary: str, chat_id: str) -> None:
+def _alert_owner(lead_id: str, name: str, phone: str, intent_summary: str,
+                 chat_id: str, channel: str = "telegram") -> None:
     """
-    DM Erez on Telegram with the structured lead details. Best-effort — a
-    delivery failure is logged but never propagated; the user's confirmation
+    Instantly DM Erez on Telegram with the structured lead details. Best-effort —
+    a delivery failure is logged but never propagated; the user's confirmation
     has already been sent and must not be affected.
+
+    Channel-aware: the "open conversation" deep link only works for Telegram,
+    where chat_id is the TG numeric user id. For Instagram the identifier is the
+    IGSID, so a tg:// link would be broken — we label the source as Instagram and
+    surface the IGSID for lookup instead. (A future change threads the resolved
+    @username through to build a real ig.me/m/<username> link.)
     """
     if not settings.telegram_owner_chat_id:
         logger.warning("[leads] TELEGRAM_OWNER_CHAT_ID not set — owner alert skipped.")
         return
 
-    now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M UTC")
+    now_str    = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M UTC")
     name_str   = name or "לא צוין"
     intent_str = intent_summary or "—"
+    label      = {"instagram": "📸 אינסטגרם",
+                  "telegram":  "✈️ טלגרם"}.get(channel, channel)
 
-    text = (
-        f"🔔 ליד חדש מהבוט\n\n"
-        f"👤 שם: {name_str}\n"
-        f"📱 טלפון: {phone}\n"
-        f"💬 נושא: {intent_str}\n"
-        f"🕐 {now_str}\n\n"
-        f"לפתיחת השיחה: tg://user?id={chat_id}"
-    )
-    _send_telegram_message(settings.telegram_owner_chat_id, text)
-    logger.info(f"[leads] Owner alerted for lead {lead_id}")
+    lines = [
+        f"🔔 ליד חדש — {label}",
+        "",
+        f"👤 שם: {name_str}",
+        f"📱 טלפון: {phone}",
+        f"💬 נושא: {intent_str}",
+        f"🕐 {now_str}",
+        "",
+    ]
+    if channel == "telegram":
+        lines.append(f"לפתיחת השיחה: tg://user?id={chat_id}")
+    else:
+        # No working deep link from an IGSID alone — surface it for lookup.
+        lines.append(f"מזהה אינסטגרם (IGSID): {chat_id}")
+
+    _send_telegram_message(settings.telegram_owner_chat_id, "\n".join(lines))
+    logger.info(f"[leads] Owner alerted for lead {lead_id} ({channel})")
 
 
 # ─── CRM lead sync — swappable provider adapter ───────────────────────────────
@@ -2567,16 +2583,17 @@ def _db_mark_lead_synced(conn, lead_id: str, external_id: str) -> None:
 
 
 def _finalize_lead(lead_id: str, name: Optional[str], phone: str,
-                   intent_summary: Optional[str], chat_id: str) -> None:
+                   intent_summary: Optional[str], chat_id: str,
+                   channel: str = "telegram") -> None:
     """
-    Single post-save side-effect funnel for ALL three capture paths:
+    Single post-save side-effect funnel for ALL capture paths:
     owner alert → CRM sync → stamp notified_at (+ crm_synced_at on success),
     in one commit. Entirely best-effort: any failure is logged, never raised —
     the caller has already sent the user's confirmation. Leads that fail the CRM
     push keep crm_synced_at = NULL and are retried by /api/cron/crm-sync.
     """
     try:
-        _alert_owner(lead_id, name, phone, intent_summary, chat_id)
+        _alert_owner(lead_id, name, phone, intent_summary, chat_id, channel=channel)
     except Exception as e:
         logger.error(f"[leads] owner alert failed for {lead_id}: {e}")
 
@@ -3717,7 +3734,8 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                         conn.commit()
                     if lead_id:
                         channel.send_lead_thanks(igsid, None)
-                        _finalize_lead(lead_id, None, phone, intent_summary, igsid)
+                        _finalize_lead(lead_id, None, phone, intent_summary, igsid,
+                                       channel="instagram")
                         _audit("instagram_lead_captured", igsid=igsid, lead_id=lead_id)
                         _track("lead_captured", "instagram",
                                session_id=session_id, lead_id=lead_id)
