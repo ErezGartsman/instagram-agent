@@ -1930,40 +1930,54 @@ class TestAgreementSafetyNet:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# The Silent Filter — Instagram engagement gate (_ig_classify_engagement)
+# Strict deterministic gating (Instagram) — Icebreakers + story drop
 # ─────────────────────────────────────────────────────────────────────────────
-class TestInstagramSilentFilter:
+class TestInstagramIcebreakerGate:
     """
-    The gate must return CONSULT / INFO / SILENT, and — critically for a personal
-    account — degrade to SILENT on any ambiguity, unknown label, or parse error,
-    so normal followers are never spammed.
+    Cold-path engagement is purely deterministic: an exact Icebreaker match
+    engages; everything else stays silent. NO LLM is consulted on the cold path.
     """
 
-    def _gate(self, llm_raw):
-        with patch.object(main, "_call_llm", return_value=llm_raw):
-            return main._ig_classify_engagement("some message", history=[])
+    def test_exact_icebreaker_matches(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "ig_icebreakers",
+                            "אשמח לפרטים על ייעוץ|How do I book?")
+        assert main._ig_is_icebreaker("אשמח לפרטים על ייעוץ") is True
+        assert main._ig_is_icebreaker("How do I book?") is True
 
-    def test_consult_maps_through(self):
-        assert self._gate('{"action": "CONSULT"}') == "CONSULT"
+    def test_icebreaker_trims_whitespace(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "ig_icebreakers", "How do I book?")
+        assert main._ig_is_icebreaker("  How do I book?  ") is True
 
-    def test_info_maps_through(self):
-        assert self._gate('{"action": "INFO"}') == "INFO"
+    def test_non_icebreaker_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "ig_icebreakers", "How do I book?")
+        assert main._ig_is_icebreaker("hi") is False
+        assert main._ig_is_icebreaker("how do i book") is False   # case-sensitive
+        assert main._ig_is_icebreaker("I'd love details about consulting") is False
 
-    def test_silent_maps_through(self):
-        assert self._gate('{"action": "SILENT"}') == "SILENT"
+    def test_empty_config_matches_nothing(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "ig_icebreakers", "")
+        assert main._ig_is_icebreaker("anything") is False
+        assert main._ig_icebreaker_set() == set()
 
-    def test_unknown_label_degrades_to_silent(self):
-        # An out-of-range label must never accidentally engage.
-        assert self._gate('{"action": "MAYBE"}') == "SILENT"
 
-    def test_missing_action_degrades_to_silent(self):
-        assert self._gate('{"foo": "bar"}') == "SILENT"
+class TestInstagramStoryDrop:
+    """Story replies and story mentions must be detected for an instant drop."""
 
-    def test_unparseable_output_degrades_to_silent(self):
-        # LLM returns garbage → conservative SILENT, never a spurious reply.
-        assert self._gate("not json at all") == "SILENT"
+    def test_story_reply_detected(self):
+        msg = {"text": "that really moved me", "reply_to": {"story": {"id": "123"}}}
+        assert main._ig_is_story_message(msg) is True
 
-    def test_llm_exception_degrades_to_silent(self):
-        # A raised error inside the LLM call must be swallowed → SILENT.
-        with patch.object(main, "_call_llm", side_effect=RuntimeError("boom")):
-            assert main._ig_classify_engagement("hi", history=[]) == "SILENT"
+    def test_story_mention_attachment_detected(self):
+        msg = {"attachments": [{"type": "story_mention", "payload": {}}]}
+        assert main._ig_is_story_message(msg) is True
+
+    def test_plain_dm_is_not_a_story(self):
+        assert main._ig_is_story_message({"text": "How do I book?"}) is False
+
+    def test_reply_to_without_story_is_not_a_story(self):
+        # A reply to a normal message (not a story) is not a story message.
+        msg = {"text": "ok", "reply_to": {"mid": "abc"}}
+        assert main._ig_is_story_message(msg) is False
+
+    def test_non_dict_is_safe(self):
+        assert main._ig_is_story_message(None) is False
