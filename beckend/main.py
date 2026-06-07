@@ -2321,17 +2321,17 @@ def _db_mark_lead_notified(conn, lead_id: str) -> None:
 
 
 def _alert_owner(lead_id: str, name: str, phone: str, intent_summary: str,
-                 chat_id: str, channel: str = "telegram") -> None:
+                 chat_id: str, channel: str = "telegram",
+                 username: Optional[str] = None) -> None:
     """
     Instantly DM Erez on Telegram with the structured lead details. Best-effort —
     a delivery failure is logged but never propagated; the user's confirmation
     has already been sent and must not be affected.
 
-    Channel-aware: the "open conversation" deep link only works for Telegram,
-    where chat_id is the TG numeric user id. For Instagram the identifier is the
-    IGSID, so a tg:// link would be broken — we label the source as Instagram and
-    surface the IGSID for lookup instead. (A future change threads the resolved
-    @username through to build a real ig.me/m/<username> link.)
+    Channel-aware "open conversation" link:
+      • Telegram → tg://user?id=<chat_id> (chat_id is the TG numeric user id).
+      • Instagram + resolved @username → https://ig.me/m/<username> (a real DM link).
+      • Instagram without a username → surface the raw IGSID for manual lookup.
     """
     if not settings.telegram_owner_chat_id:
         logger.warning("[leads] TELEGRAM_OWNER_CHAT_ID not set — owner alert skipped.")
@@ -2354,8 +2354,10 @@ def _alert_owner(lead_id: str, name: str, phone: str, intent_summary: str,
     ]
     if channel == "telegram":
         lines.append(f"לפתיחת השיחה: tg://user?id={chat_id}")
+    elif username:
+        lines.append(f"לפתיחת השיחה: https://ig.me/m/{username}  (@{username})")
     else:
-        # No working deep link from an IGSID alone — surface it for lookup.
+        # No username resolved — surface the raw IGSID for manual lookup.
         lines.append(f"מזהה אינסטגרם (IGSID): {chat_id}")
 
     _send_telegram_message(settings.telegram_owner_chat_id, "\n".join(lines))
@@ -2386,13 +2388,17 @@ def _crm_enabled() -> bool:
 
 
 def _crm_sync_lead(name: Optional[str], phone: str,
-                   intent_summary: Optional[str]) -> Optional[str]:
+                   intent_summary: Optional[str],
+                   channel: str = "telegram",
+                   external_user_id: Optional[str] = None,
+                   username: Optional[str] = None) -> Optional[str]:
     """Dispatch a lead push to the configured provider. Returns the external id."""
     if not _crm_enabled():
         return None
     if settings.crm_provider == "fake":
         return _fake_sync_lead(name, phone, intent_summary)
-    return _hubspot_sync_lead(name, phone, intent_summary)
+    return _hubspot_sync_lead(name, phone, intent_summary, channel,
+                              external_user_id, username)
 
 
 def _fake_sync_lead(name: Optional[str], phone: str,
@@ -2457,32 +2463,76 @@ def _hubspot_request(method: str, path: str,
         return None
 
 
-def _hubspot_find_contact_by_phone(phone: str) -> Optional[str]:
-    """Idempotency layer 2: return an existing contact id matching this phone."""
-    if not phone:
+def _hubspot_find_contact_by_property(prop: str, value: str) -> Optional[str]:
+    """Return an existing contact id whose `prop` exactly equals `value`, else None."""
+    if not value:
         return None
     body = _hubspot_request("POST", "/crm/v3/objects/contacts/search", {
         "filterGroups": [
-            {"filters": [{"propertyName": "phone", "operator": "EQ", "value": phone}]}
+            {"filters": [{"propertyName": prop, "operator": "EQ", "value": value}]}
         ],
-        "properties": ["phone"],
+        "properties": [prop],
         "limit": 1,
     })
     results = (body or {}).get("results") or []
     return results[0].get("id") if results else None
 
 
+def _hubspot_find_contact_by_phone(phone: str) -> Optional[str]:
+    """Idempotency layer 2: existing contact id matching this phone."""
+    return _hubspot_find_contact_by_property("phone", phone)
+
+
+def _ig_fetch_username(igsid: str) -> Optional[str]:
+    """
+    Resolve an Instagram-scoped id (IGSID) to its @username via the Graph API
+    (graph.instagram.com — the Instagram-login host). Best-effort: returns None
+    on any error so a lookup failure never blocks lead capture or CRM sync.
+    """
+    if not (settings.ig_access_token and igsid):
+        return None
+    url = (f"https://graph.instagram.com/v21.0/{igsid}"
+           f"?fields=username&access_token={settings.ig_access_token}")
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode("utf-8") or "{}")
+        return body.get("username") or None
+    except Exception as e:
+        logger.warning(f"[instagram] username fetch for {igsid} failed: {e}")
+        return None
+
+
 def _hubspot_upsert_contact(name: Optional[str], phone: str,
-                            intent_summary: Optional[str]) -> Optional[str]:
-    """Find-or-create a Contact (deduped on phone). Returns the contact id."""
+                            intent_summary: Optional[str],
+                            channel: str = "telegram",
+                            external_user_id: Optional[str] = None,
+                            username: Optional[str] = None) -> Optional[str]:
+    """
+    Find-or-create a Contact. Dedup order: phone → instagram_psid → create.
+
+    For Instagram leads we also stamp the custom instagram_psid / instagram_username
+    properties, so the contact is identifiable and dedupable by IG identity even
+    when the phone differs or was reformatted across channels. Returns contact id.
+    """
     e164 = _crm_format_phone(phone)
     props: dict = {"phone": e164, "lifecyclestage": "lead", "hs_lead_status": "NEW"}
     if name:
         props["firstname"] = name
     if intent_summary and settings.hubspot_intent_property:
         props[settings.hubspot_intent_property] = intent_summary
+    if channel == "instagram":
+        if external_user_id:
+            props["instagram_psid"] = external_user_id
+        if username:
+            props["instagram_username"] = username
 
+    # Dedup: phone first, then Instagram-scoped id (catches the same person whose
+    # phone differs / was reformatted, or who has no phone match yet).
     existing = _hubspot_find_contact_by_phone(e164)
+    if not existing and channel == "instagram" and external_user_id:
+        existing = _hubspot_find_contact_by_property("instagram_psid", external_user_id)
+
     if existing:
         body = _hubspot_request("PATCH", f"/crm/v3/objects/contacts/{existing}",
                                 {"properties": props})
@@ -2540,14 +2590,19 @@ def _hubspot_resolve_stage() -> tuple:
     return _hubspot_pipeline_cache
 
 
-def _hubspot_create_deal(contact_id: str, name: Optional[str]) -> None:
+_CRM_CHANNEL_LABEL = {"instagram": "אינסטגרם", "telegram": "טלגרם"}
+
+
+def _hubspot_create_deal(contact_id: str, name: Optional[str],
+                         channel: str = "telegram") -> None:
     """Create a Deal in the resolved pipeline/stage, associated to the contact."""
     pipeline_id, stage_id = _hubspot_resolve_stage()
     if not (pipeline_id and stage_id):
         logger.warning("[crm] No deal pipeline/stage resolved — contact synced "
                        "without a deal.")
         return
-    deal_name = f"ליד טלגרם — {name}" if name else "ליד טלגרם"
+    label = _CRM_CHANNEL_LABEL.get(channel, channel)
+    deal_name = f"ליד {label} — {name}" if name else f"ליד {label}"
     _hubspot_request("POST", "/crm/v3/objects/deals", {
         "properties": {
             "dealname":  deal_name,
@@ -2563,12 +2618,20 @@ def _hubspot_create_deal(contact_id: str, name: Optional[str]) -> None:
 
 
 def _hubspot_sync_lead(name: Optional[str], phone: str,
-                       intent_summary: Optional[str]) -> Optional[str]:
+                       intent_summary: Optional[str],
+                       channel: str = "telegram",
+                       external_user_id: Optional[str] = None,
+                       username: Optional[str] = None) -> Optional[str]:
     """Upsert Contact (idempotent) + create associated Deal. Returns contact id."""
-    contact_id = _hubspot_upsert_contact(name, phone, intent_summary)
+    # Resolve the @username for Instagram leads when not already provided — e.g.
+    # the cron backstop path, which has no inline fetch.
+    if channel == "instagram" and not username and external_user_id:
+        username = _ig_fetch_username(external_user_id)
+    contact_id = _hubspot_upsert_contact(name, phone, intent_summary, channel,
+                                         external_user_id, username)
     if contact_id:
-        _hubspot_create_deal(contact_id, name)
-        logger.info(f"[crm] HubSpot synced lead → contact {contact_id}")
+        _hubspot_create_deal(contact_id, name, channel)
+        logger.info(f"[crm] HubSpot synced {channel} lead → contact {contact_id}")
     return contact_id
 
 
@@ -2592,14 +2655,20 @@ def _finalize_lead(lead_id: str, name: Optional[str], phone: str,
     the caller has already sent the user's confirmation. Leads that fail the CRM
     push keep crm_synced_at = NULL and are retried by /api/cron/crm-sync.
     """
+    # Resolve the @username once for Instagram (used by BOTH the alert deep link
+    # and the HubSpot record), so we never make the Graph call twice.
+    username = _ig_fetch_username(chat_id) if channel == "instagram" else None
+
     try:
-        _alert_owner(lead_id, name, phone, intent_summary, chat_id, channel=channel)
+        _alert_owner(lead_id, name, phone, intent_summary, chat_id,
+                     channel=channel, username=username)
     except Exception as e:
         logger.error(f"[leads] owner alert failed for {lead_id}: {e}")
 
     external_id = None
     try:
-        external_id = _crm_sync_lead(name, phone, intent_summary)
+        external_id = _crm_sync_lead(name, phone, intent_summary, channel=channel,
+                                     external_user_id=chat_id, username=username)
     except Exception as e:
         logger.error(f"[crm] sync failed for lead {lead_id}: {e}")
 
@@ -3893,13 +3962,17 @@ def cron_crm_sync(
         with get_db_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, name, phone, intent_summary FROM leads "
-                    "WHERE crm_synced_at IS NULL ORDER BY created_at LIMIT 50"
+                    "SELECT id, name, phone, intent_summary, channel, chat_id "
+                    "FROM leads WHERE crm_synced_at IS NULL "
+                    "ORDER BY created_at LIMIT 50"
                 )
                 pending = cur.fetchall()
 
-        for lead_id, name, phone, intent in pending:
-            external_id = _crm_sync_lead(name, phone, intent)
+        for lead_id, name, phone, intent, channel, chat_id in pending:
+            # Pass channel + chat_id so the backstop applies the same channel
+            # tagging + Instagram-id/username dedup as the inline path.
+            external_id = _crm_sync_lead(name, phone, intent, channel=channel,
+                                         external_user_id=chat_id)
             if external_id:
                 with get_db_conn() as conn:
                     _db_mark_lead_synced(conn, str(lead_id), external_id)

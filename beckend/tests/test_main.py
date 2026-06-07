@@ -1250,17 +1250,17 @@ class TestHubspotSyncLead:
     def test_creates_contact_and_deal(self, monkeypatch):
         monkeypatch.setattr(main.settings, "crm_provider", "hubspot")
         monkeypatch.setattr(main.settings, "hubspot_private_token", "pat-x")
-        monkeypatch.setattr(main, "_hubspot_upsert_contact", lambda n, p, i: "c123")
+        monkeypatch.setattr(main, "_hubspot_upsert_contact", lambda *a, **k: "c123")
         deals = []
         monkeypatch.setattr(main, "_hubspot_create_deal",
-                            lambda cid, name: deals.append((cid, name)))
+                            lambda cid, name, *a, **k: deals.append((cid, name)))
         assert main._crm_sync_lead("דנה", "0521234567", "y") == "c123"
         assert deals == [("c123", "דנה")]               # deal created + associated
 
     def test_no_deal_when_contact_fails(self, monkeypatch):
         monkeypatch.setattr(main.settings, "crm_provider", "hubspot")
         monkeypatch.setattr(main.settings, "hubspot_private_token", "pat-x")
-        monkeypatch.setattr(main, "_hubspot_upsert_contact", lambda n, p, i: None)
+        monkeypatch.setattr(main, "_hubspot_upsert_contact", lambda *a, **k: None)
         called = []
         monkeypatch.setattr(main, "_hubspot_create_deal", lambda *a: called.append(1))
         assert main._crm_sync_lead("x", "0521234567", "y") is None
@@ -1271,7 +1271,7 @@ class TestFinalizeLead:
     """The single post-save funnel: best-effort, never raises, stamps state."""
     def test_marks_synced_on_success(self, client, monkeypatch):
         monkeypatch.setattr(main, "_alert_owner", lambda *a, **k: None)
-        monkeypatch.setattr(main, "_crm_sync_lead", lambda n, p, i: "c999")
+        monkeypatch.setattr(main, "_crm_sync_lead", lambda *a, **k: "c999")
         notified, synced = [], []
         monkeypatch.setattr(main, "_db_mark_lead_notified",
                             lambda c, lid: notified.append(lid))
@@ -1321,9 +1321,10 @@ class TestCronCrmSync:
     def test_processes_pending_leads(self, client, monkeypatch):
         monkeypatch.setattr(main.settings, "cron_secret", "")
         monkeypatch.setattr(main, "_crm_enabled", lambda: True)
-        _patch_conn(client, fetchall=[("lead1", "דנה", "0521234567", "y")])
+        _patch_conn(client, fetchall=[
+            ("lead1", "דנה", "0521234567", "y", "telegram", "777")])
         synced = []
-        monkeypatch.setattr(main, "_crm_sync_lead", lambda n, p, i: "cX")
+        monkeypatch.setattr(main, "_crm_sync_lead", lambda *a, **k: "cX")
         monkeypatch.setattr(main, "_db_mark_lead_synced",
                             lambda c, lid, eid: synced.append((lid, eid)))
         r = client.get("/api/cron/crm-sync")
@@ -2087,3 +2088,101 @@ class TestOwnerAlertChannelAware:
                             lambda *a, **k: called.append(1))
         main._alert_owner("lead1", None, "972", "i", "x", channel="instagram")
         assert called == []   # no send attempt when owner chat id unset
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HubSpot Instagram sync — channel tagging, IG-id dedup, username resolution
+# ─────────────────────────────────────────────────────────────────────────────
+class TestHubSpotInstagram:
+    def test_upsert_sets_ig_props_and_creates_when_new(self, monkeypatch):
+        calls = []
+
+        def fake_req(method, path, payload=None):
+            calls.append((method, path, payload))
+            if path.endswith("/search"):
+                return {"results": []}                 # no existing match
+            if method == "POST" and path == "/crm/v3/objects/contacts":
+                return {"id": "C1"}
+            return {}
+
+        monkeypatch.setattr(main, "_hubspot_request", fake_req)
+        monkeypatch.setattr(main.settings, "hubspot_intent_property", "")
+        cid = main._hubspot_upsert_contact(
+            "דני", "0501234567", "נושא",
+            channel="instagram", external_user_id="IG123", username="dani")
+        assert cid == "C1"
+        create = [c for c in calls
+                  if c[0] == "POST" and c[1] == "/crm/v3/objects/contacts"][0]
+        props = create[2]["properties"]
+        assert props["instagram_psid"]      == "IG123"
+        assert props["instagram_username"]  == "dani"
+
+    def test_dedup_by_instagram_psid_when_phone_misses(self, monkeypatch):
+        def fake_req(method, path, payload=None):
+            if path.endswith("/search"):
+                prop = payload["filterGroups"][0]["filters"][0]["propertyName"]
+                return {"results": [{"id": "C9"}]} if prop == "instagram_psid" else {"results": []}
+            return {}   # PATCH → not None
+
+        monkeypatch.setattr(main, "_hubspot_request", fake_req)
+        cid = main._hubspot_upsert_contact(
+            None, "0500000000", None,
+            channel="instagram", external_user_id="IGZ")
+        assert cid == "C9"   # matched by IG psid, then PATCHed
+
+    def test_telegram_upsert_does_not_set_ig_props(self, monkeypatch):
+        calls = []
+
+        def fake_req(method, path, payload=None):
+            calls.append((method, path, payload))
+            if path.endswith("/search"):
+                return {"results": []}
+            if method == "POST" and path == "/crm/v3/objects/contacts":
+                return {"id": "T1"}
+            return {}
+
+        monkeypatch.setattr(main, "_hubspot_request", fake_req)
+        monkeypatch.setattr(main.settings, "hubspot_intent_property", "")
+        main._hubspot_upsert_contact("x", "0501112222", None)   # channel defaults telegram
+        create = [c for c in calls
+                  if c[0] == "POST" and c[1] == "/crm/v3/objects/contacts"][0]
+        assert "instagram_psid" not in create[2]["properties"]
+
+
+class TestIgFetchUsername:
+    def test_parses_username(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "ig_access_token", "tok")
+
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b'{"username": "erez_gersman", "id": "IG1"}'
+
+        monkeypatch.setattr(main.urllib.request, "urlopen",
+                            lambda req, timeout=10: FakeResp())
+        assert main._ig_fetch_username("IG1") == "erez_gersman"
+
+    def test_safe_on_network_error(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "ig_access_token", "tok")
+
+        def boom(req, timeout=10):
+            raise RuntimeError("net down")
+
+        monkeypatch.setattr(main.urllib.request, "urlopen", boom)
+        assert main._ig_fetch_username("IG1") is None
+
+    def test_none_without_token(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "ig_access_token", "")
+        assert main._ig_fetch_username("IG1") is None
+
+
+class TestOwnerAlertIgMeLink:
+    def test_uses_igme_link_when_username_resolved(self, monkeypatch):
+        sent = {}
+        monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "999")
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, **k: sent.update(text=text))
+        main._alert_owner("l", "דני", "972", "נושא", "IGSID9",
+                          channel="instagram", username="dani")
+        assert "ig.me/m/dani" in sent["text"]
+        assert "@dani" in sent["text"]
