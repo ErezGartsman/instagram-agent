@@ -2232,3 +2232,22 @@ class TestOwnerAlertIgMeLink:
                           channel="instagram", username="dani")
         assert "ig.me/m/dani" in sent["text"]
         assert "@dani" in sent["text"]
+
+    def test_name_field_falls_back_to_username_when_no_name(self, monkeypatch):
+        # IG funnel skips the name → the "שם" field shows @username, not "לא צוין".
+        sent = {}
+        monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "999")
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, **k: sent.update(text=text))
+        main._alert_owner("l", None, "972", "נושא", "IGSID9",
+                          channel="instagram", username="erez_g")
+        assert "שם: @erez_g" in sent["text"]
+        assert "לא צוין" not in sent["text"]
+
+    def test_name_field_uses_not_specified_when_no_name_no_username(self, monkeypatch):
+        sent = {}
+        monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "999")
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, **k: sent.update(text=text))
+        main._alert_owner("l", None, "972", "נושא", "IGSID9", channel="instagram")
+        assert "לא צוין" in sent["text"]

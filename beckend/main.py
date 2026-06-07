@@ -2338,7 +2338,10 @@ def _alert_owner(lead_id: str, name: str, phone: str, intent_summary: str,
         return
 
     now_str    = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M UTC")
-    name_str   = name or "לא צוין"
+    # IG funnel skips asking for a name; fall back to the resolved @username so
+    # the alert shows a human handle instead of "לא צוין".
+    name_str   = name or (f"@{username}" if channel == "instagram" and username
+                          else "לא צוין")
     intent_str = intent_summary or "—"
     label      = {"instagram": "📸 אינסטגרם",
                   "telegram":  "✈️ טלגרם"}.get(channel, channel)
