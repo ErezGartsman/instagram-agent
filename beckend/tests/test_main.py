@@ -2285,33 +2285,84 @@ class TestLeadBrief:
         assert "4/5" in msg
         assert "בעלי בגד בי" in msg
 
-    def test_deliver_sends_telegram_and_hubspot_note(self, monkeypatch):
-        monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "999")
-        monkeypatch.setattr(main, "_generate_lead_brief",
-                            lambda ctx, history=None: {"topic": "t", "emotional_state": "e",
-                                                       "urgency": 3, "opening": "o"})
-        tg, notes = [], []
-        monkeypatch.setattr(main, "_send_telegram_message",
-                            lambda cid, text, **k: tg.append(text))
-        monkeypatch.setattr(main, "_hubspot_add_note",
-                            lambda cid, body: notes.append((cid, body)))
-
+    def _patch_lead_row(self, monkeypatch, row):
         from contextlib import contextmanager
-        mock_conn, mock_cursor = _make_mock_conn(fetchone_return=("HSCONTACT1",))
+        mock_conn, _ = _make_mock_conn(fetchone_return=row)
 
         @contextmanager
         def _cm():
             yield mock_conn
 
         monkeypatch.setattr(main, "get_db_conn", _cm)
+
+    def test_deliver_edits_alert_in_place_and_adds_note(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "999")
+        monkeypatch.setattr(main.settings, "ig_access_token", "")   # no username re-fetch
+        monkeypatch.setattr(main, "_generate_lead_brief",
+                            lambda ctx, history=None: {"topic": "בגידה", "emotional_state": "כאב",
+                                                       "urgency": 3, "opening": "o"})
+        edits, sends, notes = [], [], []
+        monkeypatch.setattr(main, "_edit_telegram_message",
+                            lambda cid, mid, text: (edits.append((mid, text)), True)[1])
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda *a, **k: sends.append(1))
+        monkeypatch.setattr(main, "_hubspot_add_note",
+                            lambda cid, body: notes.append(cid))
+        # lead row: (phone, alert_message_id, crm_external_id)
+        self._patch_lead_row(monkeypatch, ("0501234567", "555", "HSCONTACT1"))
+
         main._deliver_lead_brief("IGSID9", "בעלי בגד בי", history=[])
-        assert len(tg) == 1                       # Telegram brief sent
-        assert notes == [("HSCONTACT1", tg[0])] or notes[0][0] == "HSCONTACT1"
+        assert len(edits) == 1                  # edited the original alert
+        assert edits[0][0] == "555"             # ...using the stored message_id
+        assert "תקציר ליד" in edits[0][1]       # brief folded into the message
+        assert sends == []                      # NO second message
+        assert notes == ["HSCONTACT1"]          # HubSpot note added
+
+    def test_deliver_falls_back_to_send_when_no_message_id(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "999")
+        monkeypatch.setattr(main, "_generate_lead_brief",
+                            lambda ctx, history=None: {"topic": "t", "emotional_state": "e",
+                                                       "urgency": 3, "opening": "o"})
+        sends = []
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, **k: sends.append(text))
+        monkeypatch.setattr(main, "_hubspot_add_note", lambda cid, body: None)
+        # alert_message_id is None → cannot edit → fall back to a standalone send.
+        self._patch_lead_row(monkeypatch, ("0501234567", None, "HSCONTACT1"))
+
+        main._deliver_lead_brief("IGSID9", "ctx", history=[])
+        assert len(sends) == 1                  # fallback message sent
+        assert "תקציר ליד" in sends[0]
 
     def test_deliver_noop_when_brief_none(self, monkeypatch):
         monkeypatch.setattr(main, "_generate_lead_brief", lambda *a, **k: None)
         called = []
         monkeypatch.setattr(main, "_send_telegram_message",
                             lambda *a, **k: called.append(1))
+        monkeypatch.setattr(main, "_edit_telegram_message",
+                            lambda *a, **k: called.append(1))
         main._deliver_lead_brief("IGSID9", "ctx", history=[])
-        assert called == []                       # nothing sent when no brief
+        assert called == []                       # nothing sent/edited when no brief
+
+
+class TestLeadAlertFormatting:
+    def test_instagram_alert_omits_topic_line(self):
+        txt = main._format_lead_alert(name=None, phone="972", intent_summary="ICEBREAKER NOISE",
+                                      chat_id="IG1", channel="instagram", username="dani")
+        assert "נושא" not in txt                  # IG drops the useless topic line
+        assert "ICEBREAKER NOISE" not in txt
+        assert "ig.me/m/dani" in txt
+
+    def test_telegram_alert_keeps_topic_line(self):
+        txt = main._format_lead_alert(name="דנה", phone="972", intent_summary="גירושין",
+                                      chat_id="12345", channel="telegram")
+        assert "נושא: גירושין" in txt             # Telegram keeps real topic
+
+    def test_brief_block_appended_when_provided(self):
+        brief = {"topic": "בגידה", "emotional_state": "כאב", "urgency": 4, "opening": "בוא נדבר"}
+        txt = main._format_lead_alert(name=None, phone="972", intent_summary=None,
+                                      chat_id="IG1", channel="instagram",
+                                      username="dani", brief=brief)
+        assert "תקציר ליד" in txt
+        assert "בגידה" in txt
+        assert "4/5" in txt

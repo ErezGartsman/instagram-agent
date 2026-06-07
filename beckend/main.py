@@ -2320,51 +2320,87 @@ def _db_mark_lead_notified(conn, lead_id: str) -> None:
         )
 
 
-def _alert_owner(lead_id: str, name: str, phone: str, intent_summary: str,
-                 chat_id: str, channel: str = "telegram",
-                 username: Optional[str] = None) -> None:
-    """
-    Instantly DM Erez on Telegram with the structured lead details. Best-effort —
-    a delivery failure is logged but never propagated; the user's confirmation
-    has already been sent and must not be affected.
-
-    Channel-aware "open conversation" link:
-      • Telegram → tg://user?id=<chat_id> (chat_id is the TG numeric user id).
-      • Instagram + resolved @username → https://ig.me/m/<username> (a real DM link).
-      • Instagram without a username → surface the raw IGSID for manual lookup.
-    """
-    if not settings.telegram_owner_chat_id:
-        logger.warning("[leads] TELEGRAM_OWNER_CHAT_ID not set — owner alert skipped.")
+def _db_set_lead_alert_message_id(conn, lead_id: str, message_id) -> None:
+    """Persist the Telegram message_id of the capture alert so the later brief
+    pass can edit that same message in place (single evolving alert)."""
+    if not message_id:
         return
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE leads SET alert_message_id = %s WHERE id = %s",
+            (str(message_id), lead_id),
+        )
 
-    now_str    = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M UTC")
-    # IG funnel skips asking for a name; fall back to the resolved @username so
-    # the alert shows a human handle instead of "לא צוין".
-    name_str   = name or (f"@{username}" if channel == "instagram" and username
-                          else "לא צוין")
-    intent_str = intent_summary or "—"
-    label      = {"instagram": "📸 אינסטגרם",
-                  "telegram":  "✈️ טלגרם"}.get(channel, channel)
+
+def _format_lead_alert(name: str, phone: str, intent_summary: str, chat_id: str,
+                       channel: str = "telegram", username: Optional[str] = None,
+                       brief: Optional[dict] = None) -> str:
+    """
+    Build the owner-alert text. Shared by the instant capture alert (brief=None)
+    and the later edit-in-place enrichment (brief=<dict>), so the evolving message
+    is formatted in exactly one place.
+
+    Channel rules:
+      • Telegram shows the "נושא" line (it has real conversation history).
+      • Instagram omits "נושא" at capture (it would only echo the generic
+        Icebreaker text); the real topic arrives via the appended brief.
+      • Link: Telegram → tg://user?id=…, Instagram → ig.me/m/<username> (or IGSID).
+    """
+    now_str  = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M UTC")
+    name_str = name or (f"@{username}" if channel == "instagram" and username
+                        else "לא צוין")
+    label    = {"instagram": "📸 אינסטגרם", "telegram": "✈️ טלגרם"}.get(channel, channel)
 
     lines = [
         f"🔔 ליד חדש — {label}",
         "",
         f"👤 שם: {name_str}",
         f"📱 טלפון: {phone}",
-        f"💬 נושא: {intent_str}",
-        f"🕐 {now_str}",
-        "",
     ]
+    # "נושא" is meaningful only for Telegram; for Instagram it's the Icebreaker echo.
+    if channel != "instagram":
+        lines.append(f"💬 נושא: {intent_summary or '—'}")
+    lines.append(f"🕐 {now_str}")
+    lines.append("")
     if channel == "telegram":
         lines.append(f"לפתיחת השיחה: tg://user?id={chat_id}")
     elif username:
         lines.append(f"לפתיחת השיחה: https://ig.me/m/{username}  (@{username})")
     else:
-        # No username resolved — surface the raw IGSID for manual lookup.
         lines.append(f"מזהה אינסטגרם (IGSID): {chat_id}")
 
-    _send_telegram_message(settings.telegram_owner_chat_id, "\n".join(lines))
-    logger.info(f"[leads] Owner alerted for lead {lead_id} ({channel})")
+    # Appended only on the edit-in-place enrichment pass.
+    if brief:
+        urgency = brief.get("urgency")
+        lines += [
+            "",
+            "🧠 תקציר ליד",
+            f"📌 נושא: {brief.get('topic') or '—'}",
+            f"❤️ מצב: {brief.get('emotional_state') or '—'}",
+            f"⚡ דחיפות: {urgency}/5" if urgency else "⚡ דחיפות: —",
+            f"🗣️ פתיח מוצע: {brief.get('opening') or '—'}",
+        ]
+    return "\n".join(lines)
+
+
+def _alert_owner(lead_id: str, name: str, phone: str, intent_summary: str,
+                 chat_id: str, channel: str = "telegram",
+                 username: Optional[str] = None):
+    """
+    Instantly DM Erez on Telegram with the structured lead details. Best-effort —
+    a delivery failure is logged but never propagated. Returns the sent Telegram
+    message_id (so it can be persisted and later edited to append the brief), or
+    None if the alert was skipped / failed.
+    """
+    if not settings.telegram_owner_chat_id:
+        logger.warning("[leads] TELEGRAM_OWNER_CHAT_ID not set — owner alert skipped.")
+        return None
+
+    text = _format_lead_alert(name, phone, intent_summary, chat_id, channel, username)
+    message_id = _send_telegram_message(settings.telegram_owner_chat_id, text)
+    logger.info(f"[leads] Owner alerted for lead {lead_id} ({channel}) "
+                f"msg_id={message_id}")
+    return message_id
 
 
 # ─── CRM lead sync — swappable provider adapter ───────────────────────────────
@@ -2677,9 +2713,10 @@ def _finalize_lead(lead_id: str, name: Optional[str], phone: str,
             logger.warning(f"[leads] username fetch failed for {chat_id}: {e} — "
                            "alert will fire with IGSID fallback")
 
+    alert_message_id = None
     try:
-        _alert_owner(lead_id, name, phone, intent_summary, chat_id,
-                     channel=channel, username=username)
+        alert_message_id = _alert_owner(lead_id, name, phone, intent_summary,
+                                        chat_id, channel=channel, username=username)
     except Exception as e:
         logger.error(f"[leads] owner alert failed for {lead_id}: {e}")
 
@@ -2695,6 +2732,7 @@ def _finalize_lead(lead_id: str, name: Optional[str], phone: str,
             _db_mark_lead_notified(conn, lead_id)
             if external_id:
                 _db_mark_lead_synced(conn, lead_id, external_id)
+            _db_set_lead_alert_message_id(conn, lead_id, alert_message_id)
             conn.commit()
     except Exception as e:
         logger.error(f"[leads] finalize bookkeeping failed for {lead_id}: {e}")
@@ -2772,9 +2810,11 @@ def _format_brief_message(brief: dict, context_text: str) -> str:
 
 def _deliver_lead_brief(igsid: str, context_text: str, history: list = None) -> None:
     """
-    Generate the brief and deliver it to BOTH channels Erez asked for:
-      1. a second Telegram DM (pops up seconds before he opens WhatsApp), and
-      2. a Note appended to the HubSpot contact (if already synced).
+    Generate the brief and deliver it to BOTH channels Erez asked for, WITHOUT
+    cluttering Telegram with a second message:
+      1. EDIT the original capture alert in place to append the 🧠 brief block
+         (falls back to a new message only if the edit can't be done), and
+      2. append a Note to the HubSpot contact (if already synced).
     Best-effort throughout; a failure in either leg never affects the other or
     the lead itself.
     """
@@ -2782,34 +2822,55 @@ def _deliver_lead_brief(igsid: str, context_text: str, history: list = None) -> 
     if not brief:
         return
 
-    # 1) Telegram DM to the owner.
-    if settings.telegram_owner_chat_id:
-        try:
-            _send_telegram_message(settings.telegram_owner_chat_id,
-                                   _format_brief_message(brief, context_text))
-        except Exception as e:
-            logger.warning(f"[brief] telegram delivery failed: {e}")
-
-    # 2) HubSpot note on the contact — only if the lead is already synced
-    #    (crm_external_id holds the HubSpot contact id).
+    # Pull what we need to rebuild the alert: phone + the stored message_id (for
+    # the edit) + crm_external_id (for the HubSpot note), in one query.
+    phone = alert_message_id = contact_id = None
     try:
         with get_db_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT crm_external_id FROM leads "
+                    "SELECT phone, alert_message_id, crm_external_id FROM leads "
                     "WHERE channel = 'instagram' AND chat_id = %s "
                     "ORDER BY created_at DESC LIMIT 1",
                     (igsid,),
                 )
                 row = cur.fetchone()
-        contact_id = row[0] if row else None
-        if contact_id:
-            _hubspot_add_note(contact_id, _format_brief_message(brief, context_text))
-        else:
-            logger.info("[brief] contact not yet synced — HubSpot note deferred "
-                        "(cron will sync the lead; brief Telegram already sent).")
+        if row:
+            phone, alert_message_id, contact_id = row[0], row[1], row[2]
     except Exception as e:
-        logger.warning(f"[brief] HubSpot note failed: {e}")
+        logger.warning(f"[brief] lead lookup failed: {e}")
+
+    # 1) Telegram — edit the capture alert in place (single evolving message).
+    if settings.telegram_owner_chat_id:
+        edited = False
+        if alert_message_id:
+            # Re-resolve @username so the rebuilt alert keeps its ig.me link.
+            try:
+                username = _ig_fetch_username(igsid)
+            except Exception:
+                username = None
+            full_text = _format_lead_alert(
+                name=None, phone=phone or "—", intent_summary=None, chat_id=igsid,
+                channel="instagram", username=username, brief=brief)
+            edited = _edit_telegram_message(
+                settings.telegram_owner_chat_id, alert_message_id, full_text)
+        if not edited:
+            # No message_id, or the edit failed → fall back to a standalone msg.
+            try:
+                _send_telegram_message(settings.telegram_owner_chat_id,
+                                       _format_brief_message(brief, context_text))
+            except Exception as e:
+                logger.warning(f"[brief] telegram fallback send failed: {e}")
+
+    # 2) HubSpot note on the contact — only if already synced.
+    if contact_id:
+        try:
+            _hubspot_add_note(contact_id, _format_brief_message(brief, context_text))
+        except Exception as e:
+            logger.warning(f"[brief] HubSpot note failed: {e}")
+    else:
+        logger.info("[brief] contact not yet synced — HubSpot note deferred "
+                    "(cron will sync the lead; Telegram brief already delivered).")
 
 
 # Bot-authored system messages are Hebrew to match the representative persona.
@@ -2828,20 +2889,22 @@ def _db_get_or_create_telegram_session(conn, chat_id: str) -> str:
     return _db_get_or_create_channel_session(conn, "telegram", chat_id)
 
 
-def _send_telegram_message(chat_id, text: str, reply_markup: dict = None) -> None:
+def _send_telegram_message(chat_id, text: str, reply_markup: dict = None):
     """
     Deliver a reply via Telegram's sendMessage. Uses the stdlib urllib so no HTTP
     dependency is added to the serverless bundle. Best-effort: any network error
     is logged, never raised — the webhook must always return 200 or Telegram will
     retry the update and the user gets duplicate replies.
 
+    Returns the sent message_id (int) on success, or None — callers that want to
+    later edit the message (e.g. the lead alert) persist this id; all other
+    callers simply ignore the return value.
+
     reply_markup: optional Telegram ReplyKeyboardMarkup / ReplyKeyboardRemove dict.
-    Pass {"keyboard": [[{"text": "…", "request_contact": true}]], …} to show a
-    contact-share button, or {"remove_keyboard": true} to dismiss it.
     """
     if not settings.telegram_bot_token:
         logger.error("[telegram] TELEGRAM_BOT_TOKEN not set — cannot send reply.")
-        return
+        return None
 
     text    = (text or "").strip()[:4096] or "…"   # Telegram hard-caps at 4096 chars
     url     = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
@@ -2854,9 +2917,36 @@ def _send_telegram_message(chat_id, text: str, reply_markup: dict = None) -> Non
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            resp.read()
+            body = json.loads(resp.read().decode("utf-8") or "{}")
+        return (body.get("result") or {}).get("message_id")
     except Exception as e:
         logger.error(f"[telegram] sendMessage to {chat_id} failed: {e}")
+        return None
+
+
+def _edit_telegram_message(chat_id, message_id, text: str) -> bool:
+    """
+    Replace the text of an already-sent Telegram message via editMessageText.
+    Used to fold the Lead Brief INTO the original capture alert (one evolving
+    message instead of two). Best-effort: returns True on success, False on any
+    failure (caller falls back to sending a new message).
+    """
+    if not (settings.telegram_bot_token and message_id):
+        return False
+    text = (text or "").strip()[:4096] or "…"
+    url  = f"https://api.telegram.org/bot{settings.telegram_bot_token}/editMessageText"
+    data = json.dumps({"chat_id": chat_id, "message_id": message_id,
+                       "text": text}).encode("utf-8")
+    req  = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+        return True
+    except Exception as e:
+        logger.warning(f"[telegram] editMessageText {message_id} failed: {e}")
+        return False
 
 
 def _send_contact_keyboard(chat_id, preamble: str) -> None:
