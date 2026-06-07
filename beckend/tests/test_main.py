@@ -1927,3 +1927,43 @@ class TestAgreementSafetyNet:
         r = client.post("/api/webhook/telegram", json=self._update(text="כן"))
         assert r.status_code == 200
         assert keyboards == []                            # no false funnel entry
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The Silent Filter — Instagram engagement gate (_ig_classify_engagement)
+# ─────────────────────────────────────────────────────────────────────────────
+class TestInstagramSilentFilter:
+    """
+    The gate must return CONSULT / INFO / SILENT, and — critically for a personal
+    account — degrade to SILENT on any ambiguity, unknown label, or parse error,
+    so normal followers are never spammed.
+    """
+
+    def _gate(self, llm_raw):
+        with patch.object(main, "_call_llm", return_value=llm_raw):
+            return main._ig_classify_engagement("some message", history=[])
+
+    def test_consult_maps_through(self):
+        assert self._gate('{"action": "CONSULT"}') == "CONSULT"
+
+    def test_info_maps_through(self):
+        assert self._gate('{"action": "INFO"}') == "INFO"
+
+    def test_silent_maps_through(self):
+        assert self._gate('{"action": "SILENT"}') == "SILENT"
+
+    def test_unknown_label_degrades_to_silent(self):
+        # An out-of-range label must never accidentally engage.
+        assert self._gate('{"action": "MAYBE"}') == "SILENT"
+
+    def test_missing_action_degrades_to_silent(self):
+        assert self._gate('{"foo": "bar"}') == "SILENT"
+
+    def test_unparseable_output_degrades_to_silent(self):
+        # LLM returns garbage → conservative SILENT, never a spurious reply.
+        assert self._gate("not json at all") == "SILENT"
+
+    def test_llm_exception_degrades_to_silent(self):
+        # A raised error inside the LLM call must be swallowed → SILENT.
+        with patch.object(main, "_call_llm", side_effect=RuntimeError("boom")):
+            assert main._ig_classify_engagement("hi", history=[]) == "SILENT"

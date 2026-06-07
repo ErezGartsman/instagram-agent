@@ -3444,6 +3444,63 @@ def _process_instagram_events(body: dict) -> None:
             _handle_instagram_dm(channel, sender_igsid, text)
 
 
+# ── The Silent Filter (Instagram only) ────────────────────────────────────────
+# On Erez's PERSONAL account the bot must behave as a discreet business assistant:
+# it replies ONLY to explicit business intent and stays completely silent on
+# greetings, story reactions, emojis, and off-topic chatter — so normal followers
+# are never spammed. This LLM gate is the enforcement point.
+_IG_ENGAGEMENT_PROMPT = """\
+You are a STRICT gatekeeper for the Instagram DM assistant of Erez Gartsman, a \
+relationship & dating coach. This is his PERSONAL Instagram account, so the \
+assistant must reply ONLY to genuine BUSINESS inquiries and stay completely \
+SILENT on everything else. Authenticity matters more than catching a lead.
+
+Classify the user's latest message into exactly one action:
+
+  • "CONSULT" — the user explicitly wants to book, schedule, or be contacted, or \
+    asks to talk to Erez personally (e.g. "אני רוצה לקבוע", "can I book a call", \
+    "איך מתאמים פגישה", "I'd like a consultation").
+
+  • "INFO" — a genuine question about the professional offering: what Erez does, \
+    his coaching / approach, the services, pricing, how it works, or who he is \
+    PROFESSIONALLY (e.g. "מי זה ארז?", "what do you offer?", "כמה זה עולה?").
+
+  • "SILENT" — EVERYTHING ELSE: greetings / small talk ("hi", "שלום", "מה נשמע", \
+    "👋"), reactions to a story, emojis, compliments, memes, personal venting \
+    that is NOT a request for coaching, off-topic chatter, spam, or anything \
+    ambiguous.
+
+When in doubt, choose "SILENT".
+
+{history_block}=== OUTPUT — STRICT JSON, NOTHING ELSE ===
+{{"action": "CONSULT" or "INFO" or "SILENT"}}
+
+User message: "{question}"
+"""
+
+
+def _ig_classify_engagement(text: str, history: list = None) -> str:
+    """
+    The Silent Filter. Returns "CONSULT", "INFO", or "SILENT".
+
+    Conservative by design: any parse failure or unknown label degrades to
+    "SILENT", because on a personal account a spurious reply to a friend is worse
+    than a missed lead. The LLM sees recent history, so a business follow-up
+    ("ומה לגבי המחיר?") is still recognised mid-conversation.
+    """
+    prompt = _IG_ENGAGEMENT_PROMPT.format(
+        history_block=_build_rag_history_block(history or []),
+        question=text,
+    )
+    try:
+        parsed = _parse_llm_json(_call_llm(prompt))
+        action = parsed.get("action")
+        return action if action in ("CONSULT", "INFO", "SILENT") else "SILENT"
+    except Exception as e:
+        logger.warning(f"[instagram] engagement gate failed → SILENT: {e}")
+        return "SILENT"
+
+
 def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> None:
     """
     Shared funnel handler for Instagram DMs.
@@ -3481,16 +3538,12 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
             pass
         return
 
-    # ── Content guards ────────────────────────────────────────────────────────
-    if len(text) > 1500:
-        channel.send_text(igsid, _IG_TOO_LONG)
-        return
-    try:
-        validate_question(text)
-    except InputModerationError:
-        _audit("instagram_moderation_block", igsid=igsid)
-        channel.send_text(igsid, _IG_MODERATION)
-        return
+    # NOTE: content guards (length / moderation) are deliberately deferred to the
+    # cold-message path below. They must run AFTER the funnel state machine so a
+    # short in-funnel reply like "כן" (2 chars) is never rejected as "too short"
+    # before the offer-classifier sees it — that was the live "Yes → fallback"
+    # bug. On a cold message a guard failure becomes a SILENT drop (Silent
+    # Filter), not a moderation reply.
 
     try:
         with get_db_conn() as conn:
@@ -3624,7 +3677,15 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                 channel.send_contact_prompt(igsid, _TG_AWAITING_CONTACT_RETRY)
                 return
 
-        # ── Regex phone fallback (free-form conversation) ─────────────────────
+        # ─────────────────────────────────────────────────────────────────────
+        # COLD MESSAGE (no active funnel state consumed it above).
+        # Everything below runs only for messages that are NOT mid-funnel.
+        # ─────────────────────────────────────────────────────────────────────
+
+        # ── Regex phone fallback: a typed phone number is strong, explicit
+        #    business intent — capture it even on a cold message. Runs BEFORE the
+        #    guards so a bare number isn't blocked, and BEFORE the gate to save a
+        #    classifier call. ───────────────────────────────────────────────────
         phone_in_text = _extract_phone_from_text(text)
         if phone_in_text and not already_lead:
             try:
@@ -3642,7 +3703,9 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
             except Exception as e:
                 logger.error(f"[instagram] Regex capture failed: {e}", exc_info=True)
 
-        # ── Safety-net: affirmation after lost state ──────────────────────────
+        # ── Safety-net: WE offered earlier (state since expired) and the user
+        #    now affirms — honour it. Runs BEFORE the guards/gate because "כן" is
+        #    short and would otherwise be filtered out. ──────────────────────────
         if (bot_state is None and not already_lead
                 and _is_affirmation(text) and _last_bot_message_offered(history)):
             with get_db_conn() as conn:
@@ -3655,8 +3718,24 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                    session_id=session_id)
             return
 
-        # ── Booking-intent: deterministic funnel entry ────────────────────────
-        if bot_state is None and _has_booking_intent(text):
+        # ── Cheap pre-filter: silently drop trivially short or harmful cold
+        #    messages (e.g. "hi" < 3 chars, blocked terms) with NO reply. ────────
+        try:
+            validate_question(text)
+        except InputModerationError:
+            _audit("instagram_silent_drop", igsid=igsid, reason="prefilter")
+            return   # SILENT
+
+        # ── THE SILENT FILTER ─────────────────────────────────────────────────
+        # Only explicit business intent earns a reply; everything else is dropped
+        # silently so normal followers are never spammed.
+        action = _ig_classify_engagement(text, history)
+        if action == "SILENT":
+            _audit("instagram_silent_drop", igsid=igsid, reason="gate")
+            return   # do NOT reply
+
+        # ── CONSULT: explicit scheduling intent → deterministic booking funnel ─
+        if action == "CONSULT":
             if already_lead:
                 reply_text  = _TG_ALREADY_LEAD_BOOKING
                 new_state   = None
@@ -3665,7 +3744,6 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                 reply_text  = _TG_QUALIFICATION_QUESTION
                 new_state   = "awaiting_qualification"
                 audit_event = "instagram_qualification_triggered"
-
             with get_db_conn() as conn:
                 _db_save_message(conn, session_id, "user", text)
                 _db_save_message(conn, session_id, "assistant", reply_text)
@@ -3677,35 +3755,25 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
             _audit(audit_event, igsid=igsid, session_id=session_id)
             return
 
-        # ── PATH B: triage LLM ────────────────────────────────────────────────
+        # ── INFO: answer accurately from the knowledge base. ──────────────────
+        # Deliberately NO scheduling CTA and NO funnel state: this keeps answering
+        # follow-up questions instead of hijacking them into a yes/no offer loop
+        # (the "aggressive routing" bug). The user enters the funnel only when
+        # they explicitly ask to book (→ CONSULT above).
         query_vector = _embed_text(text)
         with get_db_conn() as conn:
             chunks = _retrieve_chunks(conn, query_vector, top_k=5)
-
         reply, intent, sources = _bot_triage_reply(text, chunks, history=history)
-
-        make_offer = (intent in ("EMOTIONAL", "FAQ") and not already_lead)
-        out = f"{reply}\n\n{_TG_MEETING_CTA}" if make_offer else reply
 
         with get_db_conn() as conn:
             _db_save_message(conn, session_id, "user", text)
-            _db_save_message(conn, session_id, "assistant", out)
-            if make_offer:
-                _db_set_session_state(conn, session_id, _make_offer_state(0))
+            _db_save_message(conn, session_id, "assistant", reply)
             _db_touch_session(conn, session_id)
             conn.commit()
 
-        _audit("instagram_triage", igsid=igsid, session_id=session_id,
-               intent=intent, offered=make_offer, sources=sources, chunks=len(chunks))
-
-        if make_offer:
-            # Send reply + offer as quick-replies for yes/no (cleaner IG UX).
-            channel.send_quick_replies(igsid, out, [
-                {"title": "כן, אשמח",  "payload": "YES"},
-                {"title": "אולי אחר כך", "payload": "NO"},
-            ])
-        else:
-            channel.send_text(igsid, out)
+        _audit("instagram_info_answer", igsid=igsid, session_id=session_id,
+               intent=intent, sources=sources, chunks=len(chunks))
+        channel.send_text(igsid, reply)
 
     except TimeoutError:
         logger.error("[instagram] LLM timeout")
