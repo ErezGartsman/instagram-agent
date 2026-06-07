@@ -2251,3 +2251,67 @@ class TestOwnerAlertIgMeLink:
                             lambda cid, text, **k: sent.update(text=text))
         main._alert_owner("l", None, "972", "נושא", "IGSID9", channel="instagram")
         assert "לא צוין" in sent["text"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lead Brief — post-capture conversation intelligence (awaiting_context)
+# ─────────────────────────────────────────────────────────────────────────────
+class TestLeadBrief:
+    def test_generate_parses_and_clamps_urgency(self, monkeypatch):
+        raw = '{"topic":"בגידה","emotional_state":"כאב","urgency":9,"opening":"אני כאן"}'
+        with patch.object(main, "_call_llm", return_value=raw):
+            brief = main._generate_lead_brief("בעלי בגד בי", history=[])
+        assert brief["topic"] == "בגידה"
+        assert brief["emotional_state"] == "כאב"
+        assert brief["urgency"] == 5            # 9 clamped to 5
+        assert brief["opening"] == "אני כאן"
+
+    def test_generate_handles_bad_urgency(self, monkeypatch):
+        raw = '{"topic":"x","emotional_state":"y","urgency":"high","opening":"z"}'
+        with patch.object(main, "_call_llm", return_value=raw):
+            brief = main._generate_lead_brief("ctx", history=[])
+        assert brief["urgency"] is None         # non-int → None, never crashes
+
+    def test_generate_returns_none_on_garbage(self, monkeypatch):
+        with patch.object(main, "_call_llm", return_value="not json"):
+            assert main._generate_lead_brief("ctx", history=[]) is None
+
+    def test_format_message_contains_fields(self):
+        brief = {"topic": "בגידה", "emotional_state": "כאב",
+                 "urgency": 4, "opening": "בוא נדבר"}
+        msg = main._format_brief_message(brief, "בעלי בגד בי")
+        assert "תקציר ליד" in msg
+        assert "בגידה" in msg
+        assert "4/5" in msg
+        assert "בעלי בגד בי" in msg
+
+    def test_deliver_sends_telegram_and_hubspot_note(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "999")
+        monkeypatch.setattr(main, "_generate_lead_brief",
+                            lambda ctx, history=None: {"topic": "t", "emotional_state": "e",
+                                                       "urgency": 3, "opening": "o"})
+        tg, notes = [], []
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, **k: tg.append(text))
+        monkeypatch.setattr(main, "_hubspot_add_note",
+                            lambda cid, body: notes.append((cid, body)))
+
+        from contextlib import contextmanager
+        mock_conn, mock_cursor = _make_mock_conn(fetchone_return=("HSCONTACT1",))
+
+        @contextmanager
+        def _cm():
+            yield mock_conn
+
+        monkeypatch.setattr(main, "get_db_conn", _cm)
+        main._deliver_lead_brief("IGSID9", "בעלי בגד בי", history=[])
+        assert len(tg) == 1                       # Telegram brief sent
+        assert notes == [("HSCONTACT1", tg[0])] or notes[0][0] == "HSCONTACT1"
+
+    def test_deliver_noop_when_brief_none(self, monkeypatch):
+        monkeypatch.setattr(main, "_generate_lead_brief", lambda *a, **k: None)
+        called = []
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda *a, **k: called.append(1))
+        main._deliver_lead_brief("IGSID9", "ctx", history=[])
+        assert called == []                       # nothing sent when no brief
