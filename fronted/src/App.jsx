@@ -705,7 +705,31 @@ const ANALYTICS_METRICS = [
 ]
 
 const AnalyticsView = () => {
-  const [loaded, setLoaded] = useState(false)
+  const [loaded, setLoaded]     = useState(false)
+  const [embedUrl, setEmbedUrl] = useState('')
+  const [configErr, setConfigErr] = useState(false)
+
+  // The Power BI report id + Azure tenant id are no longer hardcoded in this
+  // bundle (they enabled AD-tenant enumeration). Fetch the embed URL from the
+  // auth-gated backend endpoint instead, so the identifiers are only ever served
+  // to authenticated users.
+  useEffect(() => {
+    const controller = new AbortController()
+    let token = ''
+    try { token = localStorage.getItem('nexus_auth_token') || '' } catch { /* private mode */ }
+    fetch(`${API_BASE}/api/powerbi/config`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      signal: controller.signal,
+    })
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
+      .then(data => {
+        if (data?.embed_url) setEmbedUrl(data.embed_url)
+        else setConfigErr(true)
+      })
+      .catch(err => { if (err?.name !== 'AbortError') setConfigErr(true) })
+    return () => controller.abort()
+  }, [])
+
   return (
     <div className="analytics-view">
 
@@ -748,7 +772,7 @@ const AnalyticsView = () => {
 
         {/* iframe + glass loading overlay */}
         <div className="powerbi-inner">
-          {!loaded && (
+          {!loaded && !configErr && (
             <div className="powerbi-loading">
               <span className="scanner-bar-row">
                 <span className="scanner-bar"/>
@@ -759,16 +783,25 @@ const AnalyticsView = () => {
               <span className="powerbi-loading-text">Initialising analytics stream…</span>
             </div>
           )}
-          <iframe
-            title="full_instagram_scraper"
-            width="100%"
-            height="100%"
-            src="https://app.powerbi.com/reportEmbed?reportId=9285f391-757c-46a5-9c5f-e1b3a7c8f8b2&autoAuth=true&ctid=90c49fc4-c9e6-4529-a15a-033c041d510a"
-            frameBorder="0"
-            allowFullScreen
-            onLoad={() => setLoaded(true)}
-            style={{ opacity: loaded ? 1 : 0, transition: 'opacity 0.7s ease', display: 'block' }}
-          />
+          {configErr && (
+            <div className="powerbi-loading">
+              <span className="powerbi-loading-text">
+                Analytics is configured server-side and is currently unavailable.
+              </span>
+            </div>
+          )}
+          {embedUrl && (
+            <iframe
+              title="full_instagram_scraper"
+              width="100%"
+              height="100%"
+              src={embedUrl}
+              frameBorder="0"
+              allowFullScreen
+              onLoad={() => setLoaded(true)}
+              style={{ opacity: loaded ? 1 : 0, transition: 'opacity 0.7s ease', display: 'block' }}
+            />
+          )}
         </div>
       </div>
 

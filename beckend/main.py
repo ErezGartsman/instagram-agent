@@ -121,6 +121,14 @@ class Settings(BaseSettings):
     #   this ever runs, so it can never fire on a vulnerable story share.
     ig_trigger_words: str = ""
 
+    # ── Power BI embed (served to authenticated users only) ─────────────────────
+    # The Azure tenant id + report id must NOT live in the public JS bundle (they
+    # enable AD-tenant enumeration). They are served from /api/powerbi/config
+    # behind require_auth instead. Set both in the backend env to enable the
+    # Analytics view; leave empty to disable it gracefully.
+    powerbi_report_id: str = ""
+    powerbi_tenant_id: str = ""
+
     model_config = {"env_file": ".env"}
 
 settings = Settings()
@@ -4177,6 +4185,30 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
     except Exception as e:
         logger.error(f"[instagram] Unexpected {type(e).__name__}: {e}", exc_info=True)
         channel.send_text(igsid, _IG_ERROR)
+
+
+@app.get("/api/powerbi/config", dependencies=[Depends(require_auth)])
+def powerbi_config():
+    """
+    Return the Power BI embed URL, built from server-side env vars, to
+    AUTHENTICATED callers only. This keeps the Azure tenant id (ctid) and report
+    id OUT of the public JS bundle, where they would otherwise be harvestable for
+    AD-tenant enumeration. Returns 503 when not configured so the frontend can
+    degrade gracefully.
+
+    NOTE: this is the interim hardening. The full fix is a server-generated embed
+    token via an Azure service principal (removes autoAuth entirely) — scoped as
+    the next step.
+    """
+    if not (settings.powerbi_report_id and settings.powerbi_tenant_id):
+        raise HTTPException(status_code=503, detail="Power BI not configured.")
+    embed_url = (
+        "https://app.powerbi.com/reportEmbed"
+        f"?reportId={settings.powerbi_report_id}"
+        "&autoAuth=true"
+        f"&ctid={settings.powerbi_tenant_id}"
+    )
+    return {"embed_url": embed_url}
 
 
 @app.get("/api/metrics", dependencies=[Depends(require_auth)])

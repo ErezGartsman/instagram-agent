@@ -2392,3 +2392,22 @@ class TestInstagramTriggerWords:
         monkeypatch.setattr(main.settings, "ig_trigger_words", "")
         assert main._ig_matches_trigger("ייעוץ") is False
         assert main._ig_trigger_set() == set()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Power BI embed config — served only to authenticated users (no IDs in bundle)
+# ─────────────────────────────────────────────────────────────────────────────
+class TestPowerBiConfig:
+    def test_returns_embed_url_when_configured(self, client, monkeypatch):
+        monkeypatch.setattr(main.settings, "powerbi_report_id", "RID")
+        monkeypatch.setattr(main.settings, "powerbi_tenant_id", "TID")
+        r = client.get("/api/powerbi/config")
+        assert r.status_code == 200
+        url = r.json()["embed_url"]
+        assert "reportId=RID" in url and "ctid=TID" in url
+
+    def test_503_when_not_configured(self, client, monkeypatch):
+        monkeypatch.setattr(main.settings, "powerbi_report_id", "")
+        monkeypatch.setattr(main.settings, "powerbi_tenant_id", "")
+        r = client.get("/api/powerbi/config")
+        assert r.status_code == 503
