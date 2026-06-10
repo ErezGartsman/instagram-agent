@@ -495,37 +495,68 @@ class TestSerializeVal:
 # ─── 9. Telegram chat_id → session_id mapping (pure logic, mocked cursor) ──────
 
 class TestTelegramSessionMapping:
-    def test_returning_user_reuses_session(self):
-        """An existing telegram session is returned without any INSERT."""
+    # The session SELECT now fetches (id, person_id) — NEXUS Hook A stamps the
+    # person spine on unstamped sessions and is skipped entirely once stamped.
+    # These tests assert the new contract, including the bulletproof guarantee:
+    # a hook failure can never break session resolution.
+
+    def test_returning_stamped_user_skips_hook_entirely(self):
+        """A session already stamped with a person_id returns from the single
+        SELECT — Hook A adds zero statements on routine turns."""
         mock_conn, mock_cursor = _make_mock_conn()
-        mock_cursor.fetchone.return_value = ("sess-existing",)
+        mock_cursor.fetchone.return_value = ("sess-existing", "person-1")
 
         sid = main._db_get_or_create_telegram_session(mock_conn, "12345")
 
         assert sid == "sess-existing"
-        # Only the SELECT ran — no INSERT for a known user.
+        # Only the SELECT ran — no INSERT for a known user, no hook SQL.
         assert mock_cursor.execute.call_count == 1
 
-    def test_new_user_creates_session(self):
-        """First-ever message: SELECT misses, INSERT ... RETURNING creates the row."""
+    def test_new_user_creates_session_then_runs_identity_hook(self):
+        """SELECT miss → INSERT…RETURNING creates the row, then Hook A engages
+        on the same connection. On this mock the hook's own queries fail
+        (fetchone side_effect exhausts) — the contract says it rolls back to
+        its savepoint and the session id is still returned."""
         mock_conn, mock_cursor = _make_mock_conn()
         mock_cursor.fetchone.side_effect = [None, ("sess-new",)]
 
         sid = main._db_get_or_create_telegram_session(mock_conn, "999")
 
         assert sid == "sess-new"
-        assert mock_cursor.execute.call_count == 2   # SELECT then INSERT
+        executed = [c.args[0] for c in mock_cursor.execute.call_args_list]
+        assert executed[0].lstrip().startswith("SELECT id, person_id")
+        assert "INSERT INTO sessions" in executed[1]
+        # Hook A opened its savepoint; its failure was swallowed and rolled
+        # back — the caller's transaction stays fully usable.
+        assert any(s.startswith("SAVEPOINT nexus_hook") for s in executed)
+        assert any(s.startswith("ROLLBACK TO SAVEPOINT nexus_hook") for s in executed)
 
     def test_insert_race_falls_back_to_reselect(self):
-        """If a concurrent insert wins (ON CONFLICT → no row), we re-select it."""
+        """If a concurrent insert wins (ON CONFLICT → no row), we re-select the
+        winner; already stamped → hook skipped, exactly 3 statements."""
         mock_conn, mock_cursor = _make_mock_conn()
-        # SELECT miss → INSERT returns None (conflict) → re-SELECT finds the winner
-        mock_cursor.fetchone.side_effect = [None, None, ("sess-winner",)]
+        mock_cursor.fetchone.side_effect = [None, None, ("sess-winner", "person-7")]
 
         sid = main._db_get_or_create_telegram_session(mock_conn, "777")
 
         assert sid == "sess-winner"
         assert mock_cursor.execute.call_count == 3
+
+    def test_hook_failure_never_breaks_session_resolution(self):
+        """THE blast-radius guarantee: person unstamped and every hook
+        statement explodes — session resolution must still succeed."""
+        mock_conn, mock_cursor = _make_mock_conn()
+        mock_cursor.fetchone.return_value = ("sess-frail", None)
+
+        def explode_on_savepoint(sql, params=None):
+            if "SAVEPOINT" in sql:
+                raise RuntimeError("boom")
+
+        mock_cursor.execute.side_effect = explode_on_savepoint
+
+        sid = main._db_get_or_create_telegram_session(mock_conn, "12345")
+
+        assert sid == "sess-frail"
 
 
 # ─── 10. Telegram webhook endpoint ────────────────────────────────────────────
