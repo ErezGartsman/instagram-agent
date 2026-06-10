@@ -63,22 +63,28 @@ def log_interaction(
     payload: dict | None = None,
     dedup_key: str | None = None,
     source: str = "live",
+    occurred_at=None,
 ) -> bool:
     """
     INSERT one signal row. Commit-free — the caller owns the transaction.
     Returns False when dedup_key already exists (idempotent ingest), True
     when the row was written.
+
+    occurred_at: only the backfill (source='backfill') passes a historical
+    timestamp; live paths leave it None → NOW().
     """
     if kind not in INTERACTION_KINDS:
         raise ValueError(f"unknown interaction kind {kind!r}")
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO interactions "
-            "(kind, channel, person_id, session_id, payload, source, dedup_key) "
-            "VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s) ON CONFLICT DO NOTHING",
+            "(kind, channel, person_id, session_id, payload, source, dedup_key, "
+            "occurred_at) "
+            "VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, COALESCE(%s, NOW())) "
+            "ON CONFLICT DO NOTHING",
             (kind, channel, person_id, session_id,
              json.dumps(payload or {}, ensure_ascii=False, default=str),
-             source, dedup_key),
+             source, dedup_key, occurred_at),
         )
         return cur.rowcount == 1
 
