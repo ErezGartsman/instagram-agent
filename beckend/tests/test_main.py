@@ -1352,6 +1352,25 @@ class TestFinalizeLead:
         assert len(alerts) == 1
         assert alerts[0] is None
 
+    def test_deferred_alert_skips_send_and_notify_but_syncs_crm(self, client, monkeypatch):
+        """Instagram alert unification: defer_owner_alert=True must NOT alert
+        and must NOT stamp notified_at (the context turn / backstop owns both),
+        while CRM sync proceeds untouched."""
+        monkeypatch.setattr(main, "_ig_fetch_username", lambda igsid: None)
+        alerts, notified, synced = [], [], []
+        monkeypatch.setattr(main, "_alert_owner",
+                            lambda *a, **k: alerts.append(1))
+        monkeypatch.setattr(main, "_crm_sync_lead", lambda *a, **k: "c777")
+        monkeypatch.setattr(main, "_db_mark_lead_notified",
+                            lambda c, lid: notified.append(lid))
+        monkeypatch.setattr(main, "_db_mark_lead_synced",
+                            lambda c, lid, eid: synced.append((lid, eid)))
+        main._finalize_lead("leadD", None, "0521234567", "y", "IGSID9",
+                            channel="instagram", defer_owner_alert=True)
+        assert alerts == []                      # no capture-time alert
+        assert notified == []                    # notified_at stays NULL
+        assert synced == [("leadD", "c777")]     # CRM unaffected
+
 
 class TestCronCrmSync:
     def test_rejects_bad_secret(self, client, monkeypatch):
@@ -2326,9 +2345,58 @@ class TestLeadBrief:
 
         monkeypatch.setattr(main, "get_db_conn", _cm)
 
-    def test_deliver_edits_alert_in_place_and_adds_note(self, monkeypatch):
+    # Alert unification: rows are (id, phone, alert_message_id,
+    # crm_external_id, notified_at). notified_at=None means the capture-time
+    # alert was DEFERRED and _deliver_lead_brief owns the single combined send.
+
+    def test_unnotified_lead_gets_single_combined_alert(self, monkeypatch):
+        """THE unification guarantee: one message containing details + brief."""
         monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "999")
-        monkeypatch.setattr(main.settings, "ig_access_token", "")   # no username re-fetch
+        monkeypatch.setattr(main.settings, "ig_access_token", "")
+        monkeypatch.setattr(main, "_generate_lead_brief",
+                            lambda ctx, history=None: {"topic": "בגידה", "emotional_state": "כאב",
+                                                       "urgency": 3, "opening": "o"})
+        sends, edits, notified = [], [], []
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, **k: (sends.append(text), 777)[1])
+        monkeypatch.setattr(main, "_edit_telegram_message",
+                            lambda *a, **k: edits.append(1))
+        monkeypatch.setattr(main, "_db_mark_lead_notified",
+                            lambda c, lid: notified.append(lid))
+        monkeypatch.setattr(main, "_hubspot_add_note", lambda cid, body: None)
+        self._patch_lead_row(monkeypatch,
+                             ("lead1", "0501234567", None, "HSCONTACT1", None))
+
+        main._deliver_lead_brief("IGSID9", "בעלי בגד בי", history=[])
+        assert len(sends) == 1                  # exactly ONE message
+        assert "ליד חדש" in sends[0]            # ...with the lead details
+        assert "תקציר ליד" in sends[0]          # ...AND the brief, combined
+        assert edits == []                      # nothing edited
+        assert notified == ["lead1"]            # alert bookkeeping stamped
+
+    def test_brief_failure_still_sends_plain_alert(self, monkeypatch):
+        """The alert is never lost to an LLM hiccup — plain details go out."""
+        monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "999")
+        monkeypatch.setattr(main.settings, "ig_access_token", "")
+        monkeypatch.setattr(main, "_generate_lead_brief", lambda *a, **k: None)
+        sends, notified = [], []
+        monkeypatch.setattr(main, "_send_telegram_message",
+                            lambda cid, text, **k: (sends.append(text), 777)[1])
+        monkeypatch.setattr(main, "_db_mark_lead_notified",
+                            lambda c, lid: notified.append(lid))
+        self._patch_lead_row(monkeypatch,
+                             ("lead1", "0501234567", None, None, None))
+
+        main._deliver_lead_brief("IGSID9", "ctx", history=[])
+        assert len(sends) == 1
+        assert "ליד חדש" in sends[0]
+        assert "תקציר ליד" not in sends[0]      # plain — no hallucinated brief
+        assert notified == ["lead1"]
+
+    def test_already_notified_lead_gets_brief_via_edit(self, monkeypatch):
+        """Backstop-race / legacy leads: enrich in place, never re-send details."""
+        monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "999")
+        monkeypatch.setattr(main.settings, "ig_access_token", "")
         monkeypatch.setattr(main, "_generate_lead_brief",
                             lambda ctx, history=None: {"topic": "בגידה", "emotional_state": "כאב",
                                                        "urgency": 3, "opening": "o"})
@@ -2339,8 +2407,8 @@ class TestLeadBrief:
                             lambda *a, **k: sends.append(1))
         monkeypatch.setattr(main, "_hubspot_add_note",
                             lambda cid, body: notes.append(cid))
-        # lead row: (phone, alert_message_id, crm_external_id)
-        self._patch_lead_row(monkeypatch, ("0501234567", "555", "HSCONTACT1"))
+        self._patch_lead_row(monkeypatch,
+                             ("lead1", "0501234567", "555", "HSCONTACT1", "2026-06-10"))
 
         main._deliver_lead_brief("IGSID9", "בעלי בגד בי", history=[])
         assert len(edits) == 1                  # edited the original alert
@@ -2349,8 +2417,9 @@ class TestLeadBrief:
         assert sends == []                      # NO second message
         assert notes == ["HSCONTACT1"]          # HubSpot note added
 
-    def test_deliver_falls_back_to_send_when_no_message_id(self, monkeypatch):
+    def test_already_notified_no_message_id_falls_back_to_standalone(self, monkeypatch):
         monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "999")
+        monkeypatch.setattr(main.settings, "ig_access_token", "")
         monkeypatch.setattr(main, "_generate_lead_brief",
                             lambda ctx, history=None: {"topic": "t", "emotional_state": "e",
                                                        "urgency": 3, "opening": "o"})
@@ -2358,22 +2427,69 @@ class TestLeadBrief:
         monkeypatch.setattr(main, "_send_telegram_message",
                             lambda cid, text, **k: sends.append(text))
         monkeypatch.setattr(main, "_hubspot_add_note", lambda cid, body: None)
-        # alert_message_id is None → cannot edit → fall back to a standalone send.
-        self._patch_lead_row(monkeypatch, ("0501234567", None, "HSCONTACT1"))
+        self._patch_lead_row(monkeypatch,
+                             ("lead1", "0501234567", None, "HSCONTACT1", "2026-06-10"))
 
         main._deliver_lead_brief("IGSID9", "ctx", history=[])
-        assert len(sends) == 1                  # fallback message sent
+        assert len(sends) == 1                  # standalone brief as last resort
         assert "תקציר ליד" in sends[0]
 
-    def test_deliver_noop_when_brief_none(self, monkeypatch):
+    def test_no_lead_row_is_a_noop(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "telegram_owner_chat_id", "999")
         monkeypatch.setattr(main, "_generate_lead_brief", lambda *a, **k: None)
         called = []
         monkeypatch.setattr(main, "_send_telegram_message",
                             lambda *a, **k: called.append(1))
-        monkeypatch.setattr(main, "_edit_telegram_message",
-                            lambda *a, **k: called.append(1))
+        mock_conn, mock_cursor = _make_mock_conn()
+        mock_cursor.fetchone.return_value = None     # no lead behind this turn
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _cm():
+            yield mock_conn
+
+        monkeypatch.setattr(main, "get_db_conn", _cm)
+
         main._deliver_lead_brief("IGSID9", "ctx", history=[])
-        assert called == []                       # nothing sent/edited when no brief
+        assert called == []
+
+
+class TestPendingIgAlertFlush:
+    """_send_pending_ig_alert — the exit-path guarantee that a deferred alert
+    is delayed, never lost."""
+
+    def _patch_conn(self, monkeypatch, row):
+        mock_conn, mock_cursor = _make_mock_conn()
+        mock_cursor.fetchone.return_value = row
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _cm():
+            yield mock_conn
+
+        monkeypatch.setattr(main, "get_db_conn", _cm)
+
+    def test_flush_sends_plain_alert_for_unnotified_lead(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "ig_access_token", "")
+        alerts, notified = [], []
+        monkeypatch.setattr(main, "_alert_owner",
+                            lambda lid, *a, **k: (alerts.append(lid), 777)[1])
+        monkeypatch.setattr(main, "_db_mark_lead_notified",
+                            lambda c, lid: notified.append(lid))
+        self._patch_conn(monkeypatch, ("lead1", "0501234567"))
+
+        main._send_pending_ig_alert("IGSID9")
+        assert alerts == ["lead1"]
+        assert notified == ["lead1"]
+
+    def test_flush_is_a_noop_when_nothing_pending(self, monkeypatch):
+        alerts = []
+        monkeypatch.setattr(main, "_alert_owner",
+                            lambda *a, **k: alerts.append(1))
+        self._patch_conn(monkeypatch, None)
+
+        main._send_pending_ig_alert("IGSID9")
+        assert alerts == []
 
 
 class TestLeadAlertFormatting:

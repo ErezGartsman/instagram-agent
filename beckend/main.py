@@ -2745,13 +2745,21 @@ def _db_mark_lead_synced(conn, lead_id: str, external_id: str) -> None:
 
 def _finalize_lead(lead_id: str, name: Optional[str], phone: str,
                    intent_summary: Optional[str], chat_id: str,
-                   channel: str = "telegram") -> None:
+                   channel: str = "telegram",
+                   defer_owner_alert: bool = False) -> None:
     """
     Single post-save side-effect funnel for ALL capture paths:
     owner alert → CRM sync → stamp notified_at (+ crm_synced_at on success),
     in one commit. Entirely best-effort: any failure is logged, never raised —
     the caller has already sent the user's confirmation. Leads that fail the CRM
     push keep crm_synced_at = NULL and are retried by /api/cron/crm-sync.
+
+    defer_owner_alert (Instagram alert unification): when True, the Telegram
+    owner alert is NOT sent here — Erez receives exactly ONE combined message
+    (lead details + 🧠 brief) at the awaiting_context turn instead (see
+    _deliver_lead_brief). notified_at deliberately stays NULL so the exit-path
+    flushes (_send_pending_ig_alert) and the cron backstop guarantee the alert
+    is delayed, never lost. CRM sync is unaffected either way.
     """
     # Resolve the @username once for Instagram (used by BOTH the alert deep link
     # and the HubSpot record) so we never make the Graph API call twice.
@@ -2768,11 +2776,15 @@ def _finalize_lead(lead_id: str, name: Optional[str], phone: str,
                            "alert will fire with IGSID fallback")
 
     alert_message_id = None
-    try:
-        alert_message_id = _alert_owner(lead_id, name, phone, intent_summary,
-                                        chat_id, channel=channel, username=username)
-    except Exception as e:
-        logger.error(f"[leads] owner alert failed for {lead_id}: {e}")
+    if defer_owner_alert:
+        logger.info(f"[leads] owner alert deferred for {lead_id} "
+                    "(single combined alert at the context turn)")
+    else:
+        try:
+            alert_message_id = _alert_owner(lead_id, name, phone, intent_summary,
+                                            chat_id, channel=channel, username=username)
+        except Exception as e:
+            logger.error(f"[leads] owner alert failed for {lead_id}: {e}")
 
     external_id = None
     try:
@@ -2783,7 +2795,8 @@ def _finalize_lead(lead_id: str, name: Optional[str], phone: str,
 
     try:
         with get_db_conn() as conn:
-            _db_mark_lead_notified(conn, lead_id)
+            if not defer_owner_alert:
+                _db_mark_lead_notified(conn, lead_id)
             if external_id:
                 _db_mark_lead_synced(conn, lead_id, external_id)
             _db_set_lead_alert_message_id(conn, lead_id, alert_message_id)
@@ -2873,67 +2886,125 @@ def _format_brief_message(brief: dict, context_text: str) -> str:
 
 def _deliver_lead_brief(igsid: str, context_text: str, history: list = None) -> None:
     """
-    Generate the brief and deliver it to BOTH channels Erez asked for, WITHOUT
-    cluttering Telegram with a second message:
-      1. EDIT the original capture alert in place to append the 🧠 brief block
-         (falls back to a new message only if the edit can't be done), and
-      2. append a Note to the HubSpot contact (if already synced).
-    Best-effort throughout; a failure in either leg never affects the other or
-    the lead itself.
-    """
-    brief = _generate_lead_brief(context_text, history)
-    if not brief:
-        return
+    Instagram alert unification: on Instagram the capture-time owner alert is
+    DEFERRED (_finalize_lead's defer_owner_alert), and THIS function sends
+    Erez exactly ONE combined Telegram message — lead details + 🧠 brief —
+    when the lead answers the optional topic question.
 
-    # Pull what we need to rebuild the alert: phone + the stored message_id (for
-    # the edit) + crm_external_id (for the HubSpot note), in one query.
-    phone = alert_message_id = contact_id = None
+    Guarantees:
+      • The alert is never lost to an LLM hiccup: when brief generation fails,
+        the PLAIN alert (details only) is sent instead.
+      • If the alert already went out (the cron backstop won the race, or a
+        pre-unification lead), the brief is appended by editing that message
+        in place — a standalone brief message only as a last resort.
+      • HubSpot leg unchanged: the brief is attached as a Note when synced.
+    Best-effort throughout; never raises into the webhook turn.
+    """
+    brief = _generate_lead_brief(context_text, history)   # None on any failure
+
+    lead_id = phone = alert_message_id = contact_id = notified_at = None
     try:
         with get_db_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT phone, alert_message_id, crm_external_id FROM leads "
-                    "WHERE channel = 'instagram' AND chat_id = %s "
+                    "SELECT id, phone, alert_message_id, crm_external_id, notified_at "
+                    "FROM leads WHERE channel = 'instagram' AND chat_id = %s "
                     "ORDER BY created_at DESC LIMIT 1",
                     (igsid,),
                 )
                 row = cur.fetchone()
         if row:
-            phone, alert_message_id, contact_id = row[0], row[1], row[2]
+            lead_id, phone, alert_message_id, contact_id, notified_at = (
+                str(row[0]), row[1], row[2], row[3], row[4])
     except Exception as e:
         logger.warning(f"[brief] lead lookup failed: {e}")
+    if not lead_id:
+        return   # no captured lead behind this context turn — nothing to send
 
-    # 1) Telegram — edit the capture alert in place (single evolving message).
     if settings.telegram_owner_chat_id:
-        edited = False
-        if alert_message_id:
-            # Re-resolve @username so the rebuilt alert keeps its ig.me link.
-            try:
-                username = _ig_fetch_username(igsid)
-            except Exception:
-                username = None
-            full_text = _format_lead_alert(
-                name=None, phone=phone or "—", intent_summary=None, chat_id=igsid,
-                channel="instagram", username=username, brief=brief)
-            edited = _edit_telegram_message(
-                settings.telegram_owner_chat_id, alert_message_id, full_text)
-        if not edited:
-            # No message_id, or the edit failed → fall back to a standalone msg.
-            try:
-                _send_telegram_message(settings.telegram_owner_chat_id,
-                                       _format_brief_message(brief, context_text))
-            except Exception as e:
-                logger.warning(f"[brief] telegram fallback send failed: {e}")
+        try:
+            username = _ig_fetch_username(igsid)
+        except Exception:
+            username = None
+        # brief=None renders the plain details-only alert — same formatter,
+        # one source of truth for the message shape.
+        full_text = _format_lead_alert(
+            name=None, phone=phone or "—", intent_summary=None, chat_id=igsid,
+            channel="instagram", username=username, brief=brief)
 
-    # 2) HubSpot note on the contact — only if already synced.
-    if contact_id:
+        if notified_at:
+            # Already alerted (backstop race / pre-unification lead) → enrich
+            # only; NEVER re-send the details as a fresh message.
+            if brief:
+                edited = bool(alert_message_id) and _edit_telegram_message(
+                    settings.telegram_owner_chat_id, alert_message_id, full_text)
+                if not edited:
+                    try:
+                        _send_telegram_message(
+                            settings.telegram_owner_chat_id,
+                            _format_brief_message(brief, context_text))
+                    except Exception as e:
+                        logger.warning(f"[brief] standalone brief send failed: {e}")
+        else:
+            # THE single combined send (details + brief, or plain on LLM miss).
+            message_id = _send_telegram_message(settings.telegram_owner_chat_id,
+                                                full_text)
+            try:
+                with get_db_conn() as conn:
+                    _db_mark_lead_notified(conn, lead_id)
+                    _db_set_lead_alert_message_id(conn, lead_id, message_id)
+                    conn.commit()
+            except Exception as e:
+                logger.error(f"[leads] combined-alert bookkeeping failed "
+                             f"for {lead_id}: {e}")
+
+    # HubSpot note — only when there is an actual brief and a synced contact.
+    if brief and contact_id:
         try:
             _hubspot_add_note(contact_id, _format_brief_message(brief, context_text))
         except Exception as e:
             logger.warning(f"[brief] HubSpot note failed: {e}")
-    else:
+    elif brief:
         logger.info("[brief] contact not yet synced — HubSpot note deferred "
-                    "(cron will sync the lead; Telegram brief already delivered).")
+                    "(cron will sync the lead; Telegram alert already delivered).")
+
+
+def _send_pending_ig_alert(igsid: str) -> None:
+    """
+    Flush a DEFERRED Instagram owner alert WITHOUT a brief — used when the
+    awaiting_context window closes without a usable topic answer (escape,
+    crisis, sub-4-char reply, or the lead resurfacing later via the cold
+    gate). Idempotent via notified_at: no unnotified lead → silent no-op.
+    Best-effort: never raises into the webhook turn. Leads who never send
+    another message at all are caught by the cron backstop instead.
+    """
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, phone FROM leads "
+                    "WHERE channel = 'instagram' AND chat_id = %s "
+                    "AND notified_at IS NULL "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (igsid,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return
+        lead_id, phone = str(row[0]), row[1]
+        username = None
+        try:
+            username = _ig_fetch_username(igsid)
+        except Exception:
+            pass
+        message_id = _alert_owner(lead_id, None, phone, None, igsid,
+                                  channel="instagram", username=username)
+        with get_db_conn() as conn:
+            _db_mark_lead_notified(conn, lead_id)
+            _db_set_lead_alert_message_id(conn, lead_id, message_id)
+            conn.commit()
+    except Exception as e:
+        logger.error(f"[leads] pending IG alert flush failed for {igsid}: {e}")
 
 
 # Bot-authored system messages are Hebrew to match the representative persona.
@@ -4022,14 +4093,20 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
     if is_crisis(text):
         _audit("instagram_crisis", igsid=igsid)
         channel.send_text(igsid, _get_config("crisis.message"))
+        prior_state = None
         try:
             with get_db_conn() as conn:
                 sid = _db_get_or_create_channel_session(conn, "instagram", igsid)
-                if _db_get_session_state(conn, sid):
+                prior_state = _db_get_session_state(conn, sid)
+                if prior_state:
                     _db_set_session_state(conn, sid, None)
                 conn.commit()
         except Exception:
             pass
+        # A deferred capture alert must not die with the cleared state — flush
+        # it PLAIN. The crisis content itself is never included anywhere.
+        if prior_state == "awaiting_context":
+            _send_pending_ig_alert(igsid)
         return
 
     # NOTE: content guards (length / moderation) are deliberately deferred to the
@@ -4126,6 +4203,10 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                 conn.commit()
             channel.send_text(igsid, _TG_ESCAPE_RESPONSE)
             _audit("instagram_escape", igsid=igsid, prior_state=bot_state)
+            if bot_state == "awaiting_context":
+                # Declining the optional topic question still alerts Erez —
+                # plain alert, no brief.
+                _send_pending_ig_alert(igsid)
             return
 
         # ── STATE: awaiting_contact ───────────────────────────────────────────
@@ -4159,8 +4240,13 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                     if lead_id:
                         # Thanks + a soft, optional topic question in one message.
                         channel.send_text(igsid, _IG_LEAD_THANKS_CONTEXT)
+                        # Alert unification: defer the owner alert — Erez gets
+                        # ONE combined message (details + 🧠 brief) at the
+                        # context turn; exit-path flushes + the cron backstop
+                        # guarantee it is delayed, never lost.
                         _finalize_lead(lead_id, None, phone, intent_summary, igsid,
-                                       channel="instagram")
+                                       channel="instagram",
+                                       defer_owner_alert=True)
                         _audit("instagram_lead_captured", igsid=igsid, lead_id=lead_id)
                         _track("lead_captured", "instagram",
                                session_id=session_id, lead_id=lead_id)
@@ -4209,6 +4295,9 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                     _deliver_lead_brief(igsid, text, history)   # best-effort
                 except Exception as e:
                     logger.error(f"[brief] delivery failed for {igsid}: {e}")
+            else:
+                # Too short to brief — close the window with the PLAIN alert.
+                _send_pending_ig_alert(igsid)
             channel.send_text(igsid, _IG_CONTEXT_ACK)
             return
 
@@ -4259,6 +4348,11 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                 "icebreaker_hit" if entry == "icebreaker" else "trigger_hit",
                 "instagram", session_id=session_id, stage="engaged",
                 payload={"entry": entry, "returning_lead": already_lead})
+            if already_lead:
+                # A previously-captured lead resurfacing: if their deferred
+                # alert never fired (they ghosted the context question), flush
+                # it now instead of waiting for the daily backstop.
+                _send_pending_ig_alert(igsid)
             return
 
         # Neither an Icebreaker, a trigger phrase, nor an active-funnel turn
@@ -4381,8 +4475,41 @@ def cron_crm_sync(
                      "Set CRON_SECRET in Vercel env vars.")
         raise HTTPException(status_code=503, detail="Cron endpoint not configured.")
 
+    # ── Deferred-alert backstop (Instagram alert unification) ─────────────────
+    # IG capture alerts are deferred to the context turn; a lead who never
+    # sends another message would otherwise never alert. Sweep anything
+    # unnotified for >30 minutes and send the PLAIN alert. Channel-agnostic on
+    # purpose: it also retries any lead whose inline alert failed (e.g. a
+    # Telegram outage at capture time). Runs BEFORE the CRM gate — alerts must
+    # not depend on a CRM being configured.
+    alerts_sent = 0
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, chat_id, channel, name, phone, intent_summary "
+                    "FROM leads WHERE notified_at IS NULL "
+                    "AND created_at < NOW() - INTERVAL '30 minutes' "
+                    "ORDER BY created_at LIMIT 20"
+                )
+                unalerted = cur.fetchall()
+        for lid, cid, ch, nm, ph, summ in unalerted:
+            username = _ig_fetch_username(cid) if ch == "instagram" else None
+            message_id = _alert_owner(str(lid), nm, ph, summ, cid,
+                                      channel=ch, username=username)
+            with get_db_conn() as conn:
+                _db_mark_lead_notified(conn, str(lid))
+                _db_set_lead_alert_message_id(conn, str(lid), message_id)
+                conn.commit()
+            alerts_sent += 1
+        if alerts_sent:
+            _audit("alert_backstop", alerts_sent=alerts_sent)
+    except Exception as e:
+        logger.error(f"[cron] alert backstop failed: {e}")
+
     if not _crm_enabled():
-        return {"status": "skipped", "reason": "CRM not configured"}
+        return {"status": "skipped", "reason": "CRM not configured",
+                "alerts_sent": alerts_sent}
 
     synced, failed = 0, 0
     try:
@@ -4410,7 +4537,8 @@ def cron_crm_sync(
 
         _audit("crm_reconcile", pending=len(pending), synced=synced, failed=failed)
         return {"status": "ok", "pending": len(pending),
-                "synced": synced, "failed": failed}
+                "synced": synced, "failed": failed,
+                "alerts_sent": alerts_sent}
     except Exception as e:
         logger.error(f"[crm] reconcile failed: {e}", exc_info=True)
         return {"status": "error", "detail": "reconcile failed"}
