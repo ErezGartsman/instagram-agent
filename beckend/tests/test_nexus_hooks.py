@@ -17,8 +17,6 @@ exact point in the hook's sequence.
 import contextlib
 import urllib.parse
 
-import pytest
-
 from nexus import db as nexus_db
 from nexus import hooks
 
