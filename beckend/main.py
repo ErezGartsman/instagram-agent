@@ -36,6 +36,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
+from nexus import db as nexus_db
+from nexus import hooks as nexus_hooks
+
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -320,13 +323,31 @@ def get_db_conn():
         pool.putconn(conn)
 
 
+# ── NEXUS wiring (Hook G) ─────────────────────────────────────────────────────
+# Hand the pooled-connection factory to the nexus strangler package. nexus
+# modules never import main (no circular import); best-effort hooks that need
+# their own connection (e.g. the post-capture spine) obtain one through this
+# bridge. See docs/NEXUS_V1_INTEGRATION_MAP.md for the full hook contract.
+nexus_db.configure(get_db_conn)
+
+
 # ─── Schema Cache ─────────────────────────────────────────────────────────────
 
 _schema_cache: str = ""   # populated once on first chat request; never changes at runtime
 
 # Tables that exist for infrastructure / identity management — never exposed to
 # the LLM so it cannot generate SELECT queries against internal session data.
-_INTERNAL_TABLES = {"sessions", "messages", "knowledge_base", "app_config", "leads"}
+# Includes ALL NEXUS V1 spine/memory tables (pulled forward from ticket 3.7):
+# nexus_reader has zero grants on them (data already blocked), but excluding
+# them here also keeps their NAMES out of the LLM schema prompt and the
+# /api/schema sidebar. The three memory tables (migration 003) are pre-listed
+# so ticket 3.5 cannot forget to add them.
+_INTERNAL_TABLES = {
+    "sessions", "messages", "knowledge_base", "app_config", "leads",
+    "tenants", "operators", "person", "person_identity", "merge_candidates",
+    "interactions", "opportunities", "bookings",
+    "person_profile", "session_summaries", "operator_notes",
+}
 
 def get_schema_description(conn) -> str:
     """
@@ -2221,35 +2242,50 @@ def _db_get_or_create_channel_session(conn, channel: str, contact_id: str) -> st
     Reuses the sessions table UNIQUE(channel, contact_id) index — same race-safe
     INSERT … ON CONFLICT … RETURNING pattern as the Telegram-specific helper.
     Caller owns the commit.
+
+    NEXUS Hook A: when the session has no person_id yet, resolve/create the
+    canonical person and stamp it. The hook is SAVEPOINT-guarded inside
+    nexus.hooks — it can never raise and never aborts the caller's
+    transaction; on failure person_id simply stays NULL and the next turn
+    retries (self-healing). Once stamped, the hook is skipped entirely, so
+    routine message turns pay zero extra writes.
     """
+    person_id = None
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id FROM sessions WHERE channel = %s AND contact_id = %s LIMIT 1",
+            "SELECT id, person_id FROM sessions "
+            "WHERE channel = %s AND contact_id = %s LIMIT 1",
             (channel, contact_id),
         )
         row = cur.fetchone()
         if row:
-            return str(row[0])
+            session_id, person_id = str(row[0]), row[1]
+        else:
+            cur.execute(
+                """
+                INSERT INTO sessions (channel, contact_id)
+                VALUES (%s, %s)
+                ON CONFLICT (channel, contact_id) DO NOTHING
+                RETURNING id
+                """,
+                (channel, contact_id),
+            )
+            inserted = cur.fetchone()
+            if inserted:
+                session_id = str(inserted[0])
+            else:
+                # Concurrent request won the insert — re-select.
+                cur.execute(
+                    "SELECT id, person_id FROM sessions "
+                    "WHERE channel = %s AND contact_id = %s LIMIT 1",
+                    (channel, contact_id),
+                )
+                row = cur.fetchone()
+                session_id, person_id = str(row[0]), row[1]
 
-        cur.execute(
-            """
-            INSERT INTO sessions (channel, contact_id)
-            VALUES (%s, %s)
-            ON CONFLICT (channel, contact_id) DO NOTHING
-            RETURNING id
-            """,
-            (channel, contact_id),
-        )
-        inserted = cur.fetchone()
-        if inserted:
-            return str(inserted[0])
-
-        # Concurrent request won the insert — re-select.
-        cur.execute(
-            "SELECT id FROM sessions WHERE channel = %s AND contact_id = %s LIMIT 1",
-            (channel, contact_id),
-        )
-        return str(cur.fetchone()[0])
+    if person_id is None:
+        nexus_hooks.on_channel_session(conn, session_id, channel, contact_id)
+    return session_id
 
 
 def _db_get_session_state(conn, session_id: str) -> str | None:
@@ -2755,6 +2791,15 @@ def _finalize_lead(lead_id: str, name: Optional[str], phone: str,
     except Exception as e:
         logger.error(f"[leads] finalize bookkeeping failed for {lead_id}: {e}")
 
+    # ── NEXUS Hook B — capture spine ──────────────────────────────────────────
+    # person resolve → phone identity → leads/sessions person stamp →
+    # opportunity 'captured' → interaction log. Own connection + commit inside;
+    # NEVER raises (see nexus/hooks.py). Runs LAST so every legacy side-effect
+    # above is fully untouched even if the spine write fails. Idempotent under
+    # webhook replays (unique indexes + forward-only stages + dedup_key).
+    nexus_hooks.on_lead_captured(lead_id, channel=channel, chat_id=chat_id,
+                                 phone=phone)
+
 
 # ── Lead Brief — post-capture conversation intelligence ───────────────────────
 # Runs ONLY after a lead is captured and the user answers the optional topic
@@ -3233,7 +3278,7 @@ class InstagramChannel(MessagingChannel):
         })
 
     def send_contact_prompt(self, recipient_id: str, preamble: str) -> None:
-        buttons = self._contact_buttons()
+        buttons = self._contact_buttons(recipient_id)
         if buttons:
             # Send the preamble as plain text first, then the button template.
             self.send_text(recipient_id, preamble)
@@ -3252,16 +3297,24 @@ class InstagramChannel(MessagingChannel):
             "sender_action": "mark_seen",
         })
 
-    def _contact_buttons(self) -> list[dict]:
+    def _contact_buttons(self, recipient_id: str) -> list[dict]:
         """
         Returns a single WhatsApp wa.me button when WHATSAPP_NUMBER is set,
         or an empty list (triggers typed-phone fallback) when it is not.
+
+        NEXUS Hook D: the URL carries a per-person ref-code prefill so the
+        WhatsApp arrival can be linked back to this Instagram person in the
+        cockpit. whatsapp_cta_url() HARD-GUARANTEES a usable link — any
+        failure (DB down, no person, encoding error, malformed/oversized
+        result) returns the plain wa.me/<number> the bot has always sent.
+        The conversion CTA can be upgraded by nexus, never broken by it.
         """
         if settings.whatsapp_number:
             return [{
                 "type":  "web_url",
                 "title": "המשך בוואטסאפ",
-                "url":   f"https://wa.me/{settings.whatsapp_number}",
+                "url":   nexus_hooks.whatsapp_cta_url(
+                    settings.whatsapp_number, "instagram", recipient_id),
             }]
         return []
 
@@ -3432,6 +3485,10 @@ def telegram_webhook(
                 _send_contact_keyboard(chat_id, _TG_QUALIFICATION_ACK)
                 _audit("telegram_qualification_answered", chat_id=chat_id_str,
                        session_id=session_id)
+                # NEXUS C2 — best-effort, never raises (see nexus/hooks.py).
+                nexus_hooks.on_funnel_event(
+                    "qualified", "telegram", session_id=session_id,
+                    stage="qualified", dedup_key=f"qualified:{session_id}")
                 return {"ok": True}
             # Already a lead — nothing to capture; clear stale state and continue
             # to normal conversation below.
@@ -3465,6 +3522,10 @@ def telegram_webhook(
                     _send_contact_keyboard(chat_id, _TG_OFFER_ACK)
                     _audit("telegram_offer_accepted", chat_id=chat_id_str,
                            session_id=session_id)
+                    # NEXUS C3 — best-effort, never raises.
+                    nexus_hooks.on_funnel_event(
+                        "qualified", "telegram", session_id=session_id,
+                        stage="qualified", dedup_key=f"qualified:{session_id}")
                     return {"ok": True}
 
                 if decision == "DECLINE":
@@ -3622,6 +3683,10 @@ def telegram_webhook(
             _send_contact_keyboard(chat_id, _TG_OFFER_ACK)
             _audit("telegram_offer_accepted_recovered", chat_id=chat_id_str,
                    session_id=session_id)
+            # NEXUS C3 (state-loss recovery path) — best-effort, never raises.
+            nexus_hooks.on_funnel_event(
+                "qualified", "telegram", session_id=session_id,
+                stage="qualified", dedup_key=f"qualified:{session_id}")
             return {"ok": True}
 
         # ── BOOKING INTENT: deterministic funnel entry (no RAG) ───────────────
@@ -3655,6 +3720,13 @@ def telegram_webhook(
 
             _send_telegram_message(chat_id, reply_text)
             _audit(audit_event, chat_id=chat_id_str, session_id=session_id)
+            # NEXUS C4 — funnel entry on Telegram. Opens (or re-opens after a
+            # closed episode) the opportunity at 'engaged'. Best-effort.
+            nexus_hooks.on_funnel_event(
+                "trigger_hit", "telegram", session_id=session_id,
+                stage="engaged",
+                payload={"trigger": "booking_intent",
+                         "already_lead": already_lead})
             return {"ok": True}
 
         # ── PATH B: triage receptionist (LLM proposes, state machine disposes) ─
@@ -4011,6 +4083,10 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                     channel.send_contact_prompt(igsid, _TG_OFFER_ACK)
                     _audit("instagram_offer_accepted", igsid=igsid,
                            session_id=session_id)
+                    # NEXUS C3 — best-effort, never raises.
+                    nexus_hooks.on_funnel_event(
+                        "qualified", "instagram", session_id=session_id,
+                        stage="qualified", dedup_key=f"qualified:{session_id}")
                     return
 
                 if decision == "DECLINE":
@@ -4125,6 +4201,10 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
             if len(text.strip()) >= 4:
                 _track("context_provided", "instagram", session_id=session_id)
                 _audit("instagram_context_provided", igsid=igsid, session_id=session_id)
+                # NEXUS C5 — post-capture enrichment landed → 'briefed'.
+                nexus_hooks.on_funnel_event(
+                    "context_provided", "instagram", session_id=session_id,
+                    stage="briefed", dedup_key=f"context:{session_id}")
                 try:
                     _deliver_lead_brief(igsid, text, history)   # best-effort
                 except Exception as e:
@@ -4172,6 +4252,13 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
             # new-thread (icebreaker) vs existing-follower (trigger_word) funnels.
             _track("icebreaker_hit", "instagram", session_id=session_id,
                    returning_lead=already_lead, entry=entry)
+            # NEXUS C1 — funnel entry on Instagram. A returning lead whose
+            # previous episode was CLOSED gets a fresh opportunity (genuine
+            # re-engagement); an open episode is simply reused. Best-effort.
+            nexus_hooks.on_funnel_event(
+                "icebreaker_hit" if entry == "icebreaker" else "trigger_hit",
+                "instagram", session_id=session_id, stage="engaged",
+                payload={"entry": entry, "returning_lead": already_lead})
             return
 
         # Neither an Icebreaker, a trigger phrase, nor an active-funnel turn
