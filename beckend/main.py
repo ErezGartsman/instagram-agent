@@ -36,6 +36,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
+from nexus import bookings as nexus_bookings
 from nexus import db as nexus_db
 from nexus import hooks as nexus_hooks
 from nexus import memory as nexus_memory
@@ -85,6 +86,12 @@ class Settings(BaseSettings):
     hubspot_intent_property: str = ""
     # Shared secret guarding the /api/cron/crm-sync reconciliation endpoint.
     cron_secret:         str = ""
+
+    # ── Calendly booking webhook (the North Star: booked consultation) ──────────
+    # Signing key for verifying the Calendly-Webhook-Signature header. Set in the
+    # backend env; the webhook subscription is registered manually in Calendly's
+    # UI. When empty, the webhook is inert in dev and fail-closed on Vercel.
+    calendly_webhook_signing_key: str = ""
 
     # ── Instagram / Meta (optional — webhook is inert until ig_access_token is set) ─
     # ig_access_token:  Page access token from Meta developer dashboard.
@@ -427,6 +434,17 @@ _DEFAULT_CONFIG = {
         'הכאב גדול, חשוב לי שתפנה/י לער"ן (עזרה ראשונה נפשית) בטלפון 1201. הקו פתוח '
         "בכל שעה, בחינם ובאנונימיות, ויש שם אנשים אמיתיים שאפשר לדבר איתם עכשיו. 🤍"
     ),
+    # ── M4 consent surface (Ticket 3.6) — live-editable in Supabase ─────────────
+    # disclosure.line: appended to the Telegram /start greeting (first contact).
+    # consent.capture_line: appended at EVERY phone-collection moment (both
+    # channels). Empty value => the line is silently omitted.
+    "disclosure.line": (
+        "אני העוזר הדיגיטלי של ארז 🤍 השיחה שלנו נשמרת כדי שארז יוכל לעבור עליה "
+        "ולחזור אליך אישית."
+    ),
+    "consent.capture_line": (
+        "הפרטים שלך נשמרים אך ורק כדי שנוכל לחזור אליך, ולא מועברים לאף אחד."
+    ),
 }
 
 _CONFIG_TTL      = 300        # seconds — edits in Supabase take effect within this window
@@ -455,6 +473,14 @@ def _get_config(key: str) -> str:
             _config_cache_ts = now   # back off either way; no per-call retry storm
         value = _config_cache.get(key)
     return value if value else _DEFAULT_CONFIG.get(key, "")
+
+
+def _config_suffix(key: str) -> str:
+    """Return '\\n\\n<value>' for a config line, or '' when it's unset — so the
+    M4 disclosure/consent lines can be appended anywhere and tuned (or removed)
+    live in Supabase without a redeploy."""
+    line = _get_config(key).strip()
+    return f"\n\n{line}" if line else ""
 
 
 # ─── Session & Message Persistence ───────────────────────────────────────────
@@ -3095,7 +3121,7 @@ def _send_contact_keyboard(chat_id, preamble: str) -> None:
     """
     _send_telegram_message(
         chat_id,
-        f"{preamble}\n\n{_TG_CONTACT_PROMPT}",
+        f"{preamble}\n\n{_TG_CONTACT_PROMPT}{_config_suffix('consent.capture_line')}",
         reply_markup=_CONTACT_KEYBOARD,
     )
 
@@ -3351,13 +3377,15 @@ class InstagramChannel(MessagingChannel):
 
     def send_contact_prompt(self, recipient_id: str, preamble: str) -> None:
         buttons = self._contact_buttons(recipient_id)
+        consent = _config_suffix("consent.capture_line")
         if buttons:
-            # Send the preamble as plain text first, then the button template.
-            self.send_text(recipient_id, preamble)
+            # Send the preamble (+ consent) as plain text, then the button template.
+            self.send_text(recipient_id, f"{preamble}{consent}")
             self.send_buttons(recipient_id, _IG_CONTACT_PROMPT, buttons)
         else:
             # No env vars configured — fall back to asking for typed phone.
-            self.send_text(recipient_id, f"{preamble}\n\n{_IG_CONTACT_PROMPT_FALLBACK}")
+            self.send_text(recipient_id,
+                           f"{preamble}\n\n{_IG_CONTACT_PROMPT_FALLBACK}{consent}")
 
     def send_lead_thanks(self, recipient_id: str, name: str | None = None) -> None:
         # First-person confirmation (no "team"); overrides the base/Telegram copy.
@@ -3501,7 +3529,9 @@ def telegram_webhook(
     # /cancel commands are the sole, unambiguous escape hatch. Both reset state.
     if text.startswith("/start"):
         _tg_clear_state(chat_id_str)
-        _send_telegram_message(chat_id, _get_config("telegram.greeting"))
+        _send_telegram_message(
+            chat_id,
+            _get_config("telegram.greeting") + _config_suffix("disclosure.line"))
         return {"ok": True}
     if text.startswith("/cancel"):
         _tg_clear_state(chat_id_str)
@@ -4326,7 +4356,9 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
                 # number, and jump STRAIGHT to awaiting_contact — so the user's
                 # next message (their number) is captured as a lead with no
                 # intermediate qualification step.
-                reply_text  = _IG_ICEBREAKER_REPLY
+                # The icebreaker reply IS the WhatsApp-number ask → attach the
+                # M4 consent line here (the IG collection point).
+                reply_text  = _IG_ICEBREAKER_REPLY + _config_suffix("consent.capture_line")
                 new_state   = _make_contact_state(0)
                 audit_event = "instagram_funnel_entry"
             with get_db_conn() as conn:
@@ -4438,6 +4470,73 @@ def get_metrics(days: int = 30, channel: Optional[str] = None):
         "context_provided": context_n,
         "context_rate":     context_rate,  # context_provided / captures (downstream)
     }
+
+
+@app.get("/api/metrics/bookings", dependencies=[Depends(require_auth)])
+def get_booking_metrics():
+    """
+    The North Star, observable: booked consultations. 'booked_this_week' counts
+    scheduled bookings created since the start of the ISO week — canceled ones
+    drop out (status filter), which is exactly how cancellations are netted out
+    without touching the forward-only opportunity stage. matched/unmatched shows
+    how many auto-linked to a person vs. await a manual link in the cockpit.
+    """
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT "
+                    " count(*) FILTER (WHERE status='scheduled' "
+                    "   AND created_at >= date_trunc('week', NOW())) AS booked_this_week, "
+                    " count(*) FILTER (WHERE status='scheduled') AS scheduled_total, "
+                    " count(*) FILTER (WHERE status='canceled')  AS canceled_total, "
+                    " count(*) FILTER (WHERE person_id IS NOT NULL) AS matched, "
+                    " count(*) FILTER (WHERE person_id IS NULL)     AS unmatched "
+                    "FROM bookings")
+                row = cur.fetchone()
+        return {
+            "booked_this_week": row[0], "scheduled_total": row[1],
+            "canceled_total":   row[2], "matched": row[3], "unmatched": row[4],
+        }
+    except Exception as e:
+        logger.error(f"[metrics] bookings query failed: {e}")
+        raise HTTPException(status_code=500, detail="Booking metrics unavailable.")
+
+
+@app.post("/api/webhooks/calendly")
+async def calendly_webhook(
+    request: Request,
+    calendly_webhook_signature: Optional[str] = Header(default=None),
+):
+    """
+    Calendly booking webhook (invitee.created / invitee.canceled).
+
+    Security: verify the signed payload against CALENDLY_WEBHOOK_SIGNING_KEY over
+    the RAW body before any processing. When the key is unset: inert in local dev
+    (no VERCEL), fail-closed in production (drop unsigned). Always returns 200 so
+    Calendly never retry-storms; the heavy work runs in a worker thread. The
+    subscription is registered manually in Calendly's UI (operator-owned).
+    """
+    raw = await request.body()
+
+    if settings.calendly_webhook_signing_key:
+        if not nexus_bookings.verify_signature(
+                raw, calendly_webhook_signature,
+                settings.calendly_webhook_signing_key):
+            logger.warning("[calendly] rejected webhook: bad/missing signature.")
+            return {"ok": True}
+    elif os.environ.get("VERCEL"):
+        logger.error("[calendly] SIGNING_KEY not set — webhook disabled in production.")
+        return {"ok": True}
+
+    try:
+        body = json.loads(raw or b"{}")
+    except Exception:
+        logger.warning("[calendly] could not parse webhook body as JSON.")
+        return {"ok": True}
+
+    await run_in_threadpool(nexus_bookings.process_event, body)
+    return {"ok": True}
 
 
 @app.get("/api/cron/crm-sync")
