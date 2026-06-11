@@ -38,6 +38,7 @@ from pydantic_settings import BaseSettings
 
 from nexus import bookings as nexus_bookings
 from nexus import db as nexus_db
+from nexus import erasure as nexus_erasure
 from nexus import hooks as nexus_hooks
 from nexus import memory as nexus_memory
 
@@ -354,7 +355,7 @@ _INTERNAL_TABLES = {
     "sessions", "messages", "knowledge_base", "app_config", "leads",
     "tenants", "operators", "person", "person_identity", "merge_candidates",
     "interactions", "opportunities", "bookings",
-    "person_profile", "session_summaries", "operator_notes",
+    "person_profile", "session_summaries", "operator_notes", "erasure_log",
 }
 
 def get_schema_description(conn) -> str:
@@ -4537,6 +4538,41 @@ async def calendly_webhook(
 
     await run_in_threadpool(nexus_bookings.process_event, body)
     return {"ok": True}
+
+
+@app.delete("/api/person/{person_id}", dependencies=[Depends(require_auth)])
+def erase_person_endpoint(person_id: str, confirm: bool = False):
+    """
+    Right-to-be-forgotten (Ticket 3.7). HARD-deletes a person and ALL their data
+    — identities, profile, memory, sessions, messages, leads, opportunities,
+    bookings, interactions — in one transaction, then logs the erasure (UUID +
+    counts, no PII) to erasure_log.
+
+    DESTRUCTIVE + IRREVERSIBLE, so: behind require_auth (operator-only — a public
+    erasure route would let anyone delete anyone) AND requires ?confirm=true.
+    404 if the person doesn't exist (idempotent — already-erased is a no-op).
+    """
+    try:
+        uuid.UUID(person_id)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=404, detail="Person not found.")
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Erasure is irreversible — repeat the request with ?confirm=true.")
+    try:
+        with get_db_conn() as conn:
+            counts = nexus_erasure.erase_person(conn, person_id, requested_by="api")
+            if counts is None:
+                raise HTTPException(status_code=404, detail="Person not found.")
+            conn.commit()
+        _audit("person_erased", person_id=person_id, counts=counts)
+        return {"status": "erased", "person_id": person_id, "deleted": counts}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[erasure] failed for {person_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Erasure failed.")
 
 
 @app.get("/api/cron/crm-sync")

@@ -2558,3 +2558,35 @@ class TestPowerBiConfig:
         monkeypatch.setattr(main.settings, "powerbi_tenant_id", "")
         r = client.get("/api/powerbi/config")
         assert r.status_code == 503
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Erasure endpoint — right-to-be-forgotten (Ticket 3.7)
+# ─────────────────────────────────────────────────────────────────────────────
+class TestErasureEndpoint:
+    _UUID = "11111111-1111-1111-1111-111111111111"
+
+    def test_requires_confirm(self, client):
+        # Destructive: without ?confirm=true it must refuse (and never touch DB).
+        r = client.delete(f"/api/person/{self._UUID}")
+        assert r.status_code == 400
+
+    def test_invalid_uuid_is_404(self, client):
+        r = client.delete("/api/person/not-a-uuid?confirm=true")
+        assert r.status_code == 404
+
+    def test_not_found_is_404(self, client, monkeypatch):
+        monkeypatch.setattr(main.nexus_erasure, "erase_person",
+                            lambda conn, pid, requested_by="api": None)
+        r = client.delete(f"/api/person/{self._UUID}?confirm=true")
+        assert r.status_code == 404
+
+    def test_success_returns_counts(self, client, monkeypatch):
+        counts = {"messages": 5, "leads": 1, "sessions": 2, "person": 1}
+        monkeypatch.setattr(main.nexus_erasure, "erase_person",
+                            lambda conn, pid, requested_by="api": counts)
+        r = client.delete(f"/api/person/{self._UUID}?confirm=true")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "erased"
+        assert body["deleted"] == counts
