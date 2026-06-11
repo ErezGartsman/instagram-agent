@@ -28,6 +28,10 @@
     {
       "path": "/api/cron/crm-sync",
       "schedule": "0 0 * * *"
+    },
+    {
+      "path": "/api/cron/memory-sweep",
+      "schedule": "0 3 * * *"
     }
   ]
 }
