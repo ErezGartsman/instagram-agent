@@ -38,6 +38,7 @@ from pydantic_settings import BaseSettings
 
 from nexus import db as nexus_db
 from nexus import hooks as nexus_hooks
+from nexus import memory as nexus_memory
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -4542,6 +4543,64 @@ def cron_crm_sync(
     except Exception as e:
         logger.error(f"[crm] reconcile failed: {e}", exc_info=True)
         return {"status": "error", "detail": "reconcile failed"}
+
+
+# ─── Memory formation — shadow mode (Ticket 3.5, Phase 1) ─────────────────────
+# Two independent switches, both read live from app_config (no redeploy to flip):
+#   memory.formation_enabled — the background sweep writes profiles/summaries.
+#   memory.recall_enabled    — memory is injected back into the bot prompt.
+# Phase 1 = formation ON, recall OFF: the system silently builds memory without
+# touching the bot's live voice. Defaults are OFF when the key is absent, so the
+# feature is dormant until explicitly enabled.
+
+def _flag_on(key: str) -> bool:
+    return _get_config(key).strip().lower() == "true"
+
+def _memory_formation_on() -> bool:
+    return _flag_on("memory.formation_enabled")
+
+def _memory_recall_on() -> bool:
+    return _flag_on("memory.recall_enabled")
+
+
+@app.get("/api/cron/memory-sweep")
+def cron_memory_sweep(
+    authorization: Optional[str] = Header(default=None),
+    x_cron_secret: Optional[str] = Header(default=None),
+):
+    """
+    Shadow-mode memory formation sweep. Summarises idle, unsummarised sessions
+    that carry a real conversation, writing session_summaries + person_profile
+    and NOTHING user-facing. Same CRON_SECRET auth + fail-closed-on-Vercel
+    posture as /api/cron/crm-sync. Batched so a backlog can't exceed the
+    function time budget. No-op (and cheap) when memory.formation_enabled is off.
+    """
+    if settings.cron_secret:
+        bearer = (authorization or "")
+        if bearer.startswith("Bearer "):
+            bearer = bearer[len("Bearer "):].strip()
+        if not (_secret_eq(bearer, settings.cron_secret)
+                or _secret_eq(x_cron_secret, settings.cron_secret)):
+            raise HTTPException(status_code=401, detail="Invalid cron secret.")
+    elif os.environ.get("VERCEL"):
+        logger.error("[cron] CRON_SECRET not set — memory-sweep disabled in production.")
+        raise HTTPException(status_code=503, detail="Cron endpoint not configured.")
+
+    if not _memory_formation_on():
+        return {"status": "skipped", "reason": "formation disabled"}
+
+    try:
+        stats = nexus_memory.formation_sweep(
+            call_llm=_call_llm,
+            parse_json=_parse_llm_json,
+            is_crisis_fn=is_crisis,
+            model_version="gemini-2.5-flash",
+        )
+        _audit("memory_sweep", **stats)
+        return {"status": "ok", **stats}
+    except Exception as e:
+        logger.error(f"[memory] sweep failed: {e}", exc_info=True)
+        return {"status": "error", "detail": "sweep failed"}
 
 
 @app.post("/api/raw_query", dependencies=[Depends(require_auth)])
