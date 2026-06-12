@@ -161,6 +161,67 @@ def merge_profile(existing: dict | None, formation: dict, *, session_id: str) ->
     }
 
 
+# ─── Recall (Hook F — Phase 2): memory → the bot's prompt ─────────────────────
+
+def build_recall_block(conn, *, session_id: str) -> str:
+    """
+    Build the Hebrew recall block injected into the conversational prompt for a
+    KNOWN person: profile summary + durable facts + recent session summaries
+    (sensitive ones excluded at the SQL level — M4). Returns "" whenever there
+    is nothing to recall or anything fails — the bot must never break or sound
+    different because recall hiccuped. Read-only; gated by the caller behind
+    memory.recall_enabled.
+
+    The guardrail instructions ride INSIDE the block so every consumer prompt
+    (Telegram triage today, the WhatsApp flow in Sprint 4) inherits them:
+    reference gently, never assert the uncertain, never mention "memory".
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT person_id FROM sessions WHERE id = %s", (session_id,)
+            )
+            row = cur.fetchone()
+            if not row or not row[0]:
+                return ""
+            person_id = str(row[0])
+            cur.execute(
+                "SELECT summary, facts FROM person_profile WHERE person_id = %s",
+                (person_id,),
+            )
+            prof = cur.fetchone()
+            cur.execute(
+                "SELECT summary FROM session_summaries "
+                "WHERE person_id = %s AND sensitive = FALSE "
+                "ORDER BY created_at DESC LIMIT 3",
+                (person_id,),
+            )
+            sums = [r[0] for r in cur.fetchall() if r[0]]
+
+        if not prof and not sums:
+            return ""
+        lines = ["=== רקע פנימי על הפונה (לשימושך בלבד — אל תצטט) ==="]
+        if prof and prof[0]:
+            lines.append(prof[0])
+        if prof and prof[1]:
+            facts = [f.get("fact") for f in prof[1]
+                     if isinstance(f, dict) and f.get("fact")]
+            if facts:
+                lines.append("עובדות שכדאי לזכור: " + " · ".join(facts[:6]))
+        if sums:
+            lines.append("משיחות קודמות: " + " | ".join(sums))
+        lines.append(
+            "הנחיות זיכרון: התייחס/י לרקע רק אם הוא רלוונטי, בעדינות ובטבעיות — "
+            "כמו מכר שזוכר, לא כמו מערכת. לעולם אל תזכיר/י 'זיכרון' או 'מערכת'. "
+            "אם פרט אינו ודאי — אל תניח/י אותו ואל תציין/י אותו."
+        )
+        return "\n".join(lines) + "\n\n"
+    except Exception as e:
+        logger.warning("[memory] recall block failed (session=%s): %s",
+                       session_id, e)
+        return ""
+
+
 # ─── DB-touching (commit-free; caller owns the transaction) ───────────────────
 
 def _load_profile(conn, person_id: str) -> dict | None:

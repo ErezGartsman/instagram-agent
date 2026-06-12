@@ -1653,7 +1653,7 @@ Classify such messages as "FAQ".
 GROUNDING: For any factual claim about Erez, services, or availability, use ONLY \
 the context excerpts below. Never invent facts.
 
-=== CONTEXT FROM KNOWLEDGE BASE ===
+{recall_block}=== CONTEXT FROM KNOWLEDGE BASE ===
 {context}
 
 {history_block}=== LANGUAGE ===
@@ -1847,10 +1847,15 @@ def _truncate_reply(text: str) -> str:
     return (cut[:boundary + 1] if boundary > 0 else cut).strip() + " …"
 
 
-def _bot_triage_reply(question: str, chunks: list, history: list = None) -> tuple:
+def _bot_triage_reply(question: str, chunks: list, history: list = None,
+                      recall_block: str = "") -> tuple:
     """
     One triage turn: the LLM validates briefly and classifies the intent.
     Returns (reply, intent, sources) where intent ∈ {"OFFER_MEETING", "ANSWER"}.
+
+    recall_block (Hook F, memory.recall_enabled): pre-built person-memory
+    context from nexus.memory.build_recall_block — "" (the default) leaves the
+    prompt byte-for-byte unchanged, so recall OFF means literally no change.
 
     FAIL-SAFE: on any JSON/parse failure we degrade to a plain ANSWER (send the
     text, change no state) — we never crash and never fabricate an OFFER, so a
@@ -1865,6 +1870,7 @@ def _bot_triage_reply(question: str, chunks: list, history: list = None) -> tupl
         context = "(no specific knowledge-base match — lead with warmth.)"
 
     prompt = _BOT_TRIAGE_PROMPT.format(
+        recall_block=recall_block or "",
         context=context,
         history_block=_build_rag_history_block(history or []),
         question=question,
@@ -3838,10 +3844,19 @@ def telegram_webhook(
         # or transitions the funnel. Code owns the CTA + state change, so a funnel
         # closure can't be hallucinated and the persona can't drift into therapy.
         query_vector = _embed_text(text)
+        recall_block = ""
         with get_db_conn() as conn:
             chunks = _retrieve_chunks(conn, query_vector, top_k=5)
+            # NEXUS Hook F — memory recall (3.5 Phase 2). Gated by the live
+            # memory.recall_enabled flag; build_recall_block is read-only and
+            # returns "" on any failure, so the prompt is unchanged when off,
+            # for unknown persons, or on a recall hiccup.
+            if _memory_recall_on():
+                recall_block = nexus_memory.build_recall_block(
+                    conn, session_id=session_id)
 
-        reply, intent, sources = _bot_triage_reply(text, chunks, history=history)
+        reply, intent, sources = _bot_triage_reply(text, chunks, history=history,
+                                                   recall_block=recall_block)
 
         # Offer is the default for anything SUBSTANTIVE (EMOTIONAL or FAQ) — only
         # SMALLTALK stays out of the funnel — and only for a NEW lead (an existing
