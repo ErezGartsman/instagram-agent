@@ -142,6 +142,42 @@ class TestRender:
         assert "עוזר: היי" in t
 
 
+# ─── build_recall_block (Hook F) ─────────────────────────────────────────────
+
+class TestBuildRecallBlock:
+    def test_full_block_contains_profile_facts_summaries_and_guardrails(self):
+        conn = FakeConn(
+            fetchone=[("p-1",),                                  # session stamp
+                      ("אדם שעובר פרידה.",                        # profile summary
+                       [{"fact": "עבר פרידה", "by": "ai"},
+                        {"fact": "מתקשה לישון", "by": "operator"}])],
+            fetchall=[[("שיחה על געגוע",), ("שיחה על ביטחון",)]])
+        block = memory.build_recall_block(conn, session_id="s-1")
+
+        assert "רקע פנימי" in block
+        assert "אדם שעובר פרידה." in block
+        assert "עבר פרידה" in block and "מתקשה לישון" in block
+        assert "שיחה על געגוע" in block and "שיחה על ביטחון" in block
+        assert "הנחיות זיכרון" in block          # guardrails ride inside
+        assert block.endswith("\n\n")
+        # M4: sensitive sessions are excluded at the SQL level.
+        assert any("sensitive = FALSE" in s for s in conn.executed)
+
+    def test_unstamped_session_returns_empty(self):
+        conn = FakeConn(fetchone=[(None,)])
+        assert memory.build_recall_block(conn, session_id="s-2") == ""
+
+    def test_no_memory_yet_returns_empty(self):
+        conn = FakeConn(fetchone=[("p-3",), None], fetchall=[[]])
+        assert memory.build_recall_block(conn, session_id="s-3") == ""
+
+    def test_db_failure_returns_empty_never_raises(self):
+        class BrokenConn:
+            def cursor(self):
+                raise RuntimeError("db down")
+        assert memory.build_recall_block(BrokenConn(), session_id="s-4") == ""
+
+
 # ─── run_session_formation ───────────────────────────────────────────────────
 
 _FORMATION_JSON = {

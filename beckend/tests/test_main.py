@@ -1510,7 +1510,7 @@ class TestCaptionFallback:
         monkeypatch.setattr(main, "_embed_text", lambda t: [0.1] * 768)
         monkeypatch.setattr(main, "_retrieve_chunks", lambda c, v, top_k=5: [])
         monkeypatch.setattr(main, "_bot_triage_reply",
-                            lambda q, chunks, history=None:
+                            lambda q, chunks, history=None, recall_block="":
                                 (seen.update({"q": q}) or ("ok", "ANSWER", [])))
 
         photo_update = {"update_id": 7,
@@ -2558,6 +2558,37 @@ class TestPowerBiConfig:
         monkeypatch.setattr(main.settings, "powerbi_tenant_id", "")
         r = client.get("/api/powerbi/config")
         assert r.status_code == 503
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Memory recall injection — Hook F (Ticket 3.5 Phase 2)
+# ─────────────────────────────────────────────────────────────────────────────
+class TestTriageRecallInjection:
+    _RAW = '{"reply": "אני כאן איתך.", "intent": "EMOTIONAL"}'
+
+    def _capture_prompt(self, monkeypatch):
+        captured = {}
+
+        def fake_llm(prompt):
+            captured["prompt"] = prompt
+            return self._RAW
+
+        monkeypatch.setattr(main, "_call_llm", fake_llm)
+        return captured
+
+    def test_recall_block_is_injected_into_triage_prompt(self, monkeypatch):
+        captured = self._capture_prompt(monkeypatch)
+        block = "=== רקע פנימי על הפונה (לשימושך בלבד — אל תצטט) ===\nRECALL-XYZ\n\n"
+        main._bot_triage_reply("שלום", [], history=[], recall_block=block)
+        assert "RECALL-XYZ" in captured["prompt"]
+        # The block sits before the knowledge-base context, as designed.
+        assert captured["prompt"].index("RECALL-XYZ") < \
+            captured["prompt"].index("CONTEXT FROM KNOWLEDGE BASE")
+
+    def test_default_no_block_leaves_prompt_unchanged(self, monkeypatch):
+        captured = self._capture_prompt(monkeypatch)
+        main._bot_triage_reply("שלום", [], history=[])
+        assert "רקע פנימי" not in captured["prompt"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
