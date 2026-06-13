@@ -104,6 +104,18 @@ class Settings(BaseSettings):
     ig_verify_token:  str = ""
     ig_app_secret:    str = ""
 
+    # ── WhatsApp Business Cloud API (Sprint 4 — the qualification funnel) ───────
+    # All four are set in Vercel; the webhook is inert until they are present.
+    # whatsapp_phone_number_id: the number's ID (WhatsApp → API Setup).
+    # whatsapp_access_token:    System-User permanent token (whatsapp_business_
+    #                           messaging + whatsapp_business_management scopes).
+    # whatsapp_app_secret:      App → Settings → Basic — verifies X-Hub-Signature-256.
+    # whatsapp_verify_token:    A value YOU choose; echoed back on the GET verify.
+    whatsapp_phone_number_id: str = ""
+    whatsapp_access_token:    str = ""
+    whatsapp_app_secret:      str = ""
+    whatsapp_verify_token:    str = ""
+
     # ── Contact-capture CTAs for Instagram (env-var driven, never hardcoded) ────
     # whatsapp_number:  E.164 format without '+', e.g. "972501234567".
     #                   When set, a WhatsApp wa.me link button is shown as the
@@ -4415,6 +4427,319 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
     except Exception as e:
         logger.error(f"[instagram] Unexpected {type(e).__name__}: {e}", exc_info=True)
         channel.send_text(igsid, _IG_ERROR)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WhatsApp Business Cloud API channel (Sprint 4, Ticket 4.1 — plumbing/parity)
+# ───────────────────────────────────────────────────────────────────────────────
+# Peer to the Telegram and Instagram channels above: same MessagingChannel seam,
+# the same Meta X-Hub-Signature-256 verification as Instagram, and the same
+# channel-agnostic session + person-spine wiring — _db_get_or_create_channel_session
+# calls Hook A internally, so resolving a 'whatsapp' session resolves the person.
+#
+# 4.1 proves the wire: inbound WA message → signature-checked → person resolved →
+# read receipt + placeholder reply sent via the Cloud API. The qualification
+# state machine (story → insight → interest → price) attaches at the marked seam
+# in _handle_whatsapp_message in Ticket 4.2.
+#
+# Cloud API specifics vs Instagram:
+#   • Send host is graph.facebook.com/<PHONE_NUMBER_ID>/messages with a Bearer
+#     token (IG uses graph.instagram.com/me/messages with ?access_token=).
+#   • Inbound envelope is entry[].changes[].value.messages[] (delivery/read
+#     receipts arrive as value.statuses[] and carry no 'messages' → skipped).
+#   • The sender id (msg["from"]) is the user's wa_id — their phone in E.164
+#     without '+', which is exactly the external_id for channel='whatsapp'.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_WA_API_VERSION = "v21.0"   # match the IG Graph version already in use
+
+# Confirms the round-trip during 4.1 bring-up. Replaced by the qualification
+# flow's State-1 opening in Ticket 4.2.
+_WA_ACK_PLACEHOLDER = "קיבלתי ✅ (חיבור הוואטסאפ פעיל)"
+
+
+def _wa_graph_call(payload: dict) -> Optional[str]:
+    """
+    POST to the WhatsApp Cloud API /messages endpoint. Best-effort, mirrors
+    _ig_graph_call: stdlib urllib only, never raises (the webhook must always
+    return 200). On failure the Cloud API error body is logged — it carries the
+    actionable reason (token scope, 24h-window, bad recipient).
+    """
+    if not (settings.whatsapp_phone_number_id and settings.whatsapp_access_token):
+        logger.error("[whatsapp] WHATSAPP_PHONE_NUMBER_ID / WHATSAPP_ACCESS_TOKEN "
+                     "not set — cannot send.")
+        return None
+    url = (f"https://graph.facebook.com/{_WA_API_VERSION}/"
+           f"{settings.whatsapp_phone_number_id}/messages")
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "Authorization": f"Bearer {settings.whatsapp_access_token}",
+        "Content-Type":  "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read().decode("utf-8", "ignore")
+    except Exception as e:
+        detail = ""
+        read = getattr(e, "read", None)
+        if callable(read):
+            try:
+                detail = read().decode("utf-8", "ignore")
+            except Exception:
+                detail = ""
+        logger.error(f"[whatsapp] Cloud API send failed: {e} {detail}".strip())
+        return None
+
+
+class WhatsAppChannel(MessagingChannel):
+    """
+    WhatsApp Business Cloud API via graph.facebook.com.
+
+    4.1 implements send_text (the qualification flow's hot path) plus read
+    receipts; send_quick_replies / send_buttons have working implementations so
+    the MessagingChannel contract is honoured and 4.2/4.3 can use them. WhatsApp
+    text bodies cap at 4096 chars.
+    """
+
+    CHANNEL_NAME = "whatsapp"
+
+    def send_text(self, recipient_id: str, text: str) -> None:
+        body = (text or "").strip()[:4096] or "…"
+        _wa_graph_call({
+            "messaging_product": "whatsapp",
+            "recipient_type":    "individual",
+            "to":                recipient_id,
+            "type":              "text",
+            "text":              {"preview_url": False, "body": body},
+        })
+
+    def send_quick_replies(self, recipient_id: str, text: str,
+                           replies: list[dict]) -> None:
+        # WhatsApp interactive reply buttons (max 3). With none or >3 options,
+        # degrade to plain text so the funnel never wedges.
+        btns = replies[:3]
+        if not btns:
+            self.send_text(recipient_id, text)
+            return
+        _wa_graph_call({
+            "messaging_product": "whatsapp",
+            "recipient_type":    "individual",
+            "to":                recipient_id,
+            "type":              "interactive",
+            "interactive": {
+                "type": "button",
+                "body": {"text": (text or "").strip()[:1024] or "…"},
+                "action": {"buttons": [
+                    {"type": "reply", "reply": {
+                        "id":    str(r.get("payload", r["title"]))[:256],
+                        "title": r["title"][:20]}}
+                    for r in btns
+                ]},
+            },
+        })
+
+    def send_buttons(self, recipient_id: str, text: str,
+                     buttons: list[dict]) -> None:
+        # No multi-URL button template in the free-form window — send the text
+        # with any URL inline (WhatsApp auto-links it). 4.3 may upgrade the
+        # Calendly handoff to a native interactive cta_url message.
+        lines = [(text or "").strip()]
+        for b in buttons:
+            if b.get("type") == "web_url" and b.get("url"):
+                lines.append(f'{b.get("title", "")}: {b["url"]}'.strip())
+        self.send_text(recipient_id, "\n".join(ln for ln in lines if ln))
+
+    def send_contact_prompt(self, recipient_id: str, preamble: str) -> None:
+        # On WhatsApp the person is already reachable on this number — there is no
+        # separate contact-share step (unlike Telegram/Instagram). The price →
+        # Calendly handoff (Ticket 4.3) replaces the IG/TG contact CTA here.
+        consent = _config_suffix("consent.capture_line")
+        self.send_text(recipient_id, f"{preamble}{consent}")
+
+    def mark_read(self, message_id: str) -> None:
+        """Blue-tick read receipt (best-effort). WhatsApp keys this on the
+        inbound message id, so it lives here rather than the base mark_seen."""
+        if not message_id:
+            return
+        _wa_graph_call({
+            "messaging_product": "whatsapp",
+            "status":            "read",
+            "message_id":        message_id,
+        })
+
+
+_WHATSAPP_CHANNEL = WhatsAppChannel()
+
+
+# ── Inbound dedup (Meta redelivers; schema-level idempotency is the real guard) ─
+_wa_seen_mids: dict[str, float] = {}
+_WA_DEDUP_TTL = 300   # seconds; pruned each request, mirrors the IG dedup window
+
+
+def _wa_prune_dedup() -> None:
+    cutoff = time.time() - _WA_DEDUP_TTL
+    for k in [k for k, v in _wa_seen_mids.items() if v < cutoff]:
+        del _wa_seen_mids[k]
+
+
+def _wa_verify_signature(raw: bytes, header: Optional[str]) -> bool:
+    """X-Hub-Signature-256 over the RAW body with WHATSAPP_APP_SECRET — identical
+    scheme to Instagram (_ig_verify_signature)."""
+    if not header:
+        return False
+    expected = "sha256=" + hmac.new(
+        settings.whatsapp_app_secret.encode("utf-8"), raw, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(header, expected)
+
+
+@app.get("/api/webhook/whatsapp")
+def whatsapp_webhook_verify(request: Request):
+    """
+    Meta webhook verification handshake (GET), one-time at subscription.
+    Meta sends ?hub.mode=subscribe&hub.verify_token=<token>&hub.challenge=<int>.
+    Read straight from query_params — the dotted keys ('hub.mode') do not bind to
+    Python parameter names, so this is the robust way to read them. Echo the
+    challenge as plain text on success.
+    """
+    qp = request.query_params
+    if (qp.get("hub.mode") == "subscribe"
+            and _secret_eq(qp.get("hub.verify_token"), settings.whatsapp_verify_token)):
+        logger.info("[whatsapp] Webhook verified by Meta.")
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(content=qp.get("hub.challenge") or "")
+    logger.warning("[whatsapp] Webhook verification failed — bad verify_token.")
+    raise HTTPException(status_code=403, detail="Verification failed.")
+
+
+@app.post("/api/webhook/whatsapp")
+async def whatsapp_webhook(
+    request: Request,
+    x_hub_signature_256: Optional[str] = Header(default=None),
+):
+    """
+    WhatsApp Cloud API webhook — POST handler. async so we can hash the RAW body
+    (await request.body()) against Meta's HMAC before parsing. Blocking work is
+    offloaded to a worker thread. Always returns 200 so Meta never retries into a
+    duplicate-message storm. Mirrors the Instagram webhook exactly.
+    """
+    raw = await request.body()
+
+    if settings.whatsapp_app_secret:
+        if not _wa_verify_signature(raw, x_hub_signature_256):
+            logger.warning("[whatsapp] Rejected: bad X-Hub-Signature-256.")
+            return {"ok": True}   # 200 but do nothing — never 4xx to Meta
+
+    try:
+        body = json.loads(raw or b"{}")
+    except Exception:
+        logger.warning("[whatsapp] Could not parse webhook body as JSON.")
+        return {"ok": True}
+
+    await run_in_threadpool(_process_whatsapp_events, body)
+    return {"ok": True}
+
+
+def _wa_extract_text(msg: dict) -> str:
+    """Best-effort plain text from a WhatsApp inbound message. Text bodies and
+    interactive/button replies become text (the reply id is the payload);
+    everything else (media, location, …) returns '' → silent drop in 4.1."""
+    mtype = msg.get("type")
+    if mtype == "text":
+        return (msg.get("text") or {}).get("body", "") or ""
+    if mtype == "interactive":
+        inter = msg.get("interactive") or {}
+        node  = inter.get("button_reply") or inter.get("list_reply") or {}
+        return node.get("id") or node.get("title") or ""
+    if mtype == "button":
+        return (msg.get("button") or {}).get("text", "") or ""
+    return ""
+
+
+def _process_whatsapp_events(body: dict) -> None:
+    """
+    Parse the Cloud API envelope (entry[].changes[].value.messages[]) and
+    dispatch each inbound text to the handler. Runs in a worker thread. Status
+    callbacks (value.statuses[]) carry no 'messages' and are skipped.
+    """
+    _wa_prune_dedup()
+    channel = _WHATSAPP_CHANNEL
+
+    for entry in (body.get("entry") or []):
+        for change in (entry.get("changes") or []):
+            value = change.get("value") or {}
+            for msg in (value.get("messages") or []):
+                wa_from = msg.get("from")
+                mid     = msg.get("id")
+                if not wa_from or not mid:
+                    continue
+
+                # Dedup by message id (Meta redelivery / cold-start replays).
+                if mid in _wa_seen_mids:
+                    logger.debug(f"[whatsapp] Duplicate id={mid!r} — skipping.")
+                    continue
+                _wa_seen_mids[mid] = time.time()
+
+                text = _wa_extract_text(msg).strip()
+                if not text:
+                    _audit("whatsapp_nontext_dropped", wa_id=wa_from)
+                    continue
+
+                _handle_whatsapp_message(channel, wa_from, text, mid)
+
+
+def _handle_whatsapp_message(channel: MessagingChannel, wa_id: str,
+                             text: str, mid: str) -> None:
+    """
+    Ticket 4.1 — plumbing proof. Crisis gate (shared is_crisis) → read receipt →
+    channel-agnostic session + person-spine resolution (Hook A rides inside
+    _db_get_or_create_channel_session) → persist the inbound message → placeholder
+    reply. The qualification state machine (Ticket 4.2) attaches at the marked
+    seam below.
+    """
+    _audit("whatsapp_request", wa_id=wa_id, question=_redact_text(text))
+
+    try:
+        check_rate_limit(wa_id)
+    except RateLimitError:
+        _audit("whatsapp_rate_limited_drop", wa_id=wa_id)
+        return
+
+    # ── Crisis — checked FIRST, before any funnel/insight logic (parity with
+    #    Telegram/Instagram; the qualification flow's insight turn in 4.2 sits
+    #    downstream of this gate, so a distress 'story' is never AI-reflected). ──
+    if is_crisis(text):
+        _audit("whatsapp_crisis", wa_id=wa_id)
+        channel.send_text(wa_id, _get_config("crisis.message"))
+        try:
+            with get_db_conn() as conn:
+                sid = _db_get_or_create_channel_session(conn, "whatsapp", wa_id)
+                if _db_get_session_state(conn, sid):
+                    _db_set_session_state(conn, sid, None)
+                conn.commit()
+        except Exception:
+            pass
+        return
+
+    channel.mark_read(mid)   # best-effort blue tick
+
+    session_id = None
+    try:
+        with get_db_conn() as conn:
+            session_id = _db_get_or_create_channel_session(conn, "whatsapp", wa_id)
+            _db_save_message(conn, session_id, "user", text)
+            _db_touch_session(conn, session_id)
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"[whatsapp] session/persist failed for {wa_id[:6]}…: {e}")
+
+    # ── Ticket 4.2 SEAM ───────────────────────────────────────────────────────
+    # Replace the placeholder below with the qualification state machine:
+    #   bot_state = _db_get_session_state(conn, session_id)
+    #   awaiting_story → generate insight (is_crisis already passed) + bridge →
+    #   awaiting_interest → LLM 3-way classify → offered_price → Calendly link.
+    channel.send_text(wa_id, _WA_ACK_PLACEHOLDER)
+    _audit("whatsapp_ack_placeholder", wa_id=wa_id, session_id=session_id)
 
 
 @app.get("/api/powerbi/config", dependencies=[Depends(require_auth)])
