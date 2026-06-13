@@ -4593,6 +4593,34 @@ def _wa_verify_signature(raw: bytes, header: Optional[str]) -> bool:
     return hmac.compare_digest(header, expected)
 
 
+def _wa_inbound_probe(raw: bytes, sig_header: Optional[str]) -> None:
+    """
+    TEMPORARY (Ticket 4.1 bring-up) — records that an inbound POST reached this
+    function, BEFORE the signature gate and INDEPENDENT of Vercel log visibility.
+    Upserts a single app_config row ('whatsapp._debug_last_inbound') we can read
+    from Supabase to localize where inbound delivery drops. Best-effort; never
+    affects the response. REMOVE once delivery is confirmed.
+    """
+    try:
+        marker = json.dumps({
+            "ts": time.time(),
+            "bytes": len(raw or b""),
+            "sig_present": bool(sig_header),
+            "sig_valid": bool(sig_header) and _wa_verify_signature(raw, sig_header),
+        })
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO app_config (key, value, description) "
+                    "VALUES ('whatsapp._debug_last_inbound', %s, 'TEMP 4.1 inbound probe') "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+                    (marker,),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"[whatsapp] inbound probe write failed: {e}")
+
+
 @app.get("/api/webhook/whatsapp")
 def whatsapp_webhook_verify(request: Request):
     """
@@ -4624,6 +4652,7 @@ async def whatsapp_webhook(
     duplicate-message storm. Mirrors the Instagram webhook exactly.
     """
     raw = await request.body()
+    await run_in_threadpool(_wa_inbound_probe, raw, x_hub_signature_256)  # TEMP 4.1 probe
 
     if settings.whatsapp_app_secret:
         if not _wa_verify_signature(raw, x_hub_signature_256):
