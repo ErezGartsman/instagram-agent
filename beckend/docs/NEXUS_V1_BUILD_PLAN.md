@@ -62,9 +62,10 @@ recall) · cockpit (Today queue, Person 360, Pipeline) · erasure endpoint ·
 disclosure/consent lines · metrics strip.
 
 **Out (explicitly):** embeddings/vector memory · content engine · theme mining ·
-proactive/next-best-action · in-app messaging · WhatsApp API · multi-tenant
+proactive/next-best-action · in-app messaging · multi-tenant
 features · NL2SQL/Power BI rework · autonomous outbound anything · purge
-automation (policy documented only).
+automation (policy documented only). *(WhatsApp API — re-sequenced into Sprint 4
+on 2026-06-13; no longer V1-out.)*
 
 ## 3. Architecture & repo layout
 
@@ -316,21 +317,65 @@ since WhatsApp replies are out-of-system.
 references prior context (flag flipped for demo); Calendly booking appears as
 'booked' with timestamps; metrics queryable by SQL.
 
-### Sprint 4 — "Cockpit" (~3–4 weeks solo)
+### Sprint 4 — "WhatsApp + Qualification Flow" (re-sequenced 2026-06-13)
+
+Pulled forward ahead of the cockpit (now Sprint 5). Lights up WhatsApp capture
+(was M1 / §2-out / V2-deferred) and replaces the 2-turn funnel with the
+insight-based qualification flow. Consequence: the cockpit oversight layer now
+lands AFTER go-live, so the in-flow safety guards below are mandatory, not
+optional.
+
+**Locked decisions (2026-06-13):** Number = Coexistence on 0546150955 (keep the
+WhatsApp Business app + Cloud API on the same number; verify IL
+self-serve-vs-BSP eligibility at onboarding; build verifies on Meta's test
+number meanwhile). Channels = WhatsApp + Telegram run the new flow; Instagram
+stays on the current funnel. Interest signal (State 3→4) = small LLM 3-way
+classifier (interested / declined / question-or-hesitation).
+
+**Flow shape:** Understanding → Insight → Invitation → (wait for signal) →
+Price. Empathy and price NEVER share a message. Only the insight (State 2) is
+AI-generated; the opening, the bridge, the offer and the price (250₪) are
+hardcoded. The insight reflects ONE of three axes (mind-vs-heart / exhaustion /
+reality-vs-fantasy), no solutions, no banned phrases. Sits on the existing
+`sessions.bot_state` TTL machine (24h = the WhatsApp service window) and the
+`MessagingChannel` ABC seam — channel-neutral state names, not `wa_*`.
+
+**Safety guards (mandatory — cockpit oversight comes later):** (1) crisis —
+`is_crisis()` per-turn gate at webhook entry precedes insight generation
+(already true for TG/IG; the WA webhook must call it too); (2) anti-cringe —
+banned-phrase list enforced in CODE (post-gen validator + regenerate-once +
+safe fallback), not prompt-only; (3) honesty — `disclosure.line` placement
+decided on purpose (bot = Erez's digital assistant; no deceptive impersonation
+per WhatsApp policy); (4) human-takeover — under Coexistence both Erez (app) and
+the bot (API) can reply, so the bot backs off a conversation when Erez replies
+manually.
 
 | # | Ticket | Acceptance criteria |
 |---|--------|---------------------|
-| 4.1 | FE scaffold + Supabase Auth + JWT middleware | Erez signs in with Google; non-allowlisted email rejected server-side |
-| 4.2 | Cockpit read APIs + Today queue + metrics strip | Queue sorted urgency×wait; SLA timers tick; numbers match SQL |
-| 4.3 | Person 360 | Timeline + transcript drill-in; profile/facts editable (operator-wins persists); notes |
-| 4.4 | Pipeline + bookings inbox + merge/link/delete | Kanban stage moves logged; unlinked booking linkable; merge resolves candidate; erasure works from UI |
-| 4.5 | Cmd-K, RTL polish, deploy, dogfood | 5 consecutive real mornings used by Erez; fix-list triaged |
+| 4.1 | WhatsApp channel plumbing | Cloud API webhook (GET verify + POST receive, X-Hub-Signature-256); `WhatsAppChannel(MessagingChannel)`; Hook A person spine on first inbound (channel='whatsapp'); message-id dedup. Inbound WA → person resolved → reply sent, verified on the Meta test number. |
+| 4.2 | Qualification state machine | story→insight→interest→price, channel-agnostic, on WA+TG; insight LLM call + banned-phrase validator; LLM interest classifier; crisis gate inherited; funnel hooks (engaged/qualified/captured). |
+| 4.3 | Price → Calendly handoff + human-takeover | offered_price agreement → Calendly link (existing North Star); bot backs off on manual Erez reply (Coexistence). |
+| 4.4 | Hardening + dogfood | Idempotency under Meta redelivery; 24h-window / template discipline; transcript spot-checks; live test with real leads. |
+
+**Exit demo:** a real WhatsApp lead completes story → insight → interest → 250₪
+offer → Calendly booking end-to-end, in Erez's voice, with crisis and
+banned-phrase guards proven.
+
+### Sprint 5 — "Cockpit" (~3–4 weeks solo)
+
+| # | Ticket | Acceptance criteria |
+|---|--------|---------------------|
+| 5.1 | FE scaffold + Supabase Auth + JWT middleware | Erez signs in with Google; non-allowlisted email rejected server-side |
+| 5.2 | Cockpit read APIs + Today queue + metrics strip | Queue sorted urgency×wait; SLA timers tick; numbers match SQL |
+| 5.3 | Person 360 | Timeline + transcript drill-in; profile/facts editable (operator-wins persists); notes |
+| 5.4 | Pipeline + bookings inbox + merge/link/delete | Kanban stage moves logged; unlinked booking linkable; merge resolves candidate; erasure works from UI |
+| 5.5 | Cmd-K, RTL polish, deploy, dogfood | 5 consecutive real mornings used by Erez; fix-list triaged |
 
 **Exit demo:** Erez runs an actual morning from the cockpit in ≤10 minutes.
 
 ### Deferred (V2 backlog, do not start)
 Embeddings recall · theme mining · content studio · proactive
-suggestions/NBA · WhatsApp API capture · purge automation · pg_cron sub-daily
+suggestions/NBA · purge automation · pg_cron sub-daily
 sweeps · multi-operator UI.
 
 ## 9. UX principles
