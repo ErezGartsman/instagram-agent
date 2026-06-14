@@ -4476,12 +4476,9 @@ def _wa_graph_call(payload: dict) -> Optional[str]:
         "Authorization": f"Bearer {settings.whatsapp_access_token}",
         "Content-Type":  "application/json",
     })
-    kind = payload.get("type") or payload.get("status") or "?"   # 'text' | 'read'
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            body = resp.read().decode("utf-8", "ignore")
-            _wa_debug_record_send(kind, True, getattr(resp, "status", 200), "")
-            return body
+            return resp.read().decode("utf-8", "ignore")
     except Exception as e:
         detail = ""
         read = getattr(e, "read", None)
@@ -4491,7 +4488,6 @@ def _wa_graph_call(payload: dict) -> Optional[str]:
             except Exception:
                 detail = ""
         logger.error(f"[whatsapp] Cloud API send failed: {e} {detail}".strip())
-        _wa_debug_record_send(kind, False, getattr(e, "code", None), detail or str(e))
         return None
 
 
@@ -4597,63 +4593,6 @@ def _wa_verify_signature(raw: bytes, header: Optional[str]) -> bool:
     return hmac.compare_digest(header, expected)
 
 
-def _wa_inbound_probe(raw: bytes, sig_header: Optional[str]) -> None:
-    """
-    TEMPORARY (Ticket 4.1 bring-up) — records that an inbound POST reached this
-    function, BEFORE the signature gate and INDEPENDENT of Vercel log visibility.
-    Upserts a single app_config row ('whatsapp._debug_last_inbound') we can read
-    from Supabase to localize where inbound delivery drops. Best-effort; never
-    affects the response. REMOVE once delivery is confirmed.
-    """
-    try:
-        marker = json.dumps({
-            "ts": time.time(),
-            "bytes": len(raw or b""),
-            "sig_present": bool(sig_header),
-            "sig_valid": bool(sig_header) and _wa_verify_signature(raw, sig_header),
-        })
-        with get_db_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO app_config (key, value, description) "
-                    "VALUES ('whatsapp._debug_last_inbound', %s, 'TEMP 4.1 inbound probe') "
-                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-                    (marker,),
-                )
-            conn.commit()
-    except Exception as e:
-        logger.warning(f"[whatsapp] inbound probe write failed: {e}")
-
-
-def _wa_debug_record_send(kind: str, ok: bool, status, detail: str) -> None:
-    """
-    TEMPORARY (Ticket 4.1 bring-up) — records the outcome of the most recent
-    outbound Cloud API call into app_config ('whatsapp._debug_last_send') so we
-    can read the EXACT Meta error from Supabase (no Vercel log access on our
-    side). Runs inside the webhook worker thread, so the blocking write is safe.
-    Best-effort. REMOVE with the inbound probe once delivery is confirmed.
-    """
-    try:
-        marker = json.dumps({
-            "ts": time.time(),
-            "kind": kind,            # 'text' = the reply, 'read' = receipt
-            "ok": ok,
-            "status": status,
-            "error": (detail or "")[:800],
-        }, ensure_ascii=False)
-        with get_db_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO app_config (key, value, description) "
-                    "VALUES ('whatsapp._debug_last_send', %s, 'TEMP 4.1 send probe') "
-                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-                    (marker,),
-                )
-            conn.commit()
-    except Exception as e:
-        logger.warning(f"[whatsapp] send probe write failed: {e}")
-
-
 @app.get("/api/webhook/whatsapp")
 def whatsapp_webhook_verify(request: Request):
     """
@@ -4685,7 +4624,6 @@ async def whatsapp_webhook(
     duplicate-message storm. Mirrors the Instagram webhook exactly.
     """
     raw = await request.body()
-    await run_in_threadpool(_wa_inbound_probe, raw, x_hub_signature_256)  # TEMP 4.1 probe
 
     if settings.whatsapp_app_secret:
         if not _wa_verify_signature(raw, x_hub_signature_256):
