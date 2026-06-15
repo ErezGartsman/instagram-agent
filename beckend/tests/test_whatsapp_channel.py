@@ -189,3 +189,94 @@ class TestWebhookPost:
                 "Content-Type": "application/json",
             })
         assert h.call_count == 1
+
+
+# ── Ticket 4.2 — qualification state machine ──────────────────────────────────
+
+def _cfg(key):
+    return main._DEFAULT_CONFIG.get(key, "")
+
+
+def _run_state(text, bot_state, *, classify="AFFIRM", insight="תובנה"):
+    """Drive _wa_run_qualification with all boundaries patched; return the
+    _wa_send_and_persist mock so tests can assert (reply, new_state)."""
+    with patch.object(main, "_get_config", side_effect=_cfg), \
+         patch.object(main, "_wa_send_and_persist") as snp, \
+         patch.object(main, "_bot_classify_offer_response", return_value=(classify, "")), \
+         patch.object(main, "_wa_generate_insight", return_value=insight), \
+         patch.object(main.nexus_hooks, "on_funnel_event"):
+        main._wa_run_qualification(MagicMock(), "972500000000", "sess-1",
+                                   text, bot_state, [])
+    snp.assert_called_once()
+    args = snp.call_args.args          # (channel, wa_id, session_id, reply, new_state)
+    return args[3], args[4]
+
+
+class TestInsightGuard:
+    def test_clean_passes(self):
+        assert main._wa_insight_is_clean("נראה שהשכל מבין אבל הלב עוד לא שם") is True
+
+    def test_banned_phrase_caught(self):
+        assert main._wa_insight_is_clean("הרבה אנשים במצב שלך מרגישים ככה") is False
+
+    def test_banned_phrase_caught_despite_spacing(self):
+        assert main._wa_insight_is_clean("הרבה   אנשים   במצב שלך") is False
+
+    def test_empty_is_not_clean(self):
+        assert main._wa_insight_is_clean("") is False
+
+
+class TestGenerateInsight:
+    def test_clean_output_returned(self):
+        with patch.object(main, "_get_config", side_effect=_cfg), \
+             patch.object(main, "_call_llm", return_value="נראה שאתה תקוע בלופ"):
+            assert main._wa_generate_insight("הסיפור שלי") == "נראה שאתה תקוע בלופ"
+
+    def test_banned_output_falls_back(self):
+        with patch.object(main, "_get_config", side_effect=_cfg), \
+             patch.object(main, "_call_llm", return_value="הרבה אנשים במצב שלך"):
+            assert main._wa_generate_insight("x") == _cfg("whatsapp.insight_fallback")
+
+    def test_llm_error_falls_back(self):
+        with patch.object(main, "_get_config", side_effect=_cfg), \
+             patch.object(main, "_call_llm", side_effect=TimeoutError("slow")):
+            assert main._wa_generate_insight("x") == _cfg("whatsapp.insight_fallback")
+
+
+class TestQualificationFlow:
+    def test_entry_sends_opening(self):
+        reply, state = _run_state("היי בוט", None)
+        assert reply == _cfg("whatsapp.opening")
+        assert state == "wa_awaiting_story"
+
+    def test_story_generates_insight_then_bridge(self):
+        reply, state = _run_state("אני בלופ", "wa_awaiting_story", insight="INSIGHT_X")
+        assert "INSIGHT_X" in reply
+        assert _cfg("whatsapp.bridge") in reply
+        assert state == "wa_awaiting_interest"
+
+    def test_interest_yes_offers_price(self):
+        reply, state = _run_state("כן בשמחה", "wa_awaiting_interest", classify="AFFIRM")
+        assert reply == _cfg("whatsapp.price_offer")
+        assert state == "wa_offered_price"
+
+    def test_interest_question_still_offers_price(self):
+        reply, state = _run_state("כמה זה עולה?", "wa_awaiting_interest", classify="OTHER")
+        assert reply == _cfg("whatsapp.price_offer")
+        assert state == "wa_offered_price"
+
+    def test_interest_decline_closes(self):
+        reply, state = _run_state("לא תודה", "wa_awaiting_interest", classify="DECLINE")
+        assert reply == _cfg("whatsapp.decline")
+        assert state is None
+
+    def test_price_yes_sends_booking_and_clears(self):
+        reply, state = _run_state("מתאים לי", "wa_offered_price", classify="AFFIRM")
+        # calendly.url default is empty → lead-in sent without a link
+        assert reply == _cfg("whatsapp.booking_leadin")
+        assert state is None
+
+    def test_price_decline_closes(self):
+        reply, state = _run_state("יקר לי", "wa_offered_price", classify="DECLINE")
+        assert reply == _cfg("whatsapp.decline")
+        assert state is None

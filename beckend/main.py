@@ -458,6 +458,54 @@ _DEFAULT_CONFIG = {
     "consent.capture_line": (
         "הפרטים שלך נשמרים אך ורק כדי שנוכל לחזור אליך, ולא מועברים לאף אחד."
     ),
+    # ── WhatsApp qualification flow (Ticket 4.2) — live-editable in Supabase ─────
+    # Funnel: opening → (AI insight) + bridge → interest → price → Calendly. Only
+    # the insight is AI-generated; everything below is hardcoded copy in Erez's
+    # voice, tunable here without a redeploy. Empathy and price never share a
+    # message (insight and price are separate turns by design).
+    "whatsapp.opening": (
+        "היי ❤️\n"
+        "אני כאן.\n"
+        "תכתוב/י לי בכמה מילים מה עובר עלייך כרגע ומה גרם לך לפנות דווקא עכשיו."
+    ),
+    "whatsapp.bridge": (
+        "זאת בדיוק הסיבה שאני לא אוהב לתת תשובות של שתי שורות במצבים כאלה. "
+        "בדרך כלל צריך להבין מה באמת מחזיק אותך שם. אם תרצה/י, אפשר לעשות שיחה "
+        "אישית ולצלול לזה יותר לעומק."
+    ),
+    "whatsapp.price_offer": (
+        "תודה ששיתפת אותי.\n"
+        "אני חושב ששיחה יכולה מאוד לעזור לעשות סדר במה שעובר עלייך ולתת לך "
+        "כיוון ברור להמשך.\n"
+        "השיחה היא אישית, אחד על אחד, נמשכת כשעה והעלות שלה היא 250₪.\n"
+        "אם זה מרגיש לך נכון, נבדוק יחד מועד שמתאים לך ❤️"
+    ),
+    "whatsapp.booking_leadin": (
+        "מקסים 🙏 הנה הקישור לתיאום השיחה — בחר/י את המועד שהכי נוח לך:"
+    ),
+    "whatsapp.decline": (
+        "לגמרי בסדר, בלי שום לחץ 😊 אני כאן אם תרצה/י לחזור לזה בעתיד — "
+        "פשוט תכתוב/י לי."
+    ),
+    "whatsapp.price_nudge": (
+        "אין שום לחץ 🤍 אם תרצה/י נמצא יחד מועד שמתאים לך, או שנמשיך לדבר על "
+        "מה שעולה לך."
+    ),
+    "whatsapp.insight_fallback": (
+        "נשמע שיש כאן משהו אמיתי וחשוב, ושיש בו הרבה יותר ממה שאפשר לסכם בשתי שורות."
+    ),
+    "whatsapp.insight_instructions": (
+        "המשתמש שיתף מה עובר עליו. המשימה שלך: לשקף לו במשפט אחד או שניים את "
+        "הקונפליקט הפנימי שלו, בגוף ראשון ובחום אנושי — בלי לפתור, בלי לתת עצה, "
+        "בלי הבטחות. התמקד באחד משלושה צירים בלבד: (1) שכל מול רגש — מבין/ה בשכל "
+        "אבל הרגש עוד לא שם; (2) תשישות ולופ — תקוע/ה ולא מצליח/ה לצאת; (3) "
+        "מציאות מול פנטזיה — קשה לשחרר את מה שקיווה/קיוותה שיקרה. אל תזכיר/י שיחה, "
+        "פגישה או מחיר. אסור להשתמש בביטויים גנריים כמו 'אני מבין בדיוק מה אתה "
+        "עובר', 'אל תדאג יש לי פתרון' או 'הרבה אנשים במצב שלך'."
+    ),
+    # Set the real Calendly booking link here (live, no redeploy). Empty => the
+    # booking lead-in is sent without a link and Erez follows up manually.
+    "calendly.url": "",
 }
 
 _CONFIG_TTL      = 300        # seconds — edits in Supabase take effect within this window
@@ -4453,10 +4501,6 @@ def _handle_instagram_dm(channel: InstagramChannel, igsid: str, text: str) -> No
 
 _WA_API_VERSION = "v21.0"   # match the IG Graph version already in use
 
-# Confirms the round-trip during 4.1 bring-up. Replaced by the qualification
-# flow's State-1 opening in Ticket 4.2.
-_WA_ACK_PLACEHOLDER = "קיבלתי ✅ (חיבור הוואטסאפ פעיל)"
-
 
 def _wa_graph_call(payload: dict) -> Optional[str]:
     """
@@ -4688,14 +4732,159 @@ def _process_whatsapp_events(body: dict) -> None:
                 _handle_whatsapp_message(channel, wa_from, text, mid)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# WhatsApp qualification state machine (Ticket 4.2 — WhatsApp-only)
+# ───────────────────────────────────────────────────────────────────────────────
+# Psychological flow (Erez's DNA): Understanding → Insight → Invitation →
+# (wait for signal) → Price. Empathy and price NEVER share a message. Only the
+# insight (State 2) is AI-generated; the opening, bridge, offer, price and
+# Calendly lead-in are hardcoded copy (live-editable in app_config). The crisis
+# gate in _handle_whatsapp_message runs upstream of every state here, so a
+# distress 'story' is routed to the hotline before any insight is generated.
+#
+# States ride the existing sessions.bot_state TTL machine (24h = the WhatsApp
+# service window) and are wa_-prefixed so they never collide with the Telegram
+# funnel's states (Telegram keeps its own flow untouched for now).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_WA_STATE_STORY    = "wa_awaiting_story"
+_WA_STATE_INTEREST = "wa_awaiting_interest"
+_WA_STATE_PRICE    = "wa_offered_price"
+
+# Anti-cringe guard: the insight prompt forbids these, AND the output is checked
+# against them in CODE (prompt-only is not a guarantee). Matched normalized +
+# substring, so spacing/punctuation variants are still caught.
+_WA_BANNED_PHRASES = (
+    "אני מבין בדיוק מה אתה עובר",
+    "אני מבינה בדיוק מה את עוברת",
+    "אל תדאג יש לי פתרון",
+    "יש לי פתרון",
+    "הרבה אנשים במצב שלך",
+)
+
+
+def _wa_normalize(s: str) -> str:
+    """Collapse whitespace for a forgiving banned-phrase substring check."""
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def _wa_insight_is_clean(text: str) -> bool:
+    """True iff the generated insight is non-empty and contains none of the
+    banned generic-therapist phrases."""
+    norm = _wa_normalize(text)
+    return bool(norm) and not any(_wa_normalize(b) in norm for b in _WA_BANNED_PHRASES)
+
+
+def _wa_generate_insight(story: str) -> str:
+    """
+    State 2 — reflect the user's internal conflict (one of three axes), no
+    solutions. AI-generated, then guarded in code: if the output trips the
+    anti-cringe list it is regenerated once, then falls back to a safe neutral
+    reflection. The instructions live in app_config ('whatsapp.insight_
+    instructions'); the story is appended in code (never .format-ed) so a live
+    edit can't break templating.
+    """
+    prompt = (
+        f"{_get_config('whatsapp.insight_instructions')}\n\n"
+        f"מה שהמשתמש כתב:\n{(story or '').strip()[:1500]}\n\n"
+        f"התובנה שלך (משפט אחד או שניים בלבד):"
+    )
+    for attempt in range(2):
+        try:
+            insight = _truncate_reply((_call_llm(prompt) or "").strip())
+        except Exception as e:
+            logger.warning(f"[whatsapp] insight generation failed: {e}")
+            break
+        if _wa_insight_is_clean(insight):
+            return insight
+        logger.info("[whatsapp] insight rejected by anti-cringe guard (attempt %d)",
+                    attempt + 1)
+    return _get_config("whatsapp.insight_fallback")
+
+
+def _wa_send_and_persist(channel: MessagingChannel, wa_id: str, session_id: str,
+                         reply: str, new_state: Optional[str]) -> None:
+    """Persist the assistant message + set/clear bot_state, then send — the
+    DB-then-send order used by the Telegram/Instagram funnel branches."""
+    try:
+        with get_db_conn() as conn:
+            _db_save_message(conn, session_id, "assistant", reply)
+            _db_set_session_state(conn, session_id, new_state)
+            _db_touch_session(conn, session_id)
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"[whatsapp] persist/setstate failed: {e}")
+    channel.send_text(wa_id, reply)
+
+
+def _wa_run_qualification(channel: MessagingChannel, wa_id: str, session_id: str,
+                          text: str, bot_state: Optional[str],
+                          history: list) -> None:
+    """The WhatsApp funnel. Crisis already handled upstream by the caller."""
+
+    # ── State 4: price offered — waiting for a yes ────────────────────────────
+    if bot_state == _WA_STATE_PRICE:
+        decision, _ = _bot_classify_offer_response(text, history)
+        if decision == "AFFIRM":
+            link  = _get_config("calendly.url").strip()
+            lead  = _get_config("whatsapp.booking_leadin")
+            reply = f"{lead}\n{link}" if link else lead
+            _wa_send_and_persist(channel, wa_id, session_id, reply, None)
+            nexus_hooks.on_funnel_event(
+                "qualified", "whatsapp", session_id=session_id,
+                stage="qualified", dedup_key=f"qualified:{session_id}")
+            _audit("whatsapp_price_accepted", wa_id=wa_id, session_id=session_id)
+        elif decision == "DECLINE":
+            _wa_send_and_persist(channel, wa_id, session_id,
+                                 _get_config("whatsapp.decline"), None)
+            _audit("whatsapp_price_declined", wa_id=wa_id, session_id=session_id)
+        else:
+            _wa_send_and_persist(channel, wa_id, session_id,
+                                 _get_config("whatsapp.price_nudge"), _WA_STATE_PRICE)
+            _audit("whatsapp_price_other", wa_id=wa_id, session_id=session_id)
+        return
+
+    # ── State 3: invitation sent — waiting for the interest signal ────────────
+    if bot_state == _WA_STATE_INTEREST:
+        decision, _ = _bot_classify_offer_response(text, history)
+        if decision == "DECLINE":
+            _wa_send_and_persist(channel, wa_id, session_id,
+                                 _get_config("whatsapp.decline"), None)
+            _audit("whatsapp_interest_declined", wa_id=wa_id, session_id=session_id)
+        else:
+            # AFFIRM or OTHER — a question is still engagement; the price message
+            # answers the common ones (duration, 1-on-1, cost). Never push price
+            # on an explicit decline, which is the branch above.
+            _wa_send_and_persist(channel, wa_id, session_id,
+                                 _get_config("whatsapp.price_offer"), _WA_STATE_PRICE)
+            _audit("whatsapp_interest_signal", wa_id=wa_id,
+                   session_id=session_id, decision=decision)
+        return
+
+    # ── State 2: the user just told their story → reflect + bridge ────────────
+    if bot_state == _WA_STATE_STORY:
+        insight = _wa_generate_insight(text)
+        reply   = f"{insight}\n\n{_get_config('whatsapp.bridge')}"
+        _wa_send_and_persist(channel, wa_id, session_id, reply, _WA_STATE_INTEREST)
+        _audit("whatsapp_insight_sent", wa_id=wa_id, session_id=session_id)
+        return
+
+    # ── Entry: first contact (or expired state) → the opening ─────────────────
+    _wa_send_and_persist(channel, wa_id, session_id,
+                         _get_config("whatsapp.opening"), _WA_STATE_STORY)
+    nexus_hooks.on_funnel_event(
+        "engaged", "whatsapp", session_id=session_id, stage="engaged",
+        dedup_key=f"engaged:{session_id}")
+    _audit("whatsapp_funnel_opened", wa_id=wa_id, session_id=session_id)
+
+
 def _handle_whatsapp_message(channel: MessagingChannel, wa_id: str,
                              text: str, mid: str) -> None:
     """
-    Ticket 4.1 — plumbing proof. Crisis gate (shared is_crisis) → read receipt →
-    channel-agnostic session + person-spine resolution (Hook A rides inside
-    _db_get_or_create_channel_session) → persist the inbound message → placeholder
-    reply. The qualification state machine (Ticket 4.2) attaches at the marked
-    seam below.
+    Ticket 4.2 — crisis gate (shared is_crisis) → read receipt → channel-agnostic
+    session + person-spine resolution (Hook A rides inside
+    _db_get_or_create_channel_session) → persist inbound → run the qualification
+    state machine. WhatsApp-only; Telegram/Instagram funnels are untouched.
     """
     _audit("whatsapp_request", wa_id=wa_id, question=_redact_text(text))
 
@@ -4705,9 +4894,7 @@ def _handle_whatsapp_message(channel: MessagingChannel, wa_id: str,
         _audit("whatsapp_rate_limited_drop", wa_id=wa_id)
         return
 
-    # ── Crisis — checked FIRST, before any funnel/insight logic (parity with
-    #    Telegram/Instagram; the qualification flow's insight turn in 4.2 sits
-    #    downstream of this gate, so a distress 'story' is never AI-reflected). ──
+    # ── Crisis — checked FIRST, upstream of every funnel/insight branch. ──
     if is_crisis(text):
         _audit("whatsapp_crisis", wa_id=wa_id)
         channel.send_text(wa_id, _get_config("crisis.message"))
@@ -4723,23 +4910,19 @@ def _handle_whatsapp_message(channel: MessagingChannel, wa_id: str,
 
     channel.mark_read(mid)   # best-effort blue tick
 
-    session_id = None
     try:
         with get_db_conn() as conn:
             session_id = _db_get_or_create_channel_session(conn, "whatsapp", wa_id)
+            bot_state  = _db_get_session_state(conn, session_id)
+            history    = _db_load_history(conn, session_id, limit=12)
             _db_save_message(conn, session_id, "user", text)
             _db_touch_session(conn, session_id)
             conn.commit()
     except Exception as e:
-        logger.warning(f"[whatsapp] session/persist failed for {wa_id[:6]}…: {e}")
+        logger.warning(f"[whatsapp] session resolve failed for {wa_id[:6]}…: {e}")
+        return
 
-    # ── Ticket 4.2 SEAM ───────────────────────────────────────────────────────
-    # Replace the placeholder below with the qualification state machine:
-    #   bot_state = _db_get_session_state(conn, session_id)
-    #   awaiting_story → generate insight (is_crisis already passed) + bridge →
-    #   awaiting_interest → LLM 3-way classify → offered_price → Calendly link.
-    channel.send_text(wa_id, _WA_ACK_PLACEHOLDER)
-    _audit("whatsapp_ack_placeholder", wa_id=wa_id, session_id=session_id)
+    _wa_run_qualification(channel, wa_id, session_id, text, bot_state, history)
 
 
 @app.get("/api/powerbi/config", dependencies=[Depends(require_auth)])
