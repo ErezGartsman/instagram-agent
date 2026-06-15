@@ -336,3 +336,77 @@ class TestBookingConfirmation:
             out = main._wa_booking_link_and_match("972500000000")
         assert out == "https://calendly.com/erez/30min?utm_content=ABC234"
         attach.assert_called_once()
+
+
+# ── Ticket 4.4 — Coexistence human-takeover ───────────────────────────────────
+
+def _cm_conn():
+    """A MagicMock connection that works as a context manager."""
+    conn = MagicMock()
+    conn.__enter__ = lambda s: s
+    conn.__exit__ = MagicMock(return_value=False)
+    return conn
+
+
+class TestHumanTakeover:
+    def test_echo_recipients_from_message_echoes(self):
+        v = {"message_echoes": [{"from": "15556562070", "to": "972500000000",
+                                 "id": "wamid.x", "type": "text"}]}
+        assert main._wa_echo_recipients(v) == ["972500000000"]
+
+    def test_echo_recipients_messages_fallback_and_recipient_id(self):
+        assert main._wa_echo_recipients({"messages": [{"to": "972511112222"}]}) \
+            == ["972511112222"]
+        assert main._wa_echo_recipients(
+            {"message_echoes": [{"recipient_id": "972522223333"}]}) \
+            == ["972522223333"]
+
+    def test_echo_recipients_empty(self):
+        assert main._wa_echo_recipients({}) == []
+        assert main._wa_echo_recipients({"message_echoes": [{"id": "x"}]}) == []
+
+    def test_smb_echo_marks_takeover(self):
+        conn = _cm_conn()
+        with patch.object(main, "get_db_conn", return_value=conn), \
+             patch.object(main, "_wa_record_debug"), \
+             patch.object(main, "_db_get_or_create_channel_session",
+                          return_value="sid-1"), \
+             patch.object(main, "_db_set_session_state") as setstate, \
+             patch.object(main, "_db_touch_session"), \
+             patch.object(main, "_audit"):
+            main._wa_handle_smb_echo({"message_echoes": [{"to": "972500000000"}]})
+        setstate.assert_called_once_with(conn, "sid-1", "wa_human_takeover")
+
+    def test_handle_suppresses_during_takeover(self):
+        channel = MagicMock()
+        with patch.object(main, "get_db_conn", return_value=_cm_conn()), \
+             patch.object(main, "check_rate_limit"), \
+             patch.object(main, "is_crisis", return_value=False), \
+             patch.object(main, "_db_get_or_create_channel_session",
+                          return_value="sid-1"), \
+             patch.object(main, "_db_get_session_state",
+                          return_value="wa_human_takeover"), \
+             patch.object(main, "_db_load_history", return_value=[]), \
+             patch.object(main, "_db_save_message"), \
+             patch.object(main, "_db_touch_session"), \
+             patch.object(main, "_wa_run_qualification") as run, \
+             patch.object(main, "_audit"):
+            main._handle_whatsapp_message(channel, "972500000000", "היי", "wamid.1")
+        run.assert_not_called()
+        channel.send_text.assert_not_called()
+
+    def test_handle_runs_funnel_when_not_takeover(self):
+        channel = MagicMock()
+        with patch.object(main, "get_db_conn", return_value=_cm_conn()), \
+             patch.object(main, "check_rate_limit"), \
+             patch.object(main, "is_crisis", return_value=False), \
+             patch.object(main, "_db_get_or_create_channel_session",
+                          return_value="sid-1"), \
+             patch.object(main, "_db_get_session_state", return_value=None), \
+             patch.object(main, "_db_load_history", return_value=[]), \
+             patch.object(main, "_db_save_message"), \
+             patch.object(main, "_db_touch_session"), \
+             patch.object(main, "_wa_run_qualification") as run, \
+             patch.object(main, "_audit"):
+            main._handle_whatsapp_message(channel, "972500000000", "היי", "wamid.1")
+        run.assert_called_once()
