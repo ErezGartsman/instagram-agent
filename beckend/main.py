@@ -4729,11 +4729,74 @@ def _wa_extract_text(msg: dict) -> str:
     return ""
 
 
+# ── Coexistence human-takeover (Ticket 4.4) ───────────────────────────────────
+# Under Coexistence, a message Erez types in the WhatsApp Business app is mirrored
+# to our webhook as an `smb_message_echoes` event — NOT `messages`, and never for
+# our own API sends, so it unambiguously means a human reply. When one arrives we
+# mark that conversation handed-off and the bot backs off (auto-resumes when the
+# takeover state expires).
+
+_WA_SMB_ECHO_DEBUG_KEY = "whatsapp._debug_last_smb_echo"
+
+
+def _wa_record_debug(key: str, payload: dict) -> None:
+    """TEMPORARY (Coexistence bring-up) — capture a raw webhook payload to
+    app_config so the live smb_message_echoes shape can be confirmed from
+    Supabase, then removed. Best-effort."""
+    try:
+        marker = json.dumps({"ts": time.time(), "payload": payload},
+                            ensure_ascii=False)[:6000]
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO app_config (key, value, description) "
+                    "VALUES (%s, %s, 'TEMP Coexistence bring-up probe') "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "
+                    "updated_at = NOW()",
+                    (key, marker))
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"[whatsapp] debug capture failed: {e}")
+
+
+def _wa_echo_recipients(value: dict) -> list:
+    """Customer wa_ids Erez messaged from the app, pulled defensively from an
+    smb_message_echoes value — the recipient ('to') of each echoed message. The
+    exact field is confirmed live via the probe and tightened if needed."""
+    echoes = value.get("message_echoes") or value.get("messages") or []
+    out = []
+    for e in echoes:
+        cust = e.get("to") or e.get("recipient_id")
+        if cust:
+            out.append(str(cust))
+    return out
+
+
+def _wa_handle_smb_echo(value: dict) -> None:
+    """
+    Mark every conversation Erez just replied to (from the Business app) as
+    handed-off, so the bot backs off until the takeover state expires. Never
+    raises into the webhook worker.
+    """
+    _wa_record_debug(_WA_SMB_ECHO_DEBUG_KEY, value)   # TEMP — confirm live shape
+    for cust in _wa_echo_recipients(value):
+        try:
+            with get_db_conn() as conn:
+                sid = _db_get_or_create_channel_session(conn, "whatsapp", cust)
+                _db_set_session_state(conn, sid, _WA_STATE_TAKEOVER)
+                _db_touch_session(conn, sid)
+                conn.commit()
+            _audit("whatsapp_human_takeover", wa_id=cust)
+        except Exception as e:
+            logger.warning(f"[whatsapp] takeover mark failed: {e}")
+
+
 def _process_whatsapp_events(body: dict) -> None:
     """
     Parse the Cloud API envelope (entry[].changes[].value.messages[]) and
     dispatch each inbound text to the handler. Runs in a worker thread. Status
-    callbacks (value.statuses[]) carry no 'messages' and are skipped.
+    callbacks (value.statuses[]) carry no 'messages' and are skipped. Coexistence
+    smb_message_echoes (Erez's manual replies) route to the takeover handler.
     """
     _wa_prune_dedup()
     channel = _WHATSAPP_CHANNEL
@@ -4741,6 +4804,11 @@ def _process_whatsapp_events(body: dict) -> None:
     for entry in (body.get("entry") or []):
         for change in (entry.get("changes") or []):
             value = change.get("value") or {}
+            # Coexistence: a message Erez typed in the Business app arrives as an
+            # smb_message_echoes event → hand that conversation over to him.
+            if change.get("field") == "smb_message_echoes":
+                _wa_handle_smb_echo(value)
+                continue
             for msg in (value.get("messages") or []):
                 wa_from = msg.get("from")
                 mid     = msg.get("id")
@@ -4779,6 +4847,7 @@ def _process_whatsapp_events(body: dict) -> None:
 _WA_STATE_STORY    = "wa_awaiting_story"
 _WA_STATE_INTEREST = "wa_awaiting_interest"
 _WA_STATE_PRICE    = "wa_offered_price"
+_WA_STATE_TAKEOVER = "wa_human_takeover"   # Coexistence: Erez is handling manually
 
 # Anti-cringe guard: the insight prompt forbids these, AND the output is checked
 # against them in CODE (prompt-only is not a guarantee). Matched normalized +
@@ -5025,6 +5094,12 @@ def _handle_whatsapp_message(channel: MessagingChannel, wa_id: str,
             conn.commit()
     except Exception as e:
         logger.warning(f"[whatsapp] session resolve failed for {wa_id[:6]}…: {e}")
+        return
+
+    # Human takeover (Coexistence): Erez replied from his phone → the bot stays
+    # out of this conversation until the takeover state expires (auto-resume).
+    if bot_state == _WA_STATE_TAKEOVER:
+        _audit("whatsapp_suppressed_takeover", wa_id=wa_id)
         return
 
     _wa_run_qualification(channel, wa_id, session_id, text, bot_state, history)
