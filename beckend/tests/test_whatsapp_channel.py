@@ -280,3 +280,59 @@ class TestQualificationFlow:
         reply, state = _run_state("יקר לי", "wa_offered_price", classify="DECLINE")
         assert reply == _cfg("whatsapp.decline")
         assert state is None
+
+
+# ── Ticket 4.3 — Calendly → WhatsApp booking confirmation ─────────────────────
+
+class TestBookingConfirmation:
+    def test_format_il_datetime(self):
+        # 12:00 UTC on 2026-06-17 → Israel summer time (UTC+3) → 15:00.
+        out = main._format_il_datetime("2026-06-17T12:00:00Z")
+        assert out is not None
+        assert "17 ביוני 2026" in out
+        assert "בשעה 15:00" in out
+
+    def test_format_il_datetime_bad_input(self):
+        assert main._format_il_datetime(None) is None
+        assert main._format_il_datetime("") is None
+        assert main._format_il_datetime("not-a-date") is None
+
+    def test_send_confirmation_builds_message(self):
+        with patch.object(main, "_get_config", side_effect=_cfg), \
+             patch.object(main._WHATSAPP_CHANNEL, "send_text") as snd, \
+             patch.object(main, "_audit"):
+            main._wa_send_booking_confirmation({
+                "wa_id": "972500000000",
+                "starts_at": "2026-06-17T12:00:00Z",
+                "join_url": "https://meet.google.com/abc",
+                "reschedule_url": "https://calendly.com/r/x",
+            })
+        snd.assert_called_once()
+        to, msg = snd.call_args.args
+        assert to == "972500000000"
+        assert _cfg("whatsapp.booking_confirmation") in msg
+        assert "בשעה 15:00" in msg
+        assert "https://meet.google.com/abc" in msg
+        assert "https://calendly.com/r/x" in msg
+
+    def test_send_confirmation_no_wa_id_is_noop(self):
+        with patch.object(main._WHATSAPP_CHANNEL, "send_text") as snd:
+            main._wa_send_booking_confirmation({})
+        snd.assert_not_called()
+
+    def test_booking_link_personalized_with_wa_ref(self):
+        cur = MagicMock()
+        cur.fetchone.return_value = ("person-1", "ABC234")
+        cur.__enter__ = lambda s: s
+        cur.__exit__ = MagicMock(return_value=False)
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        conn.__enter__ = lambda s: s
+        conn.__exit__ = MagicMock(return_value=False)
+        with patch.object(main, "get_db_conn", return_value=conn), \
+             patch.object(main, "_get_config",
+                          return_value="https://calendly.com/erez/30min"), \
+             patch.object(main.nexus_identity, "attach_phone_identity") as attach:
+            out = main._wa_booking_link_and_match("972500000000")
+        assert out == "https://calendly.com/erez/30min?utm_content=ABC234"
+        attach.assert_called_once()

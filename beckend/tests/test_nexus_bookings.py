@@ -127,6 +127,19 @@ class TestParsePayload:
     def test_missing_fields_are_none(self):
         p = bookings.parse_invitee_payload({"payload": {"uri": "u3"}})
         assert p["phone"] is None and p["token"] is None and p["email"] is None
+        assert p["join_url"] is None and p["reschedule_url"] is None
+
+    def test_extracts_join_url_and_reschedule(self):
+        body = {"payload": {
+            "uri": "u4",
+            "reschedule_url": "https://calendly.com/reschedule/x",
+            "scheduled_event": {
+                "start_time": "2026-06-17T12:00:00Z",
+                "location": {"type": "google_conference",
+                             "join_url": "https://meet.google.com/abc"}}}}
+        p = bookings.parse_invitee_payload(body)
+        assert p["join_url"] == "https://meet.google.com/abc"
+        assert p["reschedule_url"] == "https://calendly.com/reschedule/x"
 
 
 # ─── match_person ladder ─────────────────────────────────────────────────────
@@ -237,3 +250,50 @@ class TestProcessEvent:
                                 "payload": {"uri": "evt-9", "email": "x@y.com"}})
         assert conn.commits == 1
         assert _stmts(conn, "INSERT INTO bookings")
+
+
+# ─── WhatsApp confirmation collection (Ticket 4.3) ───────────────────────────
+
+class TestBookingConfirmation:
+    def test_collected_for_matched_whatsapp_booking(self):
+        conn = FakeConn(fetchone=[
+            ("person-1",),                                 # phone match
+            ("opp-1",),                                    # open opp exists
+            ("person-1", "engaged", "calendly", None),     # advance_stage read
+            ("972500000000",),                             # _whatsapp_id_for_person
+        ])
+        confirmations = []
+        via = bookings._handle_created(conn, dict(_CREATED), confirmations)
+        assert via == "phone"
+        assert len(confirmations) == 1
+        assert confirmations[0]["wa_id"] == "972500000000"
+
+    def test_not_collected_when_unmatched(self):
+        conn = FakeConn(fetchone=[None, None])   # phone miss, email miss
+        confirmations = []
+        bookings._handle_created(conn, dict(_CREATED), confirmations)
+        assert confirmations == []
+
+    def test_not_collected_without_whatsapp_identity(self):
+        conn = FakeConn(fetchone=[
+            ("person-1",), ("opp-1",), ("person-1", "engaged", "calendly", None),
+            None,                                          # no whatsapp identity
+        ])
+        confirmations = []
+        bookings._handle_created(conn, dict(_CREATED), confirmations)
+        assert confirmations == []
+
+    def test_callback_fires_post_commit(self, monkeypatch):
+        conn = FakeConn(fetchone=[
+            ("person-1",), ("opp-1",), ("person-1", "engaged", "calendly", None),
+            ("972511112222",),
+        ])
+        monkeypatch.setattr(nexus_db, "_conn_provider", lambda: _provider(conn))
+        seen = []
+        bookings.process_event(
+            {"event": "invitee.created",
+             "payload": {"uri": "evt-x", "text_reminder_number": "+972511112222",
+                         "scheduled_event": {"start_time": "2026-06-17T12:00:00Z"}}},
+            on_confirmed=seen.append)
+        assert len(seen) == 1
+        assert seen[0]["wa_id"] == "972511112222"

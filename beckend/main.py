@@ -40,6 +40,7 @@ from nexus import bookings as nexus_bookings
 from nexus import db as nexus_db
 from nexus import erasure as nexus_erasure
 from nexus import hooks as nexus_hooks
+from nexus import identity as nexus_identity
 from nexus import memory as nexus_memory
 
 
@@ -522,6 +523,11 @@ _DEFAULT_CONFIG = {
         "• 'נראה שאתה מבין בשכל מה נכון, אבל הרגש עדיין לא שם.'\n"
         "• 'נשמע שהדבר שהכי מתיש אותך זה שאתה בלופ ולא מצליח לצאת ממנו.'\n"
         "• 'מצד אחד המציאות מולך ברורה, מצד שני קשה לשחרר את מה שקיווית שיהיה.'"
+    ),
+    # Post-booking WhatsApp confirmation intro (Ticket 4.3). The date/time (IL)
+    # and links are appended in code.
+    "whatsapp.booking_confirmation": (
+        "מעולה, השיחה שלך נקבעה! ❤️"
     ),
     # Calendly booking link: user-specific, so it lives in app_config (not the
     # repo). Empty default => the lead-in is sent without a link.
@@ -4837,6 +4843,82 @@ def _wa_send_and_persist(channel: MessagingChannel, wa_id: str, session_id: str,
     channel.send_text(wa_id, reply)
 
 
+# ── Calendly → WhatsApp booking confirmation (Ticket 4.3) ─────────────────────
+# Hebrew names for the IL-time confirmation. weekday(): Monday=0 … Sunday=6.
+_HE_WEEKDAYS = ("שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון")
+_HE_MONTHS = ("", "ינואר", "פברואר", "מרץ", "אפריל", "מאי", "יוני", "יולי",
+              "אוגוסט", "ספטמבר", "אוקטובר", "נובמבר", "דצמבר")
+
+
+def _format_il_datetime(iso_str: Optional[str]) -> Optional[str]:
+    """Calendly UTC start_time → Hebrew Israel-time string. None on any failure."""
+    if not iso_str:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        il = dt.astimezone(ZoneInfo("Asia/Jerusalem"))
+        return (f"יום {_HE_WEEKDAYS[il.weekday()]}, {il.day} ב{_HE_MONTHS[il.month]} "
+                f"{il.year}, בשעה {il:%H:%M}")
+    except Exception as e:
+        logger.warning(f"[whatsapp] datetime format failed: {e}")
+        return None
+
+
+def _wa_send_booking_confirmation(confirm: dict) -> None:
+    """
+    Post-booking WhatsApp confirmation (free-form; relies on the 24h window — a
+    user who books right after the funnel chat is inside it). Called post-commit
+    from the Calendly webhook for a NEW matched booking with a WhatsApp identity.
+    Best-effort; never raises into the webhook worker.
+    """
+    wa_id = (confirm or {}).get("wa_id")
+    if not wa_id:
+        return
+    lines = [_get_config("whatsapp.booking_confirmation")]
+    when = _format_il_datetime(confirm.get("starts_at"))
+    if when:
+        lines.append(f"\n📅 {when}")
+    if confirm.get("join_url"):
+        lines.append(f"🔗 {confirm['join_url']}")
+    if confirm.get("reschedule_url"):
+        lines.append(f"\nלשינוי או ביטול המועד:\n{confirm['reschedule_url']}")
+    _WHATSAPP_CHANNEL.send_text(wa_id, "\n".join(ln for ln in lines if ln))
+    _audit("whatsapp_booking_confirmation_sent", wa_id=wa_id)
+
+
+def _wa_booking_link_and_match(wa_id: str) -> str:
+    """
+    Build the Calendly link the funnel sends, personalized with the person's
+    wa_ref as utm_content so the booking maps back via the match ladder's first
+    rung — and attach a phone identity (belt-and-braces phone match). Best-effort;
+    falls back to the plain link.
+    """
+    base = _get_config("calendly.url").strip()
+    try:
+        ref = ""
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT p.id, p.wa_ref_code FROM person p "
+                    "JOIN person_identity pi ON pi.person_id = p.id "
+                    "WHERE pi.channel = 'whatsapp' AND pi.external_id = %s LIMIT 1",
+                    (wa_id,))
+                row = cur.fetchone()
+            if row:
+                ref = (row[1] or "").strip()
+                nexus_identity.attach_phone_identity(conn, str(row[0]), wa_id)
+            conn.commit()
+        if base and ref:
+            sep = "&" if "?" in base else "?"
+            return f"{base}{sep}utm_content={ref}"
+    except Exception as e:
+        logger.warning(f"[whatsapp] booking link/match prep failed: {e}")
+    return base
+
+
 def _wa_run_qualification(channel: MessagingChannel, wa_id: str, session_id: str,
                           text: str, bot_state: Optional[str],
                           history: list) -> None:
@@ -4846,7 +4928,7 @@ def _wa_run_qualification(channel: MessagingChannel, wa_id: str, session_id: str
     if bot_state == _WA_STATE_PRICE:
         decision, _ = _bot_classify_offer_response(text, history)
         if decision == "AFFIRM":
-            link  = _get_config("calendly.url").strip()
+            link  = _wa_booking_link_and_match(wa_id)
             lead  = _get_config("whatsapp.booking_leadin")
             reply = f"{lead}\n{link}" if link else lead
             _wa_send_and_persist(channel, wa_id, session_id, reply, None)
@@ -5079,7 +5161,9 @@ async def calendly_webhook(
         logger.warning("[calendly] could not parse webhook body as JSON.")
         return {"ok": True}
 
-    await run_in_threadpool(nexus_bookings.process_event, body)
+    await run_in_threadpool(
+        nexus_bookings.process_event, body,
+        on_confirmed=_wa_send_booking_confirmation)
     return {"ok": True}
 
 
