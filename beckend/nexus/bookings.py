@@ -72,13 +72,16 @@ def parse_invitee_payload(body: dict) -> dict:
                 break
     tracking = p.get("tracking") or {}
     scheduled = p.get("scheduled_event") or {}
+    location = scheduled.get("location") or {}
     return {
-        "uri":       p.get("uri"),
-        "email":     ((p.get("email") or "").strip().lower() or None),
-        "name":      (p.get("name") or None),
-        "phone":     phone,
-        "token":     ((tracking.get("utm_content") or "").strip() or None),
-        "starts_at": scheduled.get("start_time"),
+        "uri":            p.get("uri"),
+        "email":          ((p.get("email") or "").strip().lower() or None),
+        "name":           (p.get("name") or None),
+        "phone":          phone,
+        "token":          ((tracking.get("utm_content") or "").strip() or None),
+        "starts_at":      scheduled.get("start_time"),
+        "join_url":       ((location.get("join_url") or "").strip() or None),
+        "reschedule_url": ((p.get("reschedule_url") or "").strip() or None),
     }
 
 
@@ -112,8 +115,24 @@ def match_person(conn, *, token, phone, email) -> tuple[str | None, str]:
     return None, "none"
 
 
-def _handle_created(conn, parsed: dict) -> str:
-    """Record the booking, match it, advance a matched opportunity. Commit-free."""
+def _whatsapp_id_for_person(conn, person_id: str) -> str | None:
+    """The person's WhatsApp wa_id (their E.164-without-+ phone), or None."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT external_id FROM person_identity "
+            "WHERE person_id = %s AND channel = 'whatsapp' LIMIT 1", (person_id,))
+        row = cur.fetchone()
+    return str(row[0]) if row else None
+
+
+def _handle_created(conn, parsed: dict, confirmations: list | None = None) -> str:
+    """
+    Record the booking, match it, advance a matched opportunity. Commit-free.
+
+    When `confirmations` is provided and this is a NEW (non-replay) booking that
+    matched a person with a WhatsApp identity, append a confirmation payload to
+    it — the caller sends the WhatsApp message AFTER commit (never in-transaction).
+    """
     external_id = parsed["uri"]
     if not external_id:
         return "ignored"
@@ -136,6 +155,7 @@ def _handle_created(conn, parsed: dict) -> str:
             "ON CONFLICT (external_id) WHERE external_id IS NOT NULL DO NOTHING",
             (person_id, opp_id, external_id, parsed["starts_at"], parsed["name"],
              parsed["phone"], parsed["email"], matched_via))
+        newly_created = cur.rowcount > 0
 
     interactions.log_interaction(
         conn, "booking_created", "calendly", person_id=person_id,
@@ -143,6 +163,19 @@ def _handle_created(conn, parsed: dict) -> str:
         dedup_key=f"booking_created:{external_id}")
     logger.info("[calendly] booking %s matched_via=%s person=%s",
                 external_id, matched_via, person_id)
+
+    # Confirmation: only a NEW, person-matched booking with a WhatsApp identity
+    # qualifies (so Calendly redeliveries never double-send). Sent post-commit.
+    if confirmations is not None and newly_created and person_id:
+        wa_id = _whatsapp_id_for_person(conn, person_id)
+        if wa_id:
+            confirmations.append({
+                "wa_id":          wa_id,
+                "starts_at":      parsed.get("starts_at"),
+                "name":           parsed.get("name"),
+                "join_url":       parsed.get("join_url"),
+                "reschedule_url": parsed.get("reschedule_url"),
+            })
     return matched_via
 
 
@@ -174,22 +207,34 @@ def _handle_canceled(conn, parsed: dict) -> str:
     return "canceled"
 
 
-def process_event(body: dict) -> None:
+def process_event(body: dict, *, on_confirmed=None) -> None:
     """
     Entry point from the webhook endpoint (runs in a worker thread). Own
     pooled connection + commit; NEVER raises. Only invitee.created /
     invitee.canceled are acted on; everything else is ignored.
+
+    on_confirmed(payload): optional callback invoked AFTER commit for each NEW
+    matched booking that has a WhatsApp identity — used to send the WhatsApp
+    booking confirmation. Its failures are swallowed (the booking is already
+    recorded; the confirmation is best-effort).
     """
     try:
         event_type = body.get("event")
         if event_type not in ("invitee.created", "invitee.canceled"):
             return
         parsed = parse_invitee_payload(body)
+        confirmations: list = []
         with db.get_conn() as conn:
             if event_type == "invitee.created":
-                _handle_created(conn, parsed)
+                _handle_created(conn, parsed, confirmations)
             else:
                 _handle_canceled(conn, parsed)
             conn.commit()
+        if on_confirmed:
+            for payload in confirmations:
+                try:
+                    on_confirmed(payload)
+                except Exception as e:
+                    logger.error("[calendly] confirmation send failed: %s", e)
     except Exception as e:
         logger.error("[calendly] process_event failed: %s", e)
