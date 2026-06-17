@@ -4592,7 +4592,15 @@ def _kapso_call(payload: dict) -> Optional[str]:
     })
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.read().decode("utf-8", "ignore")
+            out = resp.read().decode("utf-8", "ignore")
+            # TEMP (outbound bring-up) — Kapso accepts our send (HTTP 2xx) but the
+            # message isn't reaching the handset, and we log nothing on success, so
+            # surface the response: status + recipient + body. Strip once delivery
+            # is confirmed.
+            logger.info("[kapso] send response %s to=%s: %s",
+                        getattr(resp, "status", "?"), payload.get("to"),
+                        out[:600])
+            return out
     except Exception as e:
         detail = ""
         read = getattr(e, "read", None)
