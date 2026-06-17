@@ -4589,6 +4589,10 @@ def _kapso_call(payload: dict) -> Optional[str]:
     req = urllib.request.Request(url, data=data, method="POST", headers={
         "X-API-Key":    settings.kapso_api_key,
         "Content-Type": "application/json",
+        # Cloudflare fronts api.kapso.ai and bans the default `Python-urllib/x.y`
+        # User-Agent at the edge (HTTP 403, "error code: 1010") before the request
+        # reaches Kapso — set a normal UA so outbound sends get through.
+        "User-Agent":   "Mozilla/5.0 (compatible; NEXUS/1.0)",
     })
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
