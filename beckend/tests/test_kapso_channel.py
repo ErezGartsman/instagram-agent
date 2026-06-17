@@ -147,6 +147,7 @@ class TestKapsoSend:
             return FakeResp()
 
         monkeypatch.setattr(main.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(main, "_wa_record_debug", lambda *a, **k: None)
         main._kapso_call({"messaging_product": "whatsapp", "to": "5",
                           "type": "text", "text": {"body": "hi"}})
         assert cap["url"] == "https://api.kapso.ai/meta/whatsapp/v24.0/PN1/messages"
