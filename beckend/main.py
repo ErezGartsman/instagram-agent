@@ -4596,18 +4596,7 @@ def _kapso_call(payload: dict) -> Optional[str]:
     })
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            out = resp.read().decode("utf-8", "ignore")
-            # TEMP (outbound bring-up) — Kapso accepts our send (HTTP 2xx) but it
-            # isn't reaching the handset. INFO logs get filtered/truncated in prod,
-            # so capture the FULL response to app_config (read via SQL). Strip once
-            # outbound delivery is confirmed.
-            _wa_record_debug("kapso._debug_last_send_response", {
-                "status": getattr(resp, "status", None),
-                "to":     payload.get("to"),
-                "type":   payload.get("type"),
-                "body":   out[:2000],
-            })
-            return out
+            return resp.read().decode("utf-8", "ignore")
     except Exception as e:
         detail = ""
         read = getattr(e, "read", None)
@@ -4617,8 +4606,6 @@ def _kapso_call(payload: dict) -> Optional[str]:
             except Exception:
                 detail = ""
         logger.error(f"[kapso] send failed: {e} {detail}".strip())
-        _wa_record_debug("kapso._debug_last_send_response", {
-            "error": str(e), "detail": detail[:2000], "to": payload.get("to")})
         return None
 
 
