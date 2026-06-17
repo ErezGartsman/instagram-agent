@@ -505,6 +505,17 @@ _DEFAULT_CONFIG = {
     "whatsapp.insight_fallback": (
         "נשמע שיש כאן משהו אמיתי, ושיש בו הרבה יותר ממה שאפשר לסכם בשתי שורות."
     ),
+    # Ticket 4.5 — strict intent gate. The funnel opens ONLY on explicit intent;
+    # a bare greeting / vague comment gets this ultra-brief human ack instead.
+    "whatsapp.greeting_ack": "היי! 🙂 מה קורה?",
+    "whatsapp.intent_gate_instructions": (
+        "אתה שומר-סף קפדני לפתיחת שיחת ייעוץ. החזר intent=true רק אם ההודעה מביעה "
+        "כוונה מפורשת לאחת מאלה: (1) לקבוע או לתאם שיחה/פגישה; (2) לקבל פרטים או "
+        "מחיר על הליווי/הקואצ'ינג; (3) להתייעץ או לשתף בבעיה או מצב בזוגיות/מערכת "
+        "יחסים. בכל מקרה אחר — ברכה, סמול-טוק, מחמאה, תגובה כללית, שאלה לא קשורה "
+        "או הודעה מעורפלת — החזר intent=false. ברירת המחדל היא false; אל תניח "
+        "כוונה שלא נאמרה במפורש."
+    ),
     # The anti-cringe instructions. Second-person reflection (never first-person),
     # down-to-earth everyday Hebrew, few-shot anchored. The story is appended in
     # code (see _wa_generate_insight).
@@ -5122,6 +5133,7 @@ async def kapso_webhook(
 # funnel's states (Telegram keeps its own flow untouched for now).
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_WA_STATE_WARMING  = "wa_warming"          # greeted, waiting for explicit intent (4.5)
 _WA_STATE_STORY    = "wa_awaiting_story"
 _WA_STATE_INTEREST = "wa_awaiting_interest"
 _WA_STATE_PRICE    = "wa_offered_price"
@@ -5269,6 +5281,40 @@ def _wa_booking_link_and_match(wa_id: str) -> str:
     return base
 
 
+def _wa_is_explicit_intent(text: str, history: list = None) -> bool:
+    """Strict funnel gate (Ticket 4.5). True ONLY when the message explicitly asks
+    to book/schedule a call, get details/price on the coaching, or consult/share a
+    relationship problem or situation. Greetings, smalltalk, vague comments,
+    compliments and off-topic questions → False. FAIL-CLOSED to False: on any
+    LLM/parse error we ack-and-wait rather than fire the questionnaire — the entry
+    ack keeps the door open for a real lead to clarify."""
+    prompt = (
+        f"{_get_config('whatsapp.intent_gate_instructions')}\n\n"
+        f"{_build_rag_history_block(history or [])}\n"
+        f"ההודעה: {(text or '').strip()[:1000]}\n\n"
+        f'החזר JSON בלבד: {{"intent": true}} או {{"intent": false}}.'
+    )
+    try:
+        val = _parse_llm_json(_call_llm(prompt)).get("intent")
+    except Exception as e:
+        logger.warning(f"[whatsapp] intent gate failed → ack: {e}")
+        return False
+    if isinstance(val, str):
+        return val.strip().lower() == "true"
+    return bool(val)
+
+
+def _wa_open_funnel(channel: MessagingChannel, wa_id: str, session_id: str) -> None:
+    """Open the qualification funnel: send the opening + mark the lead engaged.
+    Reached only when the entry/warming gate detects explicit intent."""
+    _wa_send_and_persist(channel, wa_id, session_id,
+                         _get_config("whatsapp.opening"), _WA_STATE_STORY)
+    nexus_hooks.on_funnel_event(
+        "engaged", "whatsapp", session_id=session_id, stage="engaged",
+        dedup_key=f"engaged:{session_id}")
+    _audit("whatsapp_funnel_opened", wa_id=wa_id, session_id=session_id)
+
+
 def _wa_run_qualification(channel: MessagingChannel, wa_id: str, session_id: str,
                           text: str, bot_state: Optional[str],
                           history: list) -> None:
@@ -5321,13 +5367,26 @@ def _wa_run_qualification(channel: MessagingChannel, wa_id: str, session_id: str
         _audit("whatsapp_insight_sent", wa_id=wa_id, session_id=session_id)
         return
 
-    # ── Entry: first contact (or expired state) → the opening ─────────────────
-    _wa_send_and_persist(channel, wa_id, session_id,
-                         _get_config("whatsapp.opening"), _WA_STATE_STORY)
-    nexus_hooks.on_funnel_event(
-        "engaged", "whatsapp", session_id=session_id, stage="engaged",
-        dedup_key=f"engaged:{session_id}")
-    _audit("whatsapp_funnel_opened", wa_id=wa_id, session_id=session_id)
+    # ── State: warming — greeted, waiting for explicit intent (Ticket 4.5) ────
+    # We acked once at entry; the funnel opens only when the person finally
+    # signals clear intent. Otherwise we stay quiet — never harass a casual chat.
+    if bot_state == _WA_STATE_WARMING:
+        if _wa_is_explicit_intent(text, history):
+            _wa_open_funnel(channel, wa_id, session_id)
+        else:
+            _audit("whatsapp_warming_wait", wa_id=wa_id, session_id=session_id)
+        return
+
+    # ── Entry: first contact (or expired) → STRICT intent gate (Ticket 4.5) ───
+    # Only explicit intent (book a call / get details / consult about their
+    # situation) opens the funnel. Anything vague gets one ultra-brief human ack
+    # and moves to warming — no automated questionnaire on casual messages.
+    if _wa_is_explicit_intent(text, history):
+        _wa_open_funnel(channel, wa_id, session_id)
+    else:
+        _wa_send_and_persist(channel, wa_id, session_id,
+                             _get_config("whatsapp.greeting_ack"), _WA_STATE_WARMING)
+        _audit("whatsapp_greeting_ack", wa_id=wa_id, session_id=session_id)
 
 
 def _handle_whatsapp_message(channel: MessagingChannel, wa_id: str,

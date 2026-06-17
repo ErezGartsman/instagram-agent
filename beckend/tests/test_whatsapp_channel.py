@@ -197,11 +197,13 @@ def _cfg(key):
     return main._DEFAULT_CONFIG.get(key, "")
 
 
-def _run_state(text, bot_state, *, classify="AFFIRM", insight="תובנה"):
+def _run_state(text, bot_state, *, classify="AFFIRM", insight="תובנה", intent=True):
     """Drive _wa_run_qualification with all boundaries patched; return the
-    _wa_send_and_persist mock so tests can assert (reply, new_state)."""
+    _wa_send_and_persist mock so tests can assert (reply, new_state). `intent`
+    controls the Ticket 4.5 entry/warming gate."""
     with patch.object(main, "_get_config", side_effect=_cfg), \
          patch.object(main, "_wa_send_and_persist") as snp, \
+         patch.object(main, "_wa_is_explicit_intent", return_value=intent), \
          patch.object(main, "_bot_classify_offer_response", return_value=(classify, "")), \
          patch.object(main, "_wa_generate_insight", return_value=insight), \
          patch.object(main.nexus_hooks, "on_funnel_event"):
@@ -243,11 +245,46 @@ class TestGenerateInsight:
             assert main._wa_generate_insight("x") == _cfg("whatsapp.insight_fallback")
 
 
+class TestIntentGate:
+    def test_explicit_intent_true(self):
+        with patch.object(main, "_get_config", side_effect=_cfg), \
+             patch.object(main, "_call_llm", return_value='{"intent": true}'):
+            assert main._wa_is_explicit_intent("אני רוצה לקבוע שיחה") is True
+
+    def test_vague_message_false(self):
+        with patch.object(main, "_get_config", side_effect=_cfg), \
+             patch.object(main, "_call_llm", return_value='{"intent": false}'):
+            assert main._wa_is_explicit_intent("היי מה נשמע") is False
+
+    def test_fails_closed_to_false(self):
+        with patch.object(main, "_get_config", side_effect=_cfg), \
+             patch.object(main, "_call_llm", side_effect=TimeoutError("slow")):
+            assert main._wa_is_explicit_intent("x") is False
+
+
 class TestQualificationFlow:
-    def test_entry_sends_opening(self):
-        reply, state = _run_state("היי בוט", None)
+    def test_entry_intent_opens_funnel(self):
+        reply, state = _run_state("אני רוצה לקבוע שיחה", None, intent=True)
         assert reply == _cfg("whatsapp.opening")
         assert state == "wa_awaiting_story"
+
+    def test_entry_no_intent_acks_and_warms(self):
+        reply, state = _run_state("היי בוט", None, intent=False)
+        assert reply == _cfg("whatsapp.greeting_ack")
+        assert state == "wa_warming"
+
+    def test_warming_intent_opens_funnel(self):
+        reply, state = _run_state("אני צריך עזרה עם הזוגיות", "wa_warming", intent=True)
+        assert reply == _cfg("whatsapp.opening")
+        assert state == "wa_awaiting_story"
+
+    def test_warming_no_intent_stays_silent(self):
+        with patch.object(main, "_get_config", side_effect=_cfg), \
+             patch.object(main, "_wa_send_and_persist") as snp, \
+             patch.object(main, "_wa_is_explicit_intent", return_value=False):
+            main._wa_run_qualification(MagicMock(), "972500000000", "sess-1",
+                                       "סתם תגובה", "wa_warming", [])
+        snp.assert_not_called()
 
     def test_story_generates_insight_then_bridge(self):
         reply, state = _run_state("אני בלופ", "wa_awaiting_story", insight="INSIGHT_X")
