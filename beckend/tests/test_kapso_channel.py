@@ -152,6 +152,8 @@ class TestKapsoSend:
                           "type": "text", "text": {"body": "hi"}})
         assert cap["url"] == "https://api.kapso.ai/meta/whatsapp/v24.0/PN1/messages"
         assert "k_secret" in cap["headers"].values()   # X-API-Key header
+        # non-default User-Agent so Cloudflare doesn't 403 us with error 1010
+        assert "Mozilla/5.0 (compatible; NEXUS/1.0)" in cap["headers"].values()
         assert cap["body"]["to"] == "5"
 
     def test_kapso_call_unconfigured_is_noop(self, monkeypatch):
