@@ -117,6 +117,15 @@ class Settings(BaseSettings):
     whatsapp_app_secret:      str = ""
     whatsapp_verify_token:    str = ""
 
+    # ── Kapso BSP (official Coexistence transport for the REAL number) ──────────
+    # Kapso holds the Meta Tech Provider approvals; +972546150955 is on the
+    # official Cloud API via Kapso's transparent proxy. kapso_api_base pins the
+    # Meta API version Kapso mirrors. Inert until key + phone id are set.
+    kapso_api_key:         str = ""
+    kapso_webhook_secret:  str = ""
+    kapso_phone_number_id: str = ""
+    kapso_api_base:        str = "https://api.kapso.ai/meta/whatsapp/v24.0"
+
     # ── Contact-capture CTAs for Instagram (env-var driven, never hardcoded) ────
     # whatsapp_number:  E.164 format without '+', e.g. "972501234567".
     #                   When set, a WhatsApp wa.me link button is shown as the
@@ -4564,6 +4573,38 @@ def _wa_graph_call(payload: dict) -> Optional[str]:
         return None
 
 
+def _kapso_call(payload: dict) -> Optional[str]:
+    """POST a Meta Cloud-API message body to Kapso's transparent proxy with
+    X-API-Key. Same contract/return as _wa_graph_call; KapsoChannel routes through
+    here so the real (Coexistence) number sends officially via Kapso. Never raises
+    (the webhook must always return 200)."""
+    if not (settings.kapso_api_key and settings.kapso_phone_number_id):
+        logger.error("[kapso] KAPSO_API_KEY / KAPSO_PHONE_NUMBER_ID not set "
+                     "— cannot send.")
+        return None
+    base = (settings.kapso_api_base
+            or "https://api.kapso.ai/meta/whatsapp/v24.0").rstrip("/")
+    url = f"{base}/{settings.kapso_phone_number_id}/messages"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "X-API-Key":    settings.kapso_api_key,
+        "Content-Type": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read().decode("utf-8", "ignore")
+    except Exception as e:
+        detail = ""
+        read = getattr(e, "read", None)
+        if callable(read):
+            try:
+                detail = read().decode("utf-8", "ignore")
+            except Exception:
+                detail = ""
+        logger.error(f"[kapso] send failed: {e} {detail}".strip())
+        return None
+
+
 class WhatsAppChannel(MessagingChannel):
     """
     WhatsApp Business Cloud API via graph.facebook.com.
@@ -4576,9 +4617,15 @@ class WhatsAppChannel(MessagingChannel):
 
     CHANNEL_NAME = "whatsapp"
 
+    def _send(self, payload: dict) -> Optional[str]:
+        """Transport seam — Meta Graph direct. KapsoChannel overrides this to POST
+        the identical Cloud-API body to Kapso instead, so every send method below
+        is shared verbatim."""
+        return _wa_graph_call(payload)
+
     def send_text(self, recipient_id: str, text: str) -> None:
         body = (text or "").strip()[:4096] or "…"
-        _wa_graph_call({
+        self._send({
             "messaging_product": "whatsapp",
             "recipient_type":    "individual",
             "to":                recipient_id,
@@ -4594,7 +4641,7 @@ class WhatsAppChannel(MessagingChannel):
         if not btns:
             self.send_text(recipient_id, text)
             return
-        _wa_graph_call({
+        self._send({
             "messaging_product": "whatsapp",
             "recipient_type":    "individual",
             "to":                recipient_id,
@@ -4634,7 +4681,7 @@ class WhatsAppChannel(MessagingChannel):
         inbound message id, so it lives here rather than the base mark_seen."""
         if not message_id:
             return
-        _wa_graph_call({
+        self._send({
             "messaging_product": "whatsapp",
             "status":            "read",
             "message_id":        message_id,
@@ -4642,6 +4689,20 @@ class WhatsAppChannel(MessagingChannel):
 
 
 _WHATSAPP_CHANNEL = WhatsAppChannel()
+
+
+class KapsoChannel(WhatsAppChannel):
+    """Real-number transport via the Kapso BSP (official Coexistence). Kapso
+    transparently proxies the Meta Cloud API, so every send body is identical to
+    WhatsAppChannel — only the transport differs (overridden _send). CHANNEL_NAME
+    stays 'whatsapp' so the person spine treats Kapso-delivered messages as the
+    same number/channel."""
+
+    def _send(self, payload: dict) -> Optional[str]:
+        return _kapso_call(payload)
+
+
+_KAPSO_CHANNEL = KapsoChannel()
 
 
 # ── Inbound dedup (Meta redelivers; schema-level idempotency is the real guard) ─
@@ -4827,6 +4888,181 @@ def _process_whatsapp_events(body: dict) -> None:
                     continue
 
                 _handle_whatsapp_message(channel, wa_from, text, mid)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Kapso BSP transport (official Coexistence go-live for the REAL number)
+# ───────────────────────────────────────────────────────────────────────────────
+# Kapso transparently proxies the Meta Cloud API, so KapsoChannel reuses the exact
+# WhatsApp message bodies — only the transport (X-API-Key → api.kapso.ai) differs.
+# Inbound arrives as Kapso webhooks (X-Webhook-Signature = HMAC-SHA256 of the raw
+# body; X-Webhook-Event; X-Idempotency-Key) which we verify + dedup, then feed
+# into the SAME _handle_whatsapp_message funnel. The inbound JSON shape is
+# confirmed live via a probe (Meta's business-scoped-user-ID migration means the
+# sender field is parsed defensively and the raw payload is captured).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_KAPSO_RECEIVED_DEBUG_KEY = "kapso._debug_last_received"
+_KAPSO_SENT_DEBUG_KEY     = "kapso._debug_last_sent"
+
+_kapso_seen_keys: dict[str, float] = {}
+_KAPSO_DEDUP_TTL = 600   # seconds
+
+
+def _kapso_prune_dedup() -> None:
+    cutoff = time.time() - _KAPSO_DEDUP_TTL
+    for k in [k for k, v in _kapso_seen_keys.items() if v < cutoff]:
+        del _kapso_seen_keys[k]
+
+
+def _kapso_verify_signature(raw: bytes, header: Optional[str]) -> bool:
+    """HMAC-SHA256 of the RAW body with KAPSO_WEBHOOK_SECRET (Kapso's
+    X-Webhook-Signature). Accepts a bare hex digest or a 'sha256='-prefixed one,
+    lowercased, timing-safe."""
+    if not header or not settings.kapso_webhook_secret:
+        return False
+    digest = hmac.new(
+        settings.kapso_webhook_secret.encode("utf-8"), raw, hashlib.sha256
+    ).hexdigest()
+    sig = header.strip()
+    if sig.lower().startswith("sha256="):
+        sig = sig[7:]
+    return hmac.compare_digest(sig.lower(), digest.lower())
+
+
+def _kapso_unwrap_values(body: dict) -> list:
+    """Meta-style 'value' object(s) out of whatever envelope Kapso uses. Defensive
+    across shapes (Meta entry/changes, a wrapped data/payload, or a bare value) —
+    tightened from the probe capture once the live shape is pinned."""
+    if not isinstance(body, dict):
+        return []
+    values = []
+    for entry in (body.get("entry") or []):
+        for change in (entry.get("changes") or []):
+            v = change.get("value")
+            if isinstance(v, dict):
+                values.append(v)
+    if values:
+        return values
+    for key in ("data", "payload", "value", "message"):
+        v = body.get(key)
+        if isinstance(v, dict):
+            if "messages" in v or "from" in v or "text" in v:
+                return [v]
+            inner = v.get("value")
+            if isinstance(inner, dict):
+                return [inner]
+    if "messages" in body or "from" in body or "text" in body:
+        return [body]
+    return []
+
+
+def _kapso_sender(msg: dict, value: dict) -> str:
+    """Customer WA id, parsed defensively. Meta's business-scoped-user-ID
+    migration means 'from'/'wa_id'/'phone_number' aren't all guaranteed — try
+    each, then fall back to the contacts[] block."""
+    for k in ("from", "wa_id", "phone_number", "sender", "author"):
+        val = msg.get(k)
+        if val:
+            return str(val)
+    for c in (value.get("contacts") or []):
+        wid = c.get("wa_id") or (c.get("profile") or {}).get("wa_id")
+        if wid:
+            return str(wid)
+    return ""
+
+
+def _kapso_text(msg: dict) -> str:
+    """Inbound text — reuse the Meta extractor, with string/dict fallbacks."""
+    t = _wa_extract_text(msg)
+    if t:
+        return t
+    raw = msg.get("text")
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, dict):
+        return raw.get("body", "") or ""
+    return msg.get("body", "") if isinstance(msg.get("body"), str) else ""
+
+
+def _kapso_extract_messages(body: dict) -> list:
+    """[(wa_id, text, mid), …] from an inbound Kapso payload. Best-effort across
+    shapes; empty when nothing is parseable (the probe capture is the source of
+    truth until the live shape is pinned)."""
+    out = []
+    for value in _kapso_unwrap_values(body):
+        msgs = value.get("messages")
+        if not isinstance(msgs, list):
+            msgs = [value] if (value.get("text") or value.get("type")) else []
+        for msg in msgs:
+            if not isinstance(msg, dict):
+                continue
+            wa_id = _kapso_sender(msg, value).strip()
+            text  = (_kapso_text(msg) or "").strip()
+            mid   = str(msg.get("id") or msg.get("message_id")
+                        or msg.get("wamid") or "")
+            out.append((wa_id, text, mid))
+    return out
+
+
+def _process_kapso_event(event: str, idem_key: Optional[str], body: dict) -> None:
+    """Dispatch a verified Kapso webhook (worker thread). 'message.received' feeds
+    the funnel; 'message.sent' is probe-captured ONLY for now — until we can tell
+    Erez's app replies (human takeover) apart from our own API echoes, acting on
+    it would make the bot suppress itself after every send. Never raises."""
+    _kapso_prune_dedup()
+
+    if idem_key:
+        if idem_key in _kapso_seen_keys:
+            return
+        _kapso_seen_keys[idem_key] = time.time()
+
+    if event == "whatsapp.message.sent":
+        _wa_record_debug(_KAPSO_SENT_DEBUG_KEY, body)   # TEMP probe (takeover TODO)
+        return
+    if event and event != "whatsapp.message.received":
+        return   # status callbacks / other events
+
+    _wa_record_debug(_KAPSO_RECEIVED_DEBUG_KEY, body)   # TEMP — confirm live shape
+
+    _wa_prune_dedup()
+    for wa_id, text, mid in _kapso_extract_messages(body):
+        if not wa_id or not text:
+            continue
+        if mid:
+            if mid in _wa_seen_mids:
+                continue
+            _wa_seen_mids[mid] = time.time()
+        _handle_whatsapp_message(_KAPSO_CHANNEL, wa_id, text, mid)
+
+
+@app.post("/api/webhooks/kapso")
+async def kapso_webhook(
+    request: Request,
+    x_webhook_signature: Optional[str] = Header(default=None),
+    x_webhook_event:     Optional[str] = Header(default=None),
+    x_idempotency_key:   Optional[str] = Header(default=None),
+):
+    """Kapso inbound webhook. async so we can HMAC the RAW body before parsing.
+    Verifies X-Webhook-Signature, then offloads to a worker and returns 200 fast
+    (Kapso marks a delivery failed after 10s) so it never retries into a duplicate
+    storm. Mirrors the Meta/Calendly webhook contract."""
+    raw = await request.body()
+
+    if settings.kapso_webhook_secret:
+        if not _kapso_verify_signature(raw, x_webhook_signature):
+            logger.warning("[kapso] Rejected: bad X-Webhook-Signature.")
+            return {"ok": True}
+
+    try:
+        body = json.loads(raw or b"{}")
+    except Exception:
+        logger.warning("[kapso] Could not parse webhook body as JSON.")
+        return {"ok": True}
+
+    await run_in_threadpool(_process_kapso_event,
+                            x_webhook_event or "", x_idempotency_key, body)
+    return {"ok": True}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
