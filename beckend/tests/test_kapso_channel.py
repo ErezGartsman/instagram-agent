@@ -56,6 +56,31 @@ def _meta_shape(wa_from="972500000000", mid="wamid.K1", body="שלום"):
     }}]}]}
 
 
+def _live_received(phone="972544304272", mid="wamid.LIVE1", body="היי"):
+    """The real Kapso inbound shape (confirmed via probe): a single top-level
+    'message' + 'conversation', with the BSUID held separately."""
+    return {
+        "message": {"from": phone, "from_user_id": "IL.2038190160130376",
+                    "id": mid, "type": "text", "text": {"body": body},
+                    "kapso": {"origin": "cloud_api", "direction": "inbound"}},
+        "conversation": {"phone_number": phone,
+                         "business_scoped_user_id": "IL.2038190160130376"},
+        "is_new_conversation": True, "phone_number_id": "120293527700080",
+    }
+
+
+def _live_sent(origin, to="972544304272", body="אני בודק"):
+    """A 'message.sent' echo — origin 'business_app' (Erez's phone) or
+    'cloud_api' (our own send)."""
+    return {
+        "message": {"id": "wamid.S1", "to": to, "from": "972546150955",
+                    "type": "text", "text": {"body": body},
+                    "kapso": {"origin": origin, "direction": "outbound"}},
+        "conversation": {"phone_number": to},
+        "phone_number_id": "120293527700080",
+    }
+
+
 # ── _kapso_verify_signature ───────────────────────────────────────────────────
 
 class TestKapsoSignature:
@@ -166,6 +191,17 @@ class TestKapsoExtract:
         assert main._kapso_extract_messages({"random": "noise"}) == []
         assert main._kapso_extract_messages({}) == []
 
+    def test_live_kapso_shape(self):
+        assert main._kapso_extract_messages(_live_received()) == [
+            ("972544304272", "היי", "wamid.LIVE1")]
+
+    def test_bsuid_prefers_phone_over_token(self):
+        # 'from' is the business-scoped user id; the phone is on the conversation.
+        body = {"message": {"from": "IL.2038190160130376", "id": "m",
+                            "type": "text", "text": {"body": "hi"}},
+                "conversation": {"phone_number": "972544304272"}}
+        assert main._kapso_extract_messages(body) == [("972544304272", "hi", "m")]
+
 
 # ── _process_kapso_event routing ──────────────────────────────────────────────
 
@@ -173,22 +209,28 @@ class TestKapsoRouting:
     def test_received_dispatches_to_funnel(self):
         main._kapso_seen_keys.clear()
         main._wa_seen_mids.clear()
-        with patch.object(main, "_wa_record_debug"), \
-             patch.object(main, "_handle_whatsapp_message") as h:
+        with patch.object(main, "_handle_whatsapp_message") as h:
             main._process_kapso_event("whatsapp.message.received", "i1",
-                                      _meta_shape())
+                                      _live_received())
         h.assert_called_once()
         ch, wa_id, text, mid = h.call_args[0]
         assert isinstance(ch, main.KapsoChannel)
-        assert (wa_id, text, mid) == ("972500000000", "שלום", "wamid.K1")
+        assert (wa_id, text, mid) == ("972544304272", "היי", "wamid.LIVE1")
 
-    def test_sent_is_probe_only(self):
+    def test_sent_business_app_triggers_takeover(self):
         main._kapso_seen_keys.clear()
-        with patch.object(main, "_wa_record_debug") as rec, \
+        with patch.object(main, "_kapso_handle_sent") as ho:
+            main._process_kapso_event("whatsapp.message.sent", "s1",
+                                      _live_sent("business_app"))
+        ho.assert_called_once()
+
+    def test_sent_cloud_api_no_takeover(self):
+        main._kapso_seen_keys.clear()
+        with patch.object(main, "get_db_conn") as db, \
              patch.object(main, "_handle_whatsapp_message") as h:
-            main._process_kapso_event("whatsapp.message.sent", "i2", {"foo": 1})
-        rec.assert_called_once()
-        assert rec.call_args[0][0] == main._KAPSO_SENT_DEBUG_KEY
+            main._process_kapso_event("whatsapp.message.sent", "s2",
+                                      _live_sent("cloud_api"))
+        db.assert_not_called()
         h.assert_not_called()
 
     def test_idempotency_dedup(self):
@@ -220,6 +262,26 @@ class TestKapsoRouting:
             main._process_kapso_event("whatsapp.message.delivered", "i3", {"x": 1})
         rec.assert_not_called()
         h.assert_not_called()
+
+
+# ── _kapso_handle_sent (Coexistence human-takeover) ───────────────────────────
+
+class TestKapsoTakeover:
+    def test_business_app_marks_takeover(self):
+        with patch.object(main, "get_db_conn") as gdc, \
+             patch.object(main, "_db_get_or_create_channel_session",
+                          return_value="sid") as gcs, \
+             patch.object(main, "_db_set_session_state") as setstate, \
+             patch.object(main, "_db_touch_session"):
+            gdc.return_value.__enter__.return_value = MagicMock()
+            main._kapso_handle_sent(_live_sent("business_app", to="972544304272"))
+            assert gcs.call_args[0][2] == "972544304272"
+            assert setstate.call_args[0][2] == main._WA_STATE_TAKEOVER
+
+    def test_cloud_api_is_noop(self):
+        with patch.object(main, "get_db_conn") as gdc:
+            main._kapso_handle_sent(_live_sent("cloud_api"))
+        gdc.assert_not_called()
 
 
 # ── POST /api/webhooks/kapso ──────────────────────────────────────────────────

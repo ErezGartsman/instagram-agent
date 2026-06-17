@@ -4902,9 +4902,6 @@ def _process_whatsapp_events(body: dict) -> None:
 # sender field is parsed defensively and the raw payload is captured).
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_KAPSO_RECEIVED_DEBUG_KEY = "kapso._debug_last_received"
-_KAPSO_SENT_DEBUG_KEY     = "kapso._debug_last_sent"
-
 _kapso_seen_keys: dict[str, float] = {}
 _KAPSO_DEDUP_TTL = 600   # seconds
 
@@ -4930,42 +4927,59 @@ def _kapso_verify_signature(raw: bytes, header: Optional[str]) -> bool:
     return hmac.compare_digest(sig.lower(), digest.lower())
 
 
-def _kapso_unwrap_values(body: dict) -> list:
-    """Meta-style 'value' object(s) out of whatever envelope Kapso uses. Defensive
-    across shapes (Meta entry/changes, a wrapped data/payload, or a bare value) —
-    tightened from the probe capture once the live shape is pinned."""
+def _kapso_iter_messages(body: dict):
+    """Yield (message, context) across Kapso's inbound shapes. The live shape is a
+    single top-level 'message' alongside a 'conversation'; a 'messages' list and
+    the Meta entry/changes envelope are accepted as defensive fallbacks."""
     if not isinstance(body, dict):
-        return []
-    values = []
+        return
+    m = body.get("message")
+    if isinstance(m, dict):
+        yield m, body
+        return
+    for container in (body, body.get("data"), body.get("payload"),
+                      body.get("value")):
+        if isinstance(container, dict) and isinstance(container.get("messages"), list):
+            for msg in container["messages"]:
+                if isinstance(msg, dict):
+                    yield msg, container
+            return
     for entry in (body.get("entry") or []):
         for change in (entry.get("changes") or []):
-            v = change.get("value")
-            if isinstance(v, dict):
-                values.append(v)
-    if values:
-        return values
-    for key in ("data", "payload", "value", "message"):
-        v = body.get(key)
-        if isinstance(v, dict):
-            if "messages" in v or "from" in v or "text" in v:
-                return [v]
-            inner = v.get("value")
-            if isinstance(inner, dict):
-                return [inner]
-    if "messages" in body or "from" in body or "text" in body:
-        return [body]
-    return []
+            value = change.get("value") or {}
+            for msg in (value.get("messages") or []):
+                if isinstance(msg, dict):
+                    yield msg, value
 
 
-def _kapso_sender(msg: dict, value: dict) -> str:
-    """Customer WA id, parsed defensively. Meta's business-scoped-user-ID
-    migration means 'from'/'wa_id'/'phone_number' aren't all guaranteed — try
-    each, then fall back to the contacts[] block."""
-    for k in ("from", "wa_id", "phone_number", "sender", "author"):
-        val = msg.get(k)
+def _kapso_phone(*sources: dict, keys=("phone_number", "from", "wa_id")) -> str:
+    """First phone-shaped (all-digit) value across the sources for the given keys.
+    BSUID-safe: a business-scoped user id ('IL.2038…') is an identity token, never
+    a Cloud-API address, so we prefer a real phone for the reply 'to'."""
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for key in keys:
+            val = src.get(key)
+            if val and str(val).lstrip("+").isdigit():
+                return str(val)
+    return ""
+
+
+def _kapso_sender(msg: dict, ctx: dict) -> str:
+    """Customer phone for an inbound message (the reply 'to'). ctx is the body
+    (carrying 'conversation') or a Meta 'value' (carrying 'contacts')."""
+    conv = ctx.get("conversation") if isinstance(ctx.get("conversation"), dict) else {}
+    phone = _kapso_phone(msg, conv, ctx)
+    if phone:
+        return phone
+    # No phone-shaped field (post-BSUID edge) — fall back so we never drop a msg.
+    for src, key in ((msg, "from"), (msg, "wa_id"),
+                     (conv, "business_scoped_user_id")):
+        val = src.get(key)
         if val:
             return str(val)
-    for c in (value.get("contacts") or []):
+    for c in (ctx.get("contacts") or []):
         wid = c.get("wa_id") or (c.get("profile") or {}).get("wa_id")
         if wid:
             return str(wid)
@@ -4986,30 +5000,56 @@ def _kapso_text(msg: dict) -> str:
 
 
 def _kapso_extract_messages(body: dict) -> list:
-    """[(wa_id, text, mid), …] from an inbound Kapso payload. Best-effort across
-    shapes; empty when nothing is parseable (the probe capture is the source of
-    truth until the live shape is pinned)."""
+    """[(wa_id, text, mid), …] from an inbound Kapso webhook body — the live
+    {message, conversation} shape plus defensive fallbacks; BSUID-safe."""
     out = []
-    for value in _kapso_unwrap_values(body):
-        msgs = value.get("messages")
-        if not isinstance(msgs, list):
-            msgs = [value] if (value.get("text") or value.get("type")) else []
-        for msg in msgs:
-            if not isinstance(msg, dict):
-                continue
-            wa_id = _kapso_sender(msg, value).strip()
-            text  = (_kapso_text(msg) or "").strip()
-            mid   = str(msg.get("id") or msg.get("message_id")
-                        or msg.get("wamid") or "")
-            out.append((wa_id, text, mid))
+    for msg, ctx in _kapso_iter_messages(body):
+        out.append((
+            _kapso_sender(msg, ctx).strip(),
+            (_kapso_text(msg) or "").strip(),
+            str(msg.get("id") or msg.get("message_id") or msg.get("wamid") or ""),
+        ))
     return out
+
+
+def _kapso_sent_origin(body: dict) -> str:
+    """How a 'message.sent' message was produced, per Kapso's tag:
+    'business_app' = Erez typed it in the native app (Coexistence human reply);
+    'cloud_api' = our own API send echoed back."""
+    return str(((body.get("message") or {}).get("kapso") or {})
+               .get("origin") or "").lower()
+
+
+def _kapso_handle_sent(body: dict) -> None:
+    """Coexistence human-takeover. A 'business_app'-origin 'message.sent' means
+    Erez replied from his phone → mark that conversation handed-off so the bot
+    backs off (auto-resumes when the takeover state expires). 'cloud_api' sends
+    (our own bot replies, echoed) are ignored — else the bot would suppress
+    itself after every message. Never raises."""
+    if _kapso_sent_origin(body) != "business_app":
+        return
+    msg  = body.get("message") or {}
+    conv = body.get("conversation") if isinstance(body.get("conversation"), dict) else {}
+    cust = (_kapso_phone(msg, conv, keys=("to", "phone_number", "wa_id"))
+            or str(msg.get("to") or conv.get("phone_number") or ""))
+    if not cust:
+        return
+    try:
+        with get_db_conn() as conn:
+            sid = _db_get_or_create_channel_session(conn, "whatsapp", cust)
+            _db_set_session_state(conn, sid, _WA_STATE_TAKEOVER)
+            _db_touch_session(conn, sid)
+            conn.commit()
+        _audit("whatsapp_human_takeover", wa_id=cust, source="kapso")
+    except Exception as e:
+        logger.warning(f"[kapso] takeover mark failed: {e}")
 
 
 def _process_kapso_event(event: str, idem_key: Optional[str], body: dict) -> None:
     """Dispatch a verified Kapso webhook (worker thread). 'message.received' feeds
-    the funnel; 'message.sent' is probe-captured ONLY for now — until we can tell
-    Erez's app replies (human takeover) apart from our own API echoes, acting on
-    it would make the bot suppress itself after every send. Never raises."""
+    the funnel; 'message.sent' with a 'business_app' origin is Erez replying from
+    his phone → human takeover (our own 'cloud_api' echoes are ignored). Never
+    raises."""
     _kapso_prune_dedup()
 
     if idem_key:
@@ -5018,12 +5058,10 @@ def _process_kapso_event(event: str, idem_key: Optional[str], body: dict) -> Non
         _kapso_seen_keys[idem_key] = time.time()
 
     if event == "whatsapp.message.sent":
-        _wa_record_debug(_KAPSO_SENT_DEBUG_KEY, body)   # TEMP probe (takeover TODO)
+        _kapso_handle_sent(body)   # 'business_app' origin → human takeover
         return
     if event and event != "whatsapp.message.received":
         return   # status callbacks / other events
-
-    _wa_record_debug(_KAPSO_RECEIVED_DEBUG_KEY, body)   # TEMP — confirm live shape
 
     _wa_prune_dedup()
     for wa_id, text, mid in _kapso_extract_messages(body):
