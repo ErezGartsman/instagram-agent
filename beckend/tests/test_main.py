@@ -16,8 +16,10 @@ Test categories:
 """
 
 import json
+import time
 from unittest.mock import MagicMock, patch
 
+import jwt
 import pytest
 from fastapi.testclient import TestClient
 
@@ -89,6 +91,73 @@ def _patch_conn(client, fetchone=None, fetchall=None, description=None):
     mock_conn, mock_cursor = _make_mock_conn(fetchone, fetchall, description)
     client._mock_pool.getconn.return_value = mock_conn
     return mock_conn, mock_cursor
+
+
+# ─── 1b. Cockpit auth (/api/cockpit/me) ───────────────────────────────────────
+
+def _cockpit_token(secret, *, email="erez@example.com", aud="authenticated", exp_delta=3600):
+    """Mint a Supabase-style HS256 access token for the Cockpit auth tests."""
+    payload = {
+        "sub":   "user-uuid-123",
+        "email": email,
+        "role":  "authenticated",
+        "aud":   aud,
+        "exp":   int(time.time()) + exp_delta,
+    }
+    return jwt.encode(payload, secret, algorithm="HS256")
+
+
+class TestCockpitMe:
+    SECRET = "cockpit-test-secret-0123456789abcdef-0123"
+
+    def test_503_when_unconfigured(self, client):
+        main.settings.supabase_jwt_secret = ""
+        r = client.get("/api/cockpit/me")
+        assert r.status_code == 503
+
+    def test_401_without_token(self, client):
+        main.settings.supabase_jwt_secret = self.SECRET
+        main.settings.cockpit_allowed_emails = ""
+        r = client.get("/api/cockpit/me")
+        assert r.status_code == 401
+
+    def test_401_with_bad_signature(self, client):
+        main.settings.supabase_jwt_secret = self.SECRET
+        main.settings.cockpit_allowed_emails = ""
+        token = _cockpit_token("wrong-secret-0123456789abcdef-0123456789")
+        r = client.get("/api/cockpit/me", headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 401
+
+    def test_401_when_expired(self, client):
+        main.settings.supabase_jwt_secret = self.SECRET
+        main.settings.cockpit_allowed_emails = ""
+        token = _cockpit_token(self.SECRET, exp_delta=-10)
+        r = client.get("/api/cockpit/me", headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 401
+
+    def test_200_valid_token(self, client):
+        main.settings.supabase_jwt_secret = self.SECRET
+        main.settings.cockpit_allowed_emails = ""
+        token = _cockpit_token(self.SECRET, email="erez@example.com")
+        r = client.get("/api/cockpit/me", headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["email"] == "erez@example.com"
+        assert body["id"] == "user-uuid-123"
+
+    def test_403_when_email_not_allowed(self, client):
+        main.settings.supabase_jwt_secret = self.SECRET
+        main.settings.cockpit_allowed_emails = "approved@example.com"
+        token = _cockpit_token(self.SECRET, email="intruder@example.com")
+        r = client.get("/api/cockpit/me", headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 403
+
+    def test_200_when_email_on_allowlist(self, client):
+        main.settings.supabase_jwt_secret = self.SECRET
+        main.settings.cockpit_allowed_emails = "approved@example.com, erez@example.com"
+        token = _cockpit_token(self.SECRET, email="erez@example.com")
+        r = client.get("/api/cockpit/me", headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 200
 
 
 # ─── 1. SQL Validation ────────────────────────────────────────────────────────

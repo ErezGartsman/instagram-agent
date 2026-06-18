@@ -9,6 +9,9 @@ uvicorn[standard]>=0.32.0
 pydantic>=2.0.0
 pydantic-settings>=2.0.0
 
+# Auth — verify Supabase access tokens (HS256 JWT) for the Cockpit endpoints
+PyJWT>=2.8.0
+
 # PostgreSQL
 psycopg2-binary>=2.9.0
 
