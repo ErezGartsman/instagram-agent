@@ -38,9 +38,12 @@ Flat: no shadows / gradients / blur. Utilities: `bg-surface`, `text-muted`,
    enforce server-side (below). Magic link is email-OTP, no password.
 3. **Vercel**: add the two `VITE_SUPABASE_*` vars to the cockpit project.
 
-## Next — Ticket 5.0 backend (separate change)
-`/api/cockpit/me` in `beckend/main.py`: a FastAPI dependency verifying the
-Supabase JWT (HS256 via `SUPABASE_JWT_SECRET`) and checking the email allow-list.
+## Auth — two layers (fail closed)
+1. Client: Supabase magic-link session (`AuthProvider`).
+2. Server: on load the shell calls `GET /api/cockpit/me` (`beckend/main.py` —
+   verifies the Supabase JWT via `SUPABASE_JWT_SECRET`, enforces the
+   `COCKPIT_ALLOWED_EMAILS` allow-list). The shell renders only on `200`; `403`
+   → "not approved"; any other result fails closed. Uses `VITE_API_BASE`.
 
 ## Commands
 ```bash
