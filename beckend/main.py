@@ -25,6 +25,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager, contextmanager
 from typing import Optional
 
+import jwt
 import psycopg2
 import psycopg2.pool
 from google import genai
@@ -126,6 +127,17 @@ class Settings(BaseSettings):
     kapso_phone_number_id: str = ""
     kapso_api_base:        str = "https://api.kapso.ai/meta/whatsapp/v24.0"
 
+    # ── Cockpit (Sprint 5 command center — Supabase auth) ──────────────────────
+    # supabase_jwt_secret:    the project's JWT secret (Supabase -> Settings -> API
+    #   -> JWT Secret). HS256 — verifies the access token the browser presents.
+    #   Empty string => the Cockpit auth endpoints return 503, so CI and
+    #   unconfigured deploys fail closed rather than ever trusting an unverified token.
+    # cockpit_allowed_emails: optional comma-separated allow-list. Empty => any
+    #   Supabase-authenticated user is accepted (the Supabase signup restriction is
+    #   the primary gate); set it to lock the Cockpit to specific addresses.
+    supabase_jwt_secret:    str = ""
+    cockpit_allowed_emails: str = ""
+
     # ── Contact-capture CTAs for Instagram (env-var driven, never hardcoded) ────
     # whatsapp_number:  E.164 format without '+', e.g. "972501234567".
     #                   When set, a WhatsApp wa.me link button is shown as the
@@ -202,6 +214,44 @@ def require_auth(
         return  # dev mode — auth disabled
     if credentials is None or not _secret_eq(credentials.credentials, settings.nexus_api_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+
+# ── Cockpit auth — verify the Supabase access token (JWT, HS256) ──────────────
+def require_cockpit_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
+) -> dict:
+    """
+    Authenticate a Cockpit request by verifying the Supabase access token sent as
+    `Authorization: Bearer <jwt>`. Returns the decoded claims on success.
+
+    Fail-closed behaviour:
+      • SUPABASE_JWT_SECRET unset       -> 503 (Cockpit auth not configured).
+      • missing / malformed / expired   -> 401.
+      • valid token whose email is not
+        on COCKPIT_ALLOWED_EMAILS        -> 403.
+
+    The JWT secret is the Supabase project's HS256 signing secret; it stays on the
+    server. The browser only ever holds the public anon key.
+    """
+    if not settings.supabase_jwt_secret:
+        raise HTTPException(status_code=503, detail="Cockpit auth is not configured.")
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="Missing bearer token.")
+    try:
+        claims = jwt.decode(
+            credentials.credentials,
+            settings.supabase_jwt_secret,
+            algorithms=["HS256"],
+            audience="authenticated",
+        )
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+
+    email = (claims.get("email") or "").strip().lower()
+    allow = [e.strip().lower() for e in settings.cockpit_allowed_emails.split(",") if e.strip()]
+    if allow and email not in allow:
+        raise HTTPException(status_code=403, detail="This account is not approved for the Cockpit.")
+    return claims
 
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -1479,6 +1529,20 @@ def get_stats():
     except Exception as e:
         logger.error(f"[stats] Query failed: {e}")
         return {"status": "error", "detail": "Could not fetch stats"}
+
+
+@app.get("/api/cockpit/me")
+def cockpit_me(user: dict = Depends(require_cockpit_user)):
+    """
+    Identity probe for the Cockpit SPA. The frontend calls this after a Supabase
+    magic-link sign-in to confirm the session is valid server-side (and that the
+    account is approved) before it trusts the client-side session.
+    """
+    return {
+        "id":    user.get("sub"),
+        "email": user.get("email"),
+        "role":  user.get("role"),
+    }
 
 
 @app.get("/api/schema", dependencies=[Depends(require_auth)])
