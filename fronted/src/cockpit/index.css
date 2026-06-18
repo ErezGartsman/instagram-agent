@@ -1,0 +1,93 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+   NEXUS Cockpit — design system entry
+   Tokens are the "Graphite Command" Mission Control skin (via ui-ux-pro-max):
+   flat, no shadows / gradients / blur; elevation via surface + border shifts;
+   4px grid; radius 6/8; IBM Plex Sans (UI) + JetBrains Mono (data); one accent (electric blue).
+
+   Tailwind v4 is loaded WITHOUT preflight so the legacy Nexus app at /legacy keeps
+   its own base styles; the Cockpit gets a reset scoped to `.cockpit-root` instead.
+   ──────────────────────────────────────────────────────────────────────────── */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+/* Only scan the typed Cockpit sources — never the legacy .jsx app. */
+@source "../**/*.{ts,tsx}";
+
+@theme {
+  /* Surfaces — cool slate, layered light→lighter for elevation (never shadows) */
+  --color-bg: #0b0f17;        /* page background            */
+  --color-surface: #131a24;   /* cards, panels, sidebar     */
+  --color-raised: #1f2a38;    /* hover / raised layer       */
+  --color-ink: #e8edf4;       /* primary text (cool white)  */
+  --color-muted: #8b98a9;     /* secondary text (cool grey) */
+  --color-line: rgba(232, 237, 244, 0.1); /* hairline borders (~10%) */
+  --color-accent: #3d8bff;    /* electric blue — the single signature colour */
+
+  /* Status palette */
+  --color-success: #34d399;   /* emerald */
+  --color-warn: #fbbf24;      /* amber   */
+  --color-danger: #f87171;    /* red     */
+
+  /* Radius — flat system, tightened for a precise instrument feel */
+  --radius-control: 6px;
+  --radius-card: 8px;
+
+  /* Type — IBM Plex Sans for UI, JetBrains Mono for data / numerals */
+  --font-sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+
+@layer base {
+  /* Minimal global reset — only what's safe for the legacy app to share. */
+  html,
+  body { margin: 0; }
+  #root { min-height: 100vh; }
+
+  /* Scoped reset — restores the bits Tailwind's preflight would have provided,
+     but ONLY inside the Cockpit subtree. */
+  .cockpit-root {
+    font-family: var(--font-sans);
+    background: var(--color-bg);
+    color: var(--color-ink);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  .cockpit-root *,
+  .cockpit-root *::before,
+  .cockpit-root *::after {
+    box-sizing: border-box;
+    /* Tailwind's border utilities assume this default border model. */
+    border-width: 0;
+    border-style: solid;
+    border-color: var(--color-line);
+  }
+  .cockpit-root h1,
+  .cockpit-root h2,
+  .cockpit-root h3,
+  .cockpit-root h4,
+  .cockpit-root p { margin: 0; }
+  .cockpit-root button {
+    font: inherit;
+    color: inherit;
+    background: none;
+    cursor: pointer;
+  }
+  .cockpit-root input { font: inherit; color: inherit; }
+  .cockpit-root a { color: inherit; text-decoration: none; }
+  .cockpit-root :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+}
+
+/* Respect reduced-motion across the whole Cockpit (!important beats any layer). */
+@media (prefers-reduced-motion: reduce) {
+  .cockpit-root *,
+  .cockpit-root *::before,
+  .cockpit-root *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
