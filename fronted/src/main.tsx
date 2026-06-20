@@ -12,7 +12,7 @@ import { WorkQueuePage } from './cockpit/pages/WorkQueuePage'
 import { AnalyticsPage } from './cockpit/pages/AnalyticsPage'
 import { PipelinePage } from './cockpit/pages/PipelinePage'
 import { InboxPage } from './cockpit/pages/InboxPage'
-import { ContentPage } from './cockpit/pages/ContentPage'
+import { ContentStudioPage } from './cockpit/pages/ContentStudioPage'
 import { NotFoundPage } from './cockpit/pages/NotFoundPage'
 import { FEATURES } from './cockpit/lib/flags'
 
@@ -42,7 +42,7 @@ const router = createBrowserRouter([
       ...(FEATURES.analytics ? [{ path: 'analytics', element: <AnalyticsPage /> }] : []),
       { path: 'pipeline', element: <PipelinePage /> },
       { path: 'inbox', element: <InboxPage /> },
-      { path: 'content', element: <ContentPage /> },
+      ...(FEATURES.content ? [{ path: 'content', element: <ContentStudioPage /> }] : []),
       { path: '*', element: <NotFoundPage /> },
     ],
   },

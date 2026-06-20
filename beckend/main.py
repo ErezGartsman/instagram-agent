@@ -430,6 +430,7 @@ _INTERNAL_TABLES = {
     "tenants", "operators", "person", "person_identity", "merge_candidates",
     "interactions", "opportunities", "bookings",
     "person_profile", "session_summaries", "operator_notes", "erasure_log",
+    "content_pieces",
 }
 
 def get_schema_description(conn) -> str:
@@ -1718,6 +1719,131 @@ def cockpit_powerbi(user: dict = Depends(require_cockpit_user)):
         f"&ctid={settings.powerbi_tenant_id}"
     )
     return {"embed_url": embed_url}
+
+
+# ── Content Studio (Sprint 5, the Studio pillar) — the cockpit's first write
+#    surface. CRUD over content_pieces, all Supabase-JWT gated. ───────────────
+_CONTENT_STATUSES = {"idea", "drafting", "published"}
+_CONTENT_COLS = (
+    "id, title, body, status, theme_tags, leads_attributed, "
+    "created_at, updated_at, published_at"
+)
+
+
+class ContentCreate(BaseModel):
+    title: str = ""
+    body: str = ""
+    status: str = "idea"
+    theme_tags: list[str] = Field(default_factory=list)
+
+
+class ContentUpdate(BaseModel):
+    title: Optional[str] = None
+    body: Optional[str] = None
+    status: Optional[str] = None
+    theme_tags: Optional[list[str]] = None
+    leads_attributed: Optional[int] = None   # manual V1 bridge; null hides it
+
+
+def _content_row(r) -> dict:
+    return {
+        "id":               str(r[0]),
+        "title":            r[1],
+        "body":             r[2],
+        "status":           r[3],
+        "theme_tags":       list(r[4] or []),
+        "leads_attributed": r[5],
+        "created_at":       r[6].isoformat() if r[6] else None,
+        "updated_at":       r[7].isoformat() if r[7] else None,
+        "published_at":     r[8].isoformat() if r[8] else None,
+    }
+
+
+@app.get("/api/cockpit/content")
+def cockpit_content_list(user: dict = Depends(require_cockpit_user)):
+    """All content pieces, newest-touched first — for the Studio rail + canvas."""
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {_CONTENT_COLS} FROM content_pieces "
+                    "ORDER BY updated_at DESC"
+                )
+                rows = cur.fetchall()
+        return {"status": "success", "items": [_content_row(r) for r in rows]}
+    except Exception as e:
+        logger.error(f"[cockpit/content] list failed: {e}")
+        return {"status": "error", "detail": "Could not load content."}
+
+
+@app.post("/api/cockpit/content")
+def cockpit_content_create(body: ContentCreate, user: dict = Depends(require_cockpit_user)):
+    status = body.status if body.status in _CONTENT_STATUSES else "idea"
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO content_pieces (title, body, status, theme_tags) "
+                    f"VALUES (%s, %s, %s, %s) RETURNING {_CONTENT_COLS}",
+                    (body.title, body.body, status, body.theme_tags),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        return {"status": "success", "item": _content_row(row)}
+    except Exception as e:
+        logger.error(f"[cockpit/content] create failed: {e}")
+        return {"status": "error", "detail": "Could not create the piece."}
+
+
+@app.patch("/api/cockpit/content/{piece_id}")
+def cockpit_content_update(piece_id: str, body: ContentUpdate,
+                          user: dict = Depends(require_cockpit_user)):
+    fields = body.model_dump(exclude_unset=True)   # only what the client sent
+    if "status" in fields and fields["status"] not in _CONTENT_STATUSES:
+        raise HTTPException(status_code=400, detail="Invalid status.")
+    allowed = {"title", "body", "status", "theme_tags", "leads_attributed"}
+    sets, params = [], []
+    for key, val in fields.items():
+        if key in allowed:                          # column names are whitelisted
+            sets.append(f"{key} = %s")
+            params.append(val)
+    if not sets:
+        raise HTTPException(status_code=400, detail="No fields to update.")
+    # Stamp published_at the first time a piece goes live.
+    extra = ", published_at = COALESCE(published_at, NOW())" if fields.get("status") == "published" else ""
+    params.append(piece_id)
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE content_pieces SET {', '.join(sets)}, updated_at = NOW(){extra} "
+                    f"WHERE id = %s RETURNING {_CONTENT_COLS}",
+                    params,
+                )
+                row = cur.fetchone()
+            conn.commit()
+        if not row:
+            raise HTTPException(status_code=404, detail="Piece not found.")
+        return {"status": "success", "item": _content_row(row)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[cockpit/content] update failed: {e}")
+        return {"status": "error", "detail": "Could not save the piece."}
+
+
+@app.delete("/api/cockpit/content/{piece_id}")
+def cockpit_content_delete(piece_id: str, user: dict = Depends(require_cockpit_user)):
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM content_pieces WHERE id = %s", (piece_id,))
+                deleted = cur.rowcount
+            conn.commit()
+        return {"status": "success", "deleted": deleted}
+    except Exception as e:
+        logger.error(f"[cockpit/content] delete failed: {e}")
+        return {"status": "error", "detail": "Could not delete the piece."}
 
 
 @app.get("/api/schema", dependencies=[Depends(require_auth)])
