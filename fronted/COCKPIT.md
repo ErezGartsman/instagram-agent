@@ -45,6 +45,10 @@ Flat: no shadows / gradients / blur. Utilities: `bg-surface`, `text-muted`,
    `COCKPIT_ALLOWED_EMAILS` allow-list). The shell renders only on `200`; `403`
    → "not approved"; any other result fails closed. Uses `VITE_API_BASE`.
 
+**Dev bypass:** under `vite dev`, both layers are skipped and the session is mocked
+(`erezkim1234@gmail.com`) so local work needs no login/backend — never in production
+(`import.meta.env.DEV` is `false` there). Disable with `VITE_COCKPIT_DEV_BYPASS=off`.
+
 ## Commands
 ```bash
 npm install

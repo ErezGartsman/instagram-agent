@@ -9,16 +9,38 @@ export type Access = 'checking' | 'allowed' | 'denied' | 'error'
 
 export type CockpitProfile = { id?: string; email?: string; role?: string }
 
+// ── Dev-only auth bypass ─────────────────────────────────────────────────────
+// Active under `vite dev` so local work needs no login and no running backend.
+// NEVER active in production: `import.meta.env.DEV` is statically `false` in a
+// production build, so every branch guarded by DEV_BYPASS is dead-code-eliminated
+// and the strict two-layer gate is the only thing that ships. Set
+// VITE_COCKPIT_DEV_BYPASS=off in .env.local to exercise the real login locally.
+const DEV_EMAIL = 'erezkim1234@gmail.com'
+const DEV_BYPASS = import.meta.env.DEV && import.meta.env.VITE_COCKPIT_DEV_BYPASS !== 'off'
+
+if (DEV_BYPASS) {
+  console.warn(
+    `[cockpit] DEV auth bypass active — mocking session as ${DEV_EMAIL}. ` +
+      'This never ships to production. Set VITE_COCKPIT_DEV_BYPASS=off to disable.',
+  )
+}
+
+function devSession(): Session {
+  return {
+    access_token: 'dev-bypass',
+    token_type: 'bearer',
+    user: { id: 'dev-user', email: DEV_EMAIL, role: 'authenticated' },
+  } as unknown as Session
+}
+
 type AuthValue = {
   session: Session | null
   user: User | null
   loading: boolean
-  /**
-   * Result of verifying the session against the backend allow-list. A valid local
-   * session is necessary but NOT sufficient — the shell renders only when `allowed`.
-   */
   access: Access
   profile: CockpitProfile | null
+  /** True when the dev-only auth bypass is active (never in production). */
+  devBypass: boolean
   recheck: () => void
   signInWithEmail: (email: string) => Promise<{ error: string | null }>
   signOut: () => Promise<void>
@@ -27,14 +49,16 @@ type AuthValue = {
 const AuthContext = createContext<AuthValue | undefined>(undefined)
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [session, setSession] = useState<Session | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [access, setAccess] = useState<Access>('checking')
-  const [profile, setProfile] = useState<CockpitProfile | null>(null)
-  // Bumped by recheck() to re-run the verification effect (the "Try again" button).
+  const [session, setSession] = useState<Session | null>(DEV_BYPASS ? devSession() : null)
+  const [loading, setLoading] = useState(!DEV_BYPASS)
+  const [access, setAccess] = useState<Access>(DEV_BYPASS ? 'allowed' : 'checking')
+  const [profile, setProfile] = useState<CockpitProfile | null>(
+    DEV_BYPASS ? { id: 'dev-user', email: DEV_EMAIL, role: 'authenticated' } : null,
+  )
   const [recheckNonce, setRecheckNonce] = useState(0)
 
   useEffect(() => {
+    if (DEV_BYPASS) return
     let active = true
 
     supabase.auth.getSession().then(({ data }) => {
@@ -54,11 +78,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  // Server-side gate. Runs whenever the access token changes (sign-in, refresh) or
-  // recheck() is called. Fails CLOSED: any non-200 leaves access at denied/error,
-  // never `allowed`, so a blocked or spoofed request can't reveal the shell.
+  // Server-side gate. Fails CLOSED: any non-200 leaves access at denied/error.
   const token = session?.access_token
   useEffect(() => {
+    if (DEV_BYPASS) return
     if (!token) {
       setAccess('checking')
       setProfile(null)
@@ -66,7 +89,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     let cancelled = false
     const controller = new AbortController()
-    // On a silent token refresh while already allowed, don't flash the splash.
     setAccess((prev) => (prev === 'allowed' ? prev : 'checking'))
 
     fetch(`${API_BASE}/api/cockpit/me`, {
@@ -104,6 +126,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       loading,
       access,
       profile,
+      devBypass: DEV_BYPASS,
       recheck,
       signInWithEmail: async (email) => {
         const { error } = await supabase.auth.signInWithOtp({

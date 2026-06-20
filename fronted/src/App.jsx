@@ -1163,6 +1163,11 @@ export default function App() {
   // it never appears in the source or the built bundle. authedFetch injects it
   // as a Bearer header and treats any 401 as "key revoked → re-show login".
   const [authToken, setAuthToken] = useState(() => {
+    // Local dev: skip the API-key gate. The local backend disables auth when
+    // NEXUS_API_KEY is empty, so any bearer token is accepted. NEVER in prod —
+    // import.meta.env.DEV is statically false in a production build, so this line
+    // is dead-code-eliminated and the real key gate is all that ships.
+    if (import.meta.env.DEV) return 'dev-bypass'
     try { return localStorage.getItem('nexus_auth_token') || '' } catch { return '' }
   })
 
