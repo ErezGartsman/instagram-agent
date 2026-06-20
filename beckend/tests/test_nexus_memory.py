@@ -68,6 +68,12 @@ class TestParseFormation:
         out = memory.parse_formation(self._full(attributes={"x": "null", "y": "ערך"}))
         assert out["attributes"] == {"y": "ערך"}
 
+    def test_goal_attribute_flows_through(self):
+        out = memory.parse_formation(self._full(
+            attributes={"goal": "להחליט אם להישאר", "core_concern": None}))
+        assert out["attributes"]["goal"] == "להחליט אם להישאר"
+        assert "core_concern" not in out["attributes"]   # null dropped
+
     def test_caps_facts_to_four(self):
         out = memory.parse_formation(self._full(facts=["a", "b", "c", "d", "e", "f"]))
         assert len(out["facts"]) == 4
@@ -117,10 +123,28 @@ class TestMergeProfile:
         merged = memory.merge_profile(existing, self._formation(), session_id="s3")
         assert merged["attributes"]["core_concern"] == "חרדה"
 
+    def test_goal_merges_and_updates(self):
+        existing = {"attributes": {"goal": "ישן", "relationship_status": "נשוי"},
+                    "facts": [], "version": 1}
+        merged = memory.merge_profile(
+            existing, self._formation(attributes={"goal": "לשקם אמון"}), session_id="s5")
+        assert merged["attributes"]["goal"] == "לשקם אמון"             # new goal wins
+        assert merged["attributes"]["relationship_status"] == "נשוי"   # prior key kept
+
     def test_ai_fact_dedup(self):
         existing = {"facts": [{"fact": "עובדה חדשה", "by": "ai"}], "version": 1}
         merged = memory.merge_profile(existing, self._formation(), session_id="s4")
         assert sum(1 for f in merged["facts"] if f["fact"] == "עובדה חדשה") == 1
+
+
+# ─── formation prompt ────────────────────────────────────────────────────────
+
+class TestFormationPrompt:
+    def test_prompt_requests_goal_attribute(self):
+        # The extraction is wired: the LLM is explicitly asked for attributes.goal,
+        # which the Person-360 right pane (cockpit Work Queue) reads.
+        assert "goal" in memory.FORMATION_PROMPT
+        assert "attributes.goal" in memory.FORMATION_PROMPT
 
 
 # ─── render helpers ──────────────────────────────────────────────────────────
