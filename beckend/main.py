@@ -44,6 +44,7 @@ from nexus import hooks as nexus_hooks
 from nexus import identity as nexus_identity
 from nexus import interactions as nexus_interactions
 from nexus import memory as nexus_memory
+from nexus import work_queue as nexus_work_queue
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -1597,6 +1598,105 @@ def cockpit_pipeline(user: dict = Depends(require_cockpit_user)):
     except Exception as e:
         logger.error(f"[cockpit/pipeline] query failed: {e}")
         return {"status": "error", "detail": "Could not load the pipeline."}
+
+
+@app.get("/api/cockpit/queue")
+def cockpit_queue(user: dict = Depends(require_cockpit_user)):
+    """
+    The Work Queue — the Decision Engine's surface. One ranked row per OPEN
+    opportunity, each carrying the recommended next move (Action), the engine's
+    Confidence, and the Reason, plus a memory-first Person-360 (essence / goal /
+    tension) and a V1 activity timeline derived from the signal log + the latest
+    session summary. Ranking + recommendation live in nexus.work_queue (pure,
+    unit-tested); this endpoint only gathers rows and assembles the response.
+    """
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT o.id, o.stage, o.source_channel, "
+                    "       p.id, p.display_name, p.wa_ref_code, p.first_seen_at, "
+                    "       pp.summary, pp.attributes, "
+                    "       agg.last_at, "
+                    "       ss.urgency, ss.emotional_state, ss.topic, ss.created_at "
+                    "FROM opportunities o "
+                    "JOIN person p ON p.id = o.person_id "
+                    "LEFT JOIN person_profile pp ON pp.person_id = p.id "
+                    "LEFT JOIN LATERAL (SELECT MAX(occurred_at) AS last_at "
+                    "                   FROM interactions WHERE person_id = p.id) agg ON TRUE "
+                    "LEFT JOIN LATERAL (SELECT urgency, emotional_state, topic, created_at "
+                    "                   FROM session_summaries WHERE person_id = p.id "
+                    "                   ORDER BY created_at DESC LIMIT 1) ss ON TRUE "
+                    "WHERE o.closed_at IS NULL"
+                )
+                rows = cur.fetchall()
+                person_ids = [r[3] for r in rows]
+                recent: dict[str, list] = {}
+                if person_ids:
+                    cur.execute(
+                        "SELECT person_id, kind, occurred_at FROM interactions "
+                        "WHERE person_id = ANY(%s) ORDER BY occurred_at DESC",
+                        (person_ids,),
+                    )
+                    for pid, kind, occurred_at in cur.fetchall():
+                        recent.setdefault(str(pid), []).append((kind, occurred_at))
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        items = []
+        for r in rows:
+            (opp_id, stage, channel, person_id, display_name, wa_ref, first_seen_at,
+             summary, attributes, last_at, urgency, emotional_state, topic, ss_at) = r
+            pid = str(person_id)
+            events = recent.get(pid, [])
+            hours = (now - last_at).total_seconds() / 3600 if last_at else None
+            rec = nexus_work_queue.recommend(nexus_work_queue.Signals(
+                stage=stage,
+                hours_since_last=hours,
+                recent_kinds=frozenset(k for (k, _t) in events),
+                urgency=urgency,
+            ))
+            timeline = [
+                {"kind": k, "label": nexus_work_queue.label_for_kind(k),
+                 "at": t.isoformat() if t else None}
+                for (k, t) in events[:6]
+            ]
+            if topic or emotional_state:
+                timeline.append({
+                    "kind": "session_summary",
+                    "label": "Session · " + (topic or emotional_state or "summary"),
+                    "at": ss_at.isoformat() if ss_at else None,
+                })
+                timeline.sort(key=lambda e: e["at"] or "", reverse=True)
+
+            attrs = attributes if isinstance(attributes, dict) else {}
+            name = display_name or (f"Lead {wa_ref}" if wa_ref else "Lead")
+            items.append({
+                "id":             str(opp_id),
+                "person_id":      pid,
+                "name":           name,
+                "initials":       nexus_work_queue.initials(name),
+                "channel":        channel,
+                "handle":         wa_ref,
+                "teaser":         rec.reason,
+                "action":         rec.action,
+                "confidence":     rec.confidence,
+                "reason":         rec.reason,
+                "last_contacted": last_at.isoformat() if last_at else None,
+                "first_seen_at":  first_seen_at.isoformat() if first_seen_at else None,
+                "timeline":       timeline,
+                "essence":        summary,
+                "goal":           attrs.get("goal"),
+                "tension":        attrs.get("tension") or emotional_state,
+                "_priority":      rec.priority,
+            })
+
+        items.sort(key=lambda it: (it["_priority"], it["last_contacted"] or ""), reverse=True)
+        for it in items:
+            it.pop("_priority", None)
+        return {"status": "success", "items": items}
+    except Exception as e:
+        logger.error(f"[cockpit/queue] query failed: {e}")
+        return {"status": "error", "detail": "Could not load the work queue."}
 
 
 @app.get("/api/schema", dependencies=[Depends(require_auth)])

@@ -2,10 +2,15 @@ import { API_BASE } from './api'
 
 // The Work Queue is the Decision Engine's surface: a priority-ranked list of
 // people, each carrying the Action / Confidence / Reason it was surfaced for,
-// the conversation thread, and the memory-first Person-360. One row, one
-// recommended next move.
+// a V1 activity timeline (the signal log — raw conversations stay out-of-system
+// in V1), and the memory-first Person-360. One row, one recommended next move.
 
-export type ThreadMessage = { from: 'them' | 'me'; text: string }
+export type TimelineEvent = {
+  kind: string
+  /** Human-readable label for the signal (server-provided). */
+  label: string
+  at: string | null
+}
 
 export type QueueItem = {
   id: string
@@ -13,7 +18,7 @@ export type QueueItem = {
   name: string
   initials: string
   channel: string | null
-  /** Masked contact reference shown under the name (phone / @handle). */
+  /** Masked contact reference shown under the name (wa ref / @handle). */
   handle: string | null
   /** One-line reason the row is in the queue (shown in the dense left list). */
   teaser: string
@@ -24,14 +29,15 @@ export type QueueItem = {
   /** Why the engine ranked + recommended this — the Reason half. */
   reason: string
   last_contacted: string | null
-  /** Human-readable first-contact recency for the Memory header. */
-  firstContactAgo: string
-  thread: ThreadMessage[]
-  /** The Memory layer: the core human problem, in the operator's own words.
-   *  This is the one place the Fraunces serif speaks. */
-  essence: string
-  goal: string
-  tension: string
+  /** When this person first entered the system, for the Memory header. */
+  first_seen_at: string | null
+  /** V1 activity timeline: signal-log events, most recent first. */
+  timeline: TimelineEvent[]
+  /** The Memory layer: the core human problem, in narrative form. The one
+   *  place the Fraunces serif speaks. Null until a profile summary exists. */
+  essence: string | null
+  goal: string | null
+  tension: string | null
 }
 
 export async function fetchQueue(token: string, signal?: AbortSignal): Promise<QueueItem[]> {
@@ -44,7 +50,9 @@ export async function fetchQueue(token: string, signal?: AbortSignal): Promise<Q
   return data.items ?? []
 }
 
-/** Highest confidence first — the queue is a ranking, not a chat list. */
+/** Highest confidence first — a stable client-side fallback ordering. The
+ *  server already ranks by the rule-engine priority; this only re-sorts if a
+ *  caller hands us an unranked list. */
 export function rankQueue(items: QueueItem[]): QueueItem[] {
   return [...items].sort((a, b) => b.confidence - a.confidence)
 }
@@ -60,16 +68,17 @@ export const SAMPLE_QUEUE: QueueItem[] = import.meta.env.DEV
   ? rankQueue([
       {
         id: 'q1', person_id: 'p1', name: 'Maya Goren', initials: 'MG',
-        channel: 'whatsapp', handle: '+972 54-•••-1188',
-        teaser: 'Asked about pricing before the deadline',
-        action: 'Offer the Saturday clarity call',
-        confidence: 92,
-        reason: 're-engaged after 3 days; asked about pricing',
-        last_contacted: ago(4 * 60), firstContactAgo: '11 days ago',
-        thread: [
-          { from: 'them', text: 'I keep starting the conversation in my head and then deleting it.' },
-          { from: 'me', text: "That rehearsal is information — it's telling you what you're protecting." },
-          { from: 'them', text: 'Do you do single sessions? I think I need help before the 2nd.' },
+        channel: 'whatsapp', handle: 'BR-1188',
+        teaser: 'shared their context — ready to book',
+        action: 'Send the booking link',
+        confidence: 88,
+        reason: 'shared their context — ready to book',
+        last_contacted: ago(4 * 60), first_seen_at: ago(11 * 86400),
+        timeline: [
+          { kind: 'outreach_click', label: 'Clicked the outreach link', at: ago(4 * 60) },
+          { kind: 'captured', label: 'Shared their context', at: ago(3 * 3600) },
+          { kind: 'qualified', label: 'Qualified', at: ago(2 * 86400) },
+          { kind: 'session_started', label: 'Started a conversation', at: ago(11 * 86400) },
         ],
         essence: "She isn't afraid of leaving. She's afraid of being the one who broke it.",
         goal: 'Decide before the anniversary, Jul 2',
@@ -78,15 +87,15 @@ export const SAMPLE_QUEUE: QueueItem[] = import.meta.env.DEV
       {
         id: 'q2', person_id: 'p2', name: 'Daniel Roth', initials: 'DR',
         channel: 'telegram', handle: '@daniel_r',
-        teaser: 'Opened, no reply for 26h',
-        action: 'Send the trust-repair primer',
-        confidence: 78,
-        reason: 'opened last 2 messages; no reply for 26h',
-        last_contacted: ago(1 * 3600), firstContactAgo: '4 days ago',
-        thread: [
-          { from: 'them', text: "She read it. She didn't reply. I don't know what that means." },
-          { from: 'me', text: 'Silence after a rupture is rarely a verdict — usually it is self-protection.' },
-          { from: 'them', text: "I'll wait. But I can't keep doing this on my own." },
+        teaser: 'qualified, then quiet 1d',
+        action: 'Re-engage with a check-in',
+        confidence: 66,
+        reason: 'qualified, then quiet 1d',
+        last_contacted: ago(26 * 3600), first_seen_at: ago(4 * 86400),
+        timeline: [
+          { kind: 'contacted', label: 'Was contacted', at: ago(26 * 3600) },
+          { kind: 'qualified', label: 'Qualified', at: ago(2 * 86400) },
+          { kind: 'session_started', label: 'Started a conversation', at: ago(4 * 86400) },
         ],
         essence: 'He keeps replaying the moment he lost her trust — and rehearsing an apology she will not hear.',
         goal: 'Earn one more conversation',
@@ -94,16 +103,15 @@ export const SAMPLE_QUEUE: QueueItem[] = import.meta.env.DEV
       },
       {
         id: 'q3', person_id: 'p3', name: 'Noa Levi', initials: 'NL',
-        channel: 'whatsapp', handle: '+972 52-•••-4471',
-        teaser: 'New lead · high-intent language',
-        action: 'Ask the one diagnostic question',
-        confidence: 64,
-        reason: 'new lead; high-intent language',
-        last_contacted: ago(20 * 60), firstContactAgo: 'today',
-        thread: [
-          { from: 'them', text: "We used to talk for hours. Now it's just 'goodnight'." },
-          { from: 'me', text: "When did 'goodnight' start doing the work of the whole conversation?" },
-          { from: 'them', text: '…honestly? Months ago. I just didn\'t want to say it out loud.' },
+        channel: 'whatsapp', handle: 'BR-4471',
+        teaser: 'newly engaged',
+        action: 'Open the conversation',
+        confidence: 60,
+        reason: 'newly engaged',
+        last_contacted: ago(20 * 60), first_seen_at: ago(3 * 3600),
+        timeline: [
+          { kind: 'trigger_hit', label: 'Hit an interest trigger', at: ago(20 * 60) },
+          { kind: 'session_started', label: 'Started a conversation', at: ago(3 * 3600) },
         ],
         essence: "The distance stopped hurting. That's the part that scares her.",
         goal: 'Find out if it is worth fighting for',
@@ -111,16 +119,16 @@ export const SAMPLE_QUEUE: QueueItem[] = import.meta.env.DEV
       },
       {
         id: 'q4', person_id: 'p4', name: 'Ofir Ben-David', initials: 'OB',
-        channel: 'whatsapp', handle: '+972 50-•••-9023',
-        teaser: 'Booked · mild cold feet',
-        action: 'Confirm the Thursday intake',
-        confidence: 55,
-        reason: 'booked; mild cold-feet signal',
-        last_contacted: ago(1 * 86400), firstContactAgo: '6 days ago',
-        thread: [
-          { from: 'them', text: "We booked the intake, but I'm second-guessing whether we're 'bad enough' to need this." },
-          { from: 'me', text: "Needing help early isn't a sign it's bad — it's a sign you're paying attention." },
-          { from: 'them', text: "Okay. We'll keep the Thursday slot." },
+        channel: 'whatsapp', handle: 'BR-9023',
+        teaser: 'booked — confirm and prep',
+        action: 'Confirm the upcoming session',
+        confidence: 80,
+        reason: 'booked — confirm and prep',
+        last_contacted: ago(1 * 86400), first_seen_at: ago(6 * 86400),
+        timeline: [
+          { kind: 'booking_created', label: 'Booked a consultation', at: ago(1 * 86400) },
+          { kind: 'captured', label: 'Shared their context', at: ago(3 * 86400) },
+          { kind: 'session_started', label: 'Started a conversation', at: ago(6 * 86400) },
         ],
         essence: "He's not unsure about the relationship. He's unsure he's allowed to ask for help.",
         goal: 'Show up to the first session',
@@ -128,16 +136,15 @@ export const SAMPLE_QUEUE: QueueItem[] = import.meta.env.DEV
       },
       {
         id: 'q5', person_id: 'p5', name: 'Tamar Shaked', initials: 'TS',
-        channel: 'whatsapp', handle: '+972 53-•••-7781',
-        teaser: 'Cooled · door left open',
-        action: 'Nudge gently in 2 days',
-        confidence: 41,
-        reason: 'cooled; left the door open',
-        last_contacted: ago(2 * 86400), firstContactAgo: '3 weeks ago',
-        thread: [
-          { from: 'them', text: 'Thanks — I think we are okay for now.' },
-          { from: 'me', text: "Understood. I'll leave the door open; reach out whenever the timing is right." },
-          { from: 'them', text: 'Appreciate it.' },
+        channel: 'whatsapp', handle: 'BR-7781',
+        teaser: 'went quiet 3w after first contact',
+        action: 'Reopen with a gentle nudge',
+        confidence: 52,
+        reason: 'went quiet after first contact',
+        last_contacted: ago(2 * 86400), first_seen_at: ago(21 * 86400),
+        timeline: [
+          { kind: 'contacted', label: 'Was contacted', at: ago(2 * 86400) },
+          { kind: 'session_started', label: 'Started a conversation', at: ago(21 * 86400) },
         ],
         essence: 'She wants it to be fine. Saying it out loud is how she keeps it that way.',
         goal: 'Re-open the conversation later',
