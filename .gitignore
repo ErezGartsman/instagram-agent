@@ -52,6 +52,8 @@ beckend/knowledge/
 !tsconfig*.json
 !.eslintrc.json
 !*.eslintrc.json
+# Cockpit design artifacts (source, not data) — e.g. the Power BI theme.
+!fronted/src/cockpit/**/*.json
 
 # ─── Unrelated Projects, Infra & Excluded Folders ────────────────────────────
 מחקר חברות AI/

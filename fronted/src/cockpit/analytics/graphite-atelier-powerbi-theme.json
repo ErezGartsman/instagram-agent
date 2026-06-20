@@ -1,0 +1,43 @@
+{
+  "name": "Graphite Atelier",
+  "dataColors": [
+    "#c9aa71",
+    "#8a9a82",
+    "#a99c8c",
+    "#d8a657",
+    "#7fa97f",
+    "#d08770",
+    "#6f6357",
+    "#f2ebe0"
+  ],
+  "background": "#100c0a",
+  "foreground": "#f2ebe0",
+  "tableAccent": "#c9aa71",
+  "good": "#7fa97f",
+  "neutral": "#a99c8c",
+  "bad": "#d08770",
+  "maximum": "#c9aa71",
+  "center": "#a99c8c",
+  "minimum": "#1a1512",
+  "null": "#6f6357",
+  "visualStyles": {
+    "*": {
+      "*": {
+        "background": [{ "show": true, "color": { "solid": { "color": "#1a1512" } }, "transparency": 0 }],
+        "border": [{ "show": true, "color": { "solid": { "color": "#241d17" } }, "radius": 8 }],
+        "visualHeader": [{ "show": true, "background": { "solid": { "color": "#1a1512" } }, "foreground": { "solid": { "color": "#a99c8c" } } }],
+        "title": [{ "show": true, "fontColor": { "solid": { "color": "#f2ebe0" } }, "background": { "solid": { "color": "#1a1512" } }, "fontFamily": "Segoe UI Semibold", "fontSize": 12 }],
+        "labels": [{ "color": { "solid": { "color": "#a99c8c" } }, "fontFamily": "Segoe UI", "fontSize": 9 }],
+        "categoryAxis": [{ "color": { "solid": { "color": "#a99c8c" } }, "gridlineColor": { "solid": { "color": "#241d17" } }, "fontFamily": "Segoe UI", "fontSize": 9 }],
+        "valueAxis": [{ "color": { "solid": { "color": "#a99c8c" } }, "gridlineColor": { "solid": { "color": "#241d17" } }, "fontFamily": "Segoe UI", "fontSize": 9 }],
+        "legend": [{ "labelColor": { "solid": { "color": "#a99c8c" } }, "fontFamily": "Segoe UI", "fontSize": 9 }]
+      }
+    },
+    "page": {
+      "*": {
+        "background": [{ "color": { "solid": { "color": "#100c0a" } }, "transparency": 0 }],
+        "outspace": [{ "color": { "solid": { "color": "#100c0a" } }, "transparency": 0 }]
+      }
+    }
+  }
+}

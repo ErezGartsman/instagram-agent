@@ -1699,6 +1699,27 @@ def cockpit_queue(user: dict = Depends(require_cockpit_user)):
         return {"status": "error", "detail": "Could not load the work queue."}
 
 
+@app.get("/api/cockpit/powerbi")
+def cockpit_powerbi(user: dict = Depends(require_cockpit_user)):
+    """
+    Power BI embed config for the cockpit Analytics pillar. Same server-built
+    autoAuth embed URL as /api/powerbi/config, but gated by the cockpit's
+    Supabase-JWT allow-list (the legacy route uses the static Bearer key, which
+    the SPA does not hold). Keeps the tenant id (ctid) + report id OUT of the
+    public JS bundle. Returns 503 when unconfigured so the surface degrades to a
+    calm "connect Power BI" state.
+    """
+    if not (settings.powerbi_report_id and settings.powerbi_tenant_id):
+        raise HTTPException(status_code=503, detail="Power BI not configured.")
+    embed_url = (
+        "https://app.powerbi.com/reportEmbed"
+        f"?reportId={settings.powerbi_report_id}"
+        "&autoAuth=true"
+        f"&ctid={settings.powerbi_tenant_id}"
+    )
+    return {"embed_url": embed_url}
+
+
 @app.get("/api/schema", dependencies=[Depends(require_auth)])
 def get_schema():
     """Expose DB schema so the frontend sidebar stays accurate automatically."""
