@@ -21,6 +21,12 @@ const LegacyNexus = lazy(() =>
   import('./App.jsx').then((m) => ({ default: m.default as ComponentType })),
 )
 
+// Public Nexus marketing landing — code-split so its gsap/framer-motion/lucide
+// deps stay out of the cockpit bundle. Renders outside RequireAuth + cockpit-root.
+const LandingPage = lazy(() =>
+  import('./landing/LandingPage').then((m) => ({ default: m.LandingPage })),
+)
+
 const router = createBrowserRouter([
   {
     path: '/',
@@ -37,6 +43,14 @@ const router = createBrowserRouter([
       { path: 'content', element: <ContentPage /> },
       { path: '*', element: <NotFoundPage /> },
     ],
+  },
+  {
+    path: '/landing',
+    element: (
+      <Suspense fallback={null}>
+        <LandingPage />
+      </Suspense>
+    ),
   },
   {
     path: '/legacy/*',
