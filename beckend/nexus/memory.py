@@ -57,13 +57,18 @@ Return ONLY a strict JSON object, nothing else:
   "emotional_state": "<2-4 Hebrew words>",
   "urgency": <integer 1-5>,
   "profile_summary": "<2-4 Hebrew sentences: who this person is, their situation, and what they seem to need — integrate prior knowledge WITH this conversation>",
-  "attributes": {{"relationship_status": "<value or null>", "core_concern": "<value or null>", "communication_style": "<value or null>"}},
+  "attributes": {{"relationship_status": "<value or null>", "core_concern": "<value or null>", "goal": "<value or null>", "communication_style": "<value or null>"}},
   "facts": ["<short durable Hebrew fact grounded in their words>"]}}
 
 Rules:
 - Ground EVERYTHING in their actual words — never invent facts.
 - urgency: 1 = casual/curious, 5 = acute distress / wants help now.
 - attributes: include a key's value only if the conversation supports it; else null.
+- attributes.core_concern: the PROBLEM weighing on them (e.g. "חוסר תקשורת בזוגיות").
+- attributes.goal: the ONE outcome they are working toward, in their own framing
+  (e.g. "להחליט אם להישאר", "לשקם אמון אחרי בגידה", "להבין אם שווה להמשיך מרחוק").
+  Capture it whenever the conversation makes it reasonably clear — null only when
+  there is genuinely no signal. Do NOT invent a goal they did not express.
 - facts: 0-4 concrete, durable facts. Nothing the person did not actually say.
 - HEBREW for all values. No markdown, no commentary, nothing outside the JSON.
 """
