@@ -1,8 +1,10 @@
 /* ─────────────────────────────────────────────────────────────────────────────
    NEXUS Cockpit — design system entry
-   Tokens are the "Graphite Command" Mission Control skin (via ui-ux-pro-max):
-   flat, no shadows / gradients / blur; elevation via surface + border shifts;
-   4px grid; radius 6/8; IBM Plex Sans (UI) + JetBrains Mono (data); one accent (electric blue).
+   Tokens are the "Graphite Atelier" skin (via ui-ux-pro-max) — a quiet sanctuary
+   that hides a precision instrument: flat, no shadows / gradients / blur; elevation
+   via surface + border shifts; 4px grid; radius 6/8; warm obsidian surfaces; one
+   signature accent (champagne bronze). Three typographic voices — Inter (machine UI)
+   · JetBrains Mono (data / numerals) · Fraunces (the human Memory layer).
 
    Tailwind v4 is loaded WITHOUT preflight so the legacy Nexus app at /legacy keeps
    its own base styles; the Cockpit gets a reset scoped to `.cockpit-root` instead.
@@ -15,27 +17,30 @@
 @source "../**/*.{ts,tsx}";
 
 @theme {
-  /* Surfaces — cool slate, layered light→lighter for elevation (never shadows) */
-  --color-bg: #0b0f17;        /* page background            */
-  --color-surface: #131a24;   /* cards, panels, sidebar     */
-  --color-raised: #1f2a38;    /* hover / raised layer       */
-  --color-ink: #e8edf4;       /* primary text (cool white)  */
-  --color-muted: #8b98a9;     /* secondary text (cool grey) */
-  --color-line: rgba(232, 237, 244, 0.1); /* hairline borders (~10%) */
-  --color-accent: #3d8bff;    /* electric blue — the single signature colour */
+  /* Surfaces — warm obsidian, layered dark→lighter for elevation (never shadows) */
+  --color-bg: #100c0a;        /* page background — warm obsidian        */
+  --color-surface: #1a1512;   /* cards, panels, sidebar — espresso      */
+  --color-raised: #241d17;    /* hover / raised layer — warm graphite   */
+  --color-ink: #f2ebe0;       /* primary text — parchment               */
+  --color-muted: #a99c8c;     /* secondary text — warm taupe            */
+  --color-faint: #6f6357;     /* tertiary text — timestamps, hints      */
+  --color-line: rgba(242, 235, 224, 0.09); /* hairline borders (~9%)    */
+  --color-accent: #c9aa71;    /* champagne bronze — the single signature */
+  --color-sage: #8a9a82;      /* quiet supporting tone — live / calm cues */
 
-  /* Status palette */
-  --color-success: #34d399;   /* emerald */
-  --color-warn: #fbbf24;      /* amber   */
-  --color-danger: #f87171;    /* red     */
+  /* Status palette — warm-tuned: attention, never alarm */
+  --color-success: #7fa97f;   /* warm sage-green */
+  --color-warn: #d8a657;      /* muted ochre     */
+  --color-danger: #d08770;    /* terracotta      */
 
   /* Radius — flat system, tightened for a precise instrument feel */
   --radius-control: 6px;
   --radius-card: 8px;
 
-  /* Type — IBM Plex Sans for UI, JetBrains Mono for data / numerals */
-  --font-sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  /* Type — three voices: Inter (machine UI) · JetBrains Mono (data) · Fraunces (human) */
+  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --font-serif: "Fraunces", "Iowan Old Style", Georgia, serif;
 }
 
 @layer base {
@@ -81,6 +86,29 @@
     outline-offset: 2px;
   }
 }
+
+/* ── Graphite Atelier motion — the whisper budget ────────────────────────────
+   The "one-thing" focus mechanic. Unselected queue rows recede via Tailwind
+   opacity transitions; the selected person's thread + memory pane rise into
+   view. The Human (Fraunces) layer recalls a touch slower than the Machine, so
+   it reads as remembered, not rendered. The confidence bar draws once, never
+   loops. All of these inherit the reduced-motion kill-switch above (they live
+   inside .cockpit-root). */
+@keyframes cq-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes cq-rise-slow {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes cq-grow {
+  from { width: 0; }
+  to   { width: var(--w, 0%); }
+}
+.cockpit-root .cq-rise      { animation: cq-rise 0.26s ease both; }
+.cockpit-root .cq-rise-slow { animation: cq-rise-slow 0.42s ease both; }
+.cockpit-root .cq-grow      { animation: cq-grow 0.7s cubic-bezier(0.22, 1, 0.36, 1) both; }
 
 /* Respect reduced-motion across the whole Cockpit (!important beats any layer). */
 @media (prefers-reduced-motion: reduce) {

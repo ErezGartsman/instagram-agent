@@ -11,6 +11,7 @@ export type IconName =
   | 'alert'
   | 'arrowRight'
   | 'clock'
+  | 'queue'
 
 type Props = { name: IconName; size?: number } & Omit<SVGProps<SVGSVGElement>, 'name'>
 
@@ -104,6 +105,14 @@ export function Icon({ name, size = 18, ...rest }: Props) {
         <svg {...common}>
           <circle cx="12" cy="12" r="9" />
           <polyline points="12 7 12 12 15 14" />
+        </svg>
+      )
+    case 'queue':
+      return (
+        <svg {...common}>
+          <line x1="4" y1="6" x2="20" y2="6" />
+          <line x1="4" y1="12" x2="14" y2="12" />
+          <line x1="4" y1="18" x2="10" y2="18" />
         </svg>
       )
   }

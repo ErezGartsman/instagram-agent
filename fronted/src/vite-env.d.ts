@@ -9,6 +9,9 @@ interface ImportMetaEnv {
   readonly VITE_API_URL?: string
   // Set to "off" to disable the dev-only auth bypass under `vite dev`.
   readonly VITE_COCKPIT_DEV_BYPASS?: string
+  // Feature flags — ship a surface dark in prod by leaving these unset.
+  // Set to "1" to force the Work Queue on in a production build.
+  readonly VITE_FEATURE_WORKQUEUE?: string
 }
 
 interface ImportMeta {
