@@ -10,6 +10,7 @@ export type IconName =
   | 'check'
   | 'alert'
   | 'arrowRight'
+  | 'clock'
 
 type Props = { name: IconName; size?: number } & Omit<SVGProps<SVGSVGElement>, 'name'>
 
@@ -96,6 +97,13 @@ export function Icon({ name, size = 18, ...rest }: Props) {
         <svg {...common}>
           <line x1="5" y1="12" x2="19" y2="12" />
           <polyline points="12 5 19 12 12 19" />
+        </svg>
+      )
+    case 'clock':
+      return (
+        <svg {...common}>
+          <circle cx="12" cy="12" r="9" />
+          <polyline points="12 7 12 12 15 14" />
         </svg>
       )
   }
