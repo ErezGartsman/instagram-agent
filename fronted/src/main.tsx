@@ -8,10 +8,12 @@ import { AuthProvider } from './cockpit/auth/AuthProvider'
 import { RequireAuth } from './cockpit/auth/RequireAuth'
 import { AppShell } from './cockpit/shell/AppShell'
 import { OverviewPage } from './cockpit/pages/OverviewPage'
+import { WorkQueuePage } from './cockpit/pages/WorkQueuePage'
 import { PipelinePage } from './cockpit/pages/PipelinePage'
 import { InboxPage } from './cockpit/pages/InboxPage'
 import { ContentPage } from './cockpit/pages/ContentPage'
 import { NotFoundPage } from './cockpit/pages/NotFoundPage'
+import { FEATURES } from './cockpit/lib/flags'
 
 // Legacy Nexus app — preserved at /legacy, code-split so it never ships with the
 // Cockpit bundle. It keeps its own styles, API-key auth, and backend.
@@ -29,6 +31,7 @@ const router = createBrowserRouter([
     ),
     children: [
       { index: true, element: <OverviewPage /> },
+      ...(FEATURES.workQueue ? [{ path: 'queue', element: <WorkQueuePage /> }] : []),
       { path: 'pipeline', element: <PipelinePage /> },
       { path: 'inbox', element: <InboxPage /> },
       { path: 'content', element: <ContentPage /> },

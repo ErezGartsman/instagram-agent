@@ -20,23 +20,40 @@ The WhatsApp funnel must NOT fire the psychological opener on a bare greeting
 bare greeting, stay silent or send an ultra-brief, human acknowledgment. The bot
 is a person, not a tripwire.
 
-## 4. Cockpit design discipline — "Graphite Command" is the source of truth (Sprint 5 guardrail)
-The Cockpit's visual system is **"Graphite Command"** — a high-contrast, dark "Mission
-Control" aesthetic for analytics-heavy intelligence software, derived via the
-`ui-ux-pro-max` skill (Dark-Mode OLED × Executive Dashboard). It permanently supersedes
-the earlier buckssauce browns. Canonical tokens live in `fronted/src/cockpit/index.css`
-(`@theme`); every component references the semantic Tailwind utilities only — `bg-bg`,
-`bg-surface`, `bg-raised`, `text-ink`, `text-muted`, `border-line`, `text-accent`,
-`text-success` / `text-warn` / `text-danger` — never raw hex.
+## 4. Cockpit design discipline — "Graphite Atelier" is the absolute source of truth (Sprint 5 guardrail)
+The Cockpit's visual system is **"Graphite Atelier"** — a "quiet sanctuary that hides a
+precision instrument": the calm, low-lit warmth of a private study fused with the razor-sharp
+organization of a command center. Derived via the `ui-ux-pro-max` skill and locked by Erez
+on 2026-06-20, it **permanently supersedes "Graphite Command"** (the cool-slate / electric-blue
+skin) and the earlier buckssauce browns. References: Linear (typography, keyboard-first),
+Notion dark (editorial negative space), an Aman-resort lounge at night (warm ambient light,
+nothing screaming). Canonical tokens live in `fronted/src/cockpit/index.css` (`@theme`); every
+component references the semantic Tailwind utilities only — `bg-bg`, `bg-surface`, `bg-raised`,
+`text-ink`, `text-muted`, `text-faint`, `border-line`, `text-accent`, `text-sage`,
+`text-success` / `text-warn` / `text-danger`, `font-serif` — never raw hex.
 
-Primitives: bg `#0b0f17` · surface `#131a24` · raised `#1f2a38` · ink `#e8edf4` ·
-muted `#8b98a9` · line cream/10% · accent `#3d8bff` (electric blue — the one signature) ·
-success `#34d399` · warn `#fbbf24` · danger `#f87171`. Radius 6 (controls) / 8 (cards).
-Type: IBM Plex Sans for UI, **JetBrains Mono for all data/numerals** (KPIs, counts,
-timestamps — `tabular-nums`). Discipline: flat — no shadows / gradients / blur; elevation
-via surface + border shifts only; one signature element, everything else quiet; sentence
-case; two weights. Apply real craft — never templated or default-looking UI. When
-extending the system consult `ui-ux-pro-max`; adhere to this aesthetic, don't drift.
+Primitives (warm obsidian): bg `#100c0a` · surface `#1a1512` · raised `#241d17` · ink `#f2ebe0`
+(parchment) · muted `#a99c8c` · faint `#6f6357` · line parchment/9% · accent `#c9aa71`
+(**champagne bronze — the one signature**, appears once with weight per view) · sage `#8a9a82`
+(quiet supporting tone, live/calm cues, never competes with bronze) · success `#7fa97f` ·
+warn `#d8a657` · danger `#d08770` (warm — attention, never alarm). Radius 6 (controls) / 8 (cards).
+
+**Three typographic voices** — the signature risk, made structural (Machine vs. Human):
+**Inter** for all UI / queue / system data (the Machine); **JetBrains Mono** `tabular-nums` for
+every numeral — KPIs, counts, %, timestamps (the Instrument); **Fraunces** (light, soft optical)
+for the Memory layer only — the emotional summary / core human problem (the Human). The sans stays
+quiet; the serif speaks.
+
+**Motion** — the whisper budget (CSS only, never a heavy anim lib; honors `prefers-reduced-motion`
+via the global guard): the "one-thing" focus mechanic — on select, unselected queue rows recede
+to 40% opacity (~260ms) while the thread + memory rise (`cq-rise`); the Human/Fraunces layer
+recalls a touch slower (`cq-rise-slow`, ~420ms); the confidence bar draws once (`cq-grow`), never
+loops; hover is color/opacity only, never scale.
+
+Discipline: flat — no shadows / gradients / blur; elevation via surface + border shifts only; one
+signature element, everything else quiet; sentence case; two weights. Apply real craft — never
+templated or default-looking UI. When extending the system consult `ui-ux-pro-max`; adhere to this
+aesthetic, don't drift.
 
 ---
 
