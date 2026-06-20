@@ -42,6 +42,7 @@ from nexus import db as nexus_db
 from nexus import erasure as nexus_erasure
 from nexus import hooks as nexus_hooks
 from nexus import identity as nexus_identity
+from nexus import interactions as nexus_interactions
 from nexus import memory as nexus_memory
 
 
@@ -1543,6 +1544,59 @@ def cockpit_me(user: dict = Depends(require_cockpit_user)):
         "email": user.get("email"),
         "role":  user.get("role"),
     }
+
+
+@app.get("/api/cockpit/pipeline")
+def cockpit_pipeline(user: dict = Depends(require_cockpit_user)):
+    """
+    Open opportunities grouped into the forward-only pipeline stages, for the
+    Cockpit lead board. One open opportunity per person (closed_at IS NULL),
+    enriched with the profile summary (intent) and the last-activity timestamp.
+    """
+    stages = nexus_interactions.PIPELINE_STAGES
+    buckets: dict[str, list] = {s: [] for s in stages}
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT o.id, o.stage, o.source_channel, o.stage_entered_at, "
+                    "       p.id, p.display_name, p.wa_ref_code, "
+                    "       pp.summary, li.last_at "
+                    "FROM opportunities o "
+                    "JOIN person p ON p.id = o.person_id "
+                    "LEFT JOIN person_profile pp ON pp.person_id = p.id "
+                    "LEFT JOIN (SELECT person_id, MAX(occurred_at) AS last_at "
+                    "           FROM interactions GROUP BY person_id) li "
+                    "       ON li.person_id = p.id "
+                    "WHERE o.closed_at IS NULL "
+                    "ORDER BY COALESCE(li.last_at, o.stage_entered_at) DESC NULLS LAST"
+                )
+                rows = cur.fetchall()
+        for r in rows:
+            (opp_id, stage, channel, stage_entered_at, person_id,
+             display_name, wa_ref, summary, last_at) = r
+            if stage not in buckets:
+                continue  # terminal / unknown stage — not shown on the board
+            buckets[stage].append({
+                "id":               str(opp_id),
+                "person_id":        str(person_id),
+                "name":             display_name or (f"Lead {wa_ref}" if wa_ref else "Lead"),
+                "wa_ref":           wa_ref,
+                "channel":          channel,
+                "intent":           summary,
+                "last_contacted":   last_at.isoformat() if last_at else None,
+                "stage_entered_at": stage_entered_at.isoformat() if stage_entered_at else None,
+            })
+        return {
+            "status": "success",
+            "stages": [
+                {"stage": s, "count": len(buckets[s]), "leads": buckets[s]}
+                for s in stages
+            ],
+        }
+    except Exception as e:
+        logger.error(f"[cockpit/pipeline] query failed: {e}")
+        return {"status": "error", "detail": "Could not load the pipeline."}
 
 
 @app.get("/api/schema", dependencies=[Depends(require_auth)])

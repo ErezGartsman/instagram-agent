@@ -159,6 +159,38 @@ class TestCockpitMe:
         r = client.get("/api/cockpit/me", headers={"Authorization": f"Bearer {token}"})
         assert r.status_code == 200
 
+    def test_pipeline_requires_auth(self, client):
+        main.settings.supabase_jwt_secret = self.SECRET
+        r = client.get("/api/cockpit/pipeline")
+        assert r.status_code == 401
+
+    def test_pipeline_groups_and_enriches(self, client):
+        import datetime as _dt
+        main.settings.supabase_jwt_secret = self.SECRET
+        main.settings.cockpit_allowed_emails = ""
+        token = _cockpit_token(self.SECRET)
+        now = _dt.datetime(2026, 6, 18, 12, 0, 0)
+        rows = [
+            ("opp-1", "engaged", "whatsapp", now, "p1", "Dana K.", "BR-7F2A",
+             "Wants couples therapy; hesitant about cost.", now),
+            ("opp-2", "booked", "whatsapp", now, "p2", None, "BR-3D8E", None, now),
+        ]
+        _patch_conn(client, fetchall=rows)
+        r = client.get("/api/cockpit/pipeline", headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 200
+        data = r.json()
+        assert [s["stage"] for s in data["stages"]] == [
+            "engaged", "qualified", "captured", "briefed", "booked",
+        ]
+        by = {s["stage"]: s for s in data["stages"]}
+        assert by["engaged"]["count"] == 1
+        lead = by["engaged"]["leads"][0]
+        assert lead["name"] == "Dana K."
+        assert lead["intent"] == "Wants couples therapy; hesitant about cost."
+        assert lead["last_contacted"] is not None
+        # display_name None -> "Lead {wa_ref}" fallback
+        assert by["booked"]["leads"][0]["name"] == "Lead BR-3D8E"
+
 
 # ─── 1. SQL Validation ────────────────────────────────────────────────────────
 
