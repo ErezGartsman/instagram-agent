@@ -9,6 +9,7 @@ import { RequireAuth } from './cockpit/auth/RequireAuth'
 import { AppShell } from './cockpit/shell/AppShell'
 import { OverviewPage } from './cockpit/pages/OverviewPage'
 import { WorkQueuePage } from './cockpit/pages/WorkQueuePage'
+import { AnalyticsPage } from './cockpit/pages/AnalyticsPage'
 import { PipelinePage } from './cockpit/pages/PipelinePage'
 import { InboxPage } from './cockpit/pages/InboxPage'
 import { ContentPage } from './cockpit/pages/ContentPage'
@@ -38,6 +39,7 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <OverviewPage /> },
       ...(FEATURES.workQueue ? [{ path: 'queue', element: <WorkQueuePage /> }] : []),
+      ...(FEATURES.analytics ? [{ path: 'analytics', element: <AnalyticsPage /> }] : []),
       { path: 'pipeline', element: <PipelinePage /> },
       { path: 'inbox', element: <InboxPage /> },
       { path: 'content', element: <ContentPage /> },

@@ -8,4 +8,6 @@
 export const FEATURES = {
   /** Sprint 5 · the 3-pane Work Queue (Graphite Atelier). */
   workQueue: import.meta.env.DEV || import.meta.env.VITE_FEATURE_WORKQUEUE === '1',
+  /** Sprint 5 · the Analytics pillar (embedded Power BI). */
+  analytics: import.meta.env.DEV || import.meta.env.VITE_FEATURE_ANALYTICS === '1',
 } as const
