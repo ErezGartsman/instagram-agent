@@ -25,7 +25,11 @@ export const NAV_SECTIONS: NavSection[] = [
   },
   {
     label: 'Studio',
-    items: [{ to: '/content', label: 'Content', icon: 'sparkle' }],
+    items: [
+      ...(FEATURES.content
+        ? [{ to: '/content', label: 'Content', icon: 'sparkle' as IconName }]
+        : []),
+    ],
   },
   {
     label: 'Insight',
