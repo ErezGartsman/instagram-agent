@@ -1,49 +1,51 @@
 import { API_BASE } from './api'
 import type { Stage } from './pipeline'
 
-// The Analytics pillar: an Executive KPI strip (our own, from real CRM data)
-// over a single framed, segmented Power BI embed. The dense social + report
-// richness lives inside Power BI; the calm at-a-glance numbers are ours.
+// The Analytics pillar — a NATIVE Bento dashboard (no Power BI embed). The data
+// lives in our own Supabase (social + CRM); the frontend draws every card and
+// chart by hand in the Graphite Atelier language.
 
-/**
- * Fetch the cockpit Power BI embed URL. Returns null when Power BI isn't
- * configured (HTTP 503) so the surface can degrade to a calm "connect" state
- * rather than erroring. Throws only on unexpected failures.
- */
-export async function fetchPowerBiEmbed(token: string, signal?: AbortSignal): Promise<string | null> {
-  const res = await fetch(`${API_BASE}/api/cockpit/powerbi`, {
+export type GrowthPoint = { week: string; followers: number }
+export type TopPost = { shortcode: string; likes: number; comments: number }
+export type PipelineStage = { stage: string; count: number }
+
+export type AnalyticsData = {
+  community: {
+    /** Operator-maintained real follower total (IG + TikTok); the others are live SQL. */
+    size: number
+    followers_tracked: number
+    likes: number
+    comments: number
+    posts: number
+    growth: GrowthPoint[]
+    top_posts: TopPost[]
+  }
+  pipeline: PipelineStage[]
+  booked: number
+}
+
+export async function fetchAnalytics(token: string, signal?: AbortSignal): Promise<AnalyticsData> {
+  const res = await fetch(`${API_BASE}/api/cockpit/analytics`, {
     headers: { Authorization: `Bearer ${token}` },
     signal,
   })
-  if (res.status === 503) return null
-  if (!res.ok) throw new Error(`powerbi ${res.status}`)
-  const data = (await res.json()) as { embed_url?: string }
-  return data.embed_url ?? null
+  if (!res.ok) throw new Error(`analytics ${res.status}`)
+  return (await res.json()) as AnalyticsData
 }
 
-export type ReportView = { key: string; label: string; pageName: string }
-
-// The segmented report selector. `pageName` deep-links a Power BI report page
-// (its section ObjectId) — set these to your report's page names to make each
-// segment jump to its view; empty = the report's default page. Find the IDs via
-// the Power BI REST API: GET /reports/{reportId}/pages.
-export const REPORT_VIEWS: ReportView[] = [
-  { key: 'pipeline', label: 'Pipeline', pageName: '' },
-  { key: 'community', label: 'Community', pageName: '' },
-  { key: 'bookings', label: 'Bookings', pageName: '' },
-]
-
-/** Append a Power BI page deep-link to the embed URL when one is configured. */
-export function embedUrlForView(embedUrl: string, view: ReportView): string {
-  return view.pageName ? `${embedUrl}&pageName=${encodeURIComponent(view.pageName)}` : embedUrl
+/** Compact number for KPI tiles: 709 · 11k · 75.2k · 268k. */
+export function compact(n: number): string {
+  if (n < 1000) return String(n)
+  const v = n / 1000
+  const d = v >= 100 || Number.isInteger(v) ? 0 : 1
+  return `${v.toFixed(d)}k`
 }
 
 export type Kpi = { label: string; value: string; note?: string }
 
 /**
- * Executive KPIs derived from the live pipeline board — real counts only, no
- * invented rates. (The 75k IG/TikTok community analytics live inside the Power
- * BI report, not here, since we don't track them server-side yet.)
+ * Executive KPIs derived from the live pipeline board — real counts only (used
+ * by the Overview pulse). No invented rates.
  */
 export function deriveKpis(stages: Stage[]): Kpi[] {
   const count = (s: string) => stages.find((x) => x.stage === s)?.count ?? 0
@@ -56,4 +58,39 @@ export function deriveKpis(stages: Stage[]): Kpi[] {
     { label: 'Qualified+', value: String(qualifiedPlus), note: 'qualified → booked' },
     { label: 'Booked', value: String(booked), note: 'north-star metric' },
   ]
+}
+
+// Dev-bypass sample so the Bento is populated during local UI work. Guarded by
+// import.meta.env.DEV → dead-code-eliminated from production builds.
+const sampleGrowth: GrowthPoint[] = import.meta.env.DEV
+  ? [62, 65, 64, 70, 72, 78, 80, 88, 92, 101, 108, 120].map((followers, i) => ({
+      week: `2026-${String(4 + Math.floor(i / 4)).padStart(2, '0')}-${String((i % 4) * 7 + 1).padStart(2, '0')}`,
+      followers: followers * 600,
+    }))
+  : []
+
+export const SAMPLE_ANALYTICS: AnalyticsData = {
+  community: {
+    size: 75200,
+    followers_tracked: 20000,
+    likes: 268000,
+    comments: 11000,
+    posts: 709,
+    growth: sampleGrowth,
+    top_posts: [
+      { shortcode: 'C8aXk2Lp', likes: 4120, comments: 318 },
+      { shortcode: 'C7mQ9rTe', likes: 3340, comments: 271 },
+      { shortcode: 'C6vB1nWq', likes: 2890, comments: 204 },
+      { shortcode: 'C5pL7yHd', likes: 2410, comments: 188 },
+      { shortcode: 'C4kR3zSx', likes: 1980, comments: 142 },
+    ],
+  },
+  pipeline: [
+    { stage: 'engaged', count: 3 },
+    { stage: 'qualified', count: 2 },
+    { stage: 'captured', count: 1 },
+    { stage: 'briefed', count: 1 },
+    { stage: 'booked', count: 1 },
+  ],
+  booked: 3,
 }

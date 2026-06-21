@@ -620,6 +620,11 @@ _DEFAULT_CONFIG = {
     # Calendly booking link: user-specific, so it lives in app_config (not the
     # repo). Empty default => the lead-in is sent without a link.
     "calendly.url": "",
+    # Analytics — the operator-maintained community size (real IG + TikTok
+    # follower total). The DB's followers table is only a partial scrape, so this
+    # is the truthful headline figure, tuned live in app_config; every other
+    # analytics number is live SQL.
+    "analytics.community_size": "75000",
 }
 
 _CONFIG_TTL      = 300        # seconds — edits in Supabase take effect within this window
@@ -1712,25 +1717,86 @@ def cockpit_queue(user: dict = Depends(require_cockpit_user)):
         return {"status": "error", "detail": "Could not load the work queue."}
 
 
-@app.get("/api/cockpit/powerbi")
-def cockpit_powerbi(user: dict = Depends(require_cockpit_user)):
+@app.get("/api/cockpit/analytics")
+def cockpit_analytics(user: dict = Depends(require_cockpit_user)):
     """
-    Power BI embed config for the cockpit Analytics pillar. Same server-built
-    autoAuth embed URL as /api/powerbi/config, but gated by the cockpit's
-    Supabase-JWT allow-list (the legacy route uses the static Bearer key, which
-    the SPA does not hold). Keeps the tenant id (ctid) + report id OUT of the
-    public JS bundle. Returns 503 when unconfigured so the surface degrades to a
-    calm "connect Power BI" state.
+    Native Analytics for the cockpit Bento dashboard — NO Power BI embed. One
+    payload aggregating the social tables (followers / posts / comments / likers)
+    and the CRM funnel (opportunities / bookings); the frontend draws every chart
+    natively (recharts, Atelier-themed).
+
+    The headline community size is the operator-maintained figure in app_config
+    (`analytics.community_size`) — the DB followers table is a partial scrape, so
+    that one number is curated while every other figure is live SQL.
     """
-    if not (settings.powerbi_report_id and settings.powerbi_tenant_id):
-        raise HTTPException(status_code=503, detail="Power BI not configured.")
-    embed_url = (
-        "https://app.powerbi.com/reportEmbed"
-        f"?reportId={settings.powerbi_report_id}"
-        "&autoAuth=true"
-        f"&ctid={settings.powerbi_tenant_id}"
-    )
-    return {"embed_url": embed_url}
+    try:
+        community_size = int(_get_config("analytics.community_size") or 0)
+    except (TypeError, ValueError):
+        community_size = 0
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM followers")
+                followers_tracked = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM posts")
+                posts = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM likers")
+                likes = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM comments")
+                comments = cur.fetchone()[0]
+                # Follower growth — cumulative tracked follows by week.
+                cur.execute(
+                    "SELECT to_char(date_trunc('week', followed_at), 'YYYY-MM-DD'), COUNT(*) "
+                    "FROM followers WHERE followed_at IS NOT NULL GROUP BY 1 ORDER BY 1"
+                )
+                weekly = cur.fetchall()
+                # Top posts by likes (with their comment counts).
+                cur.execute(
+                    "WITH lk AS (SELECT post_shortcode, COUNT(*) c FROM likers GROUP BY 1), "
+                    "     cm AS (SELECT post_shortcode, COUNT(*) c FROM comments GROUP BY 1) "
+                    "SELECT p.post_shortcode, COALESCE(lk.c, 0), COALESCE(cm.c, 0) "
+                    "FROM posts p "
+                    "LEFT JOIN lk ON lk.post_shortcode = p.post_shortcode "
+                    "LEFT JOIN cm ON cm.post_shortcode = p.post_shortcode "
+                    "ORDER BY COALESCE(lk.c, 0) DESC LIMIT 6"
+                )
+                top = cur.fetchall()
+                # CRM funnel — open opportunities by stage.
+                cur.execute(
+                    "SELECT stage, COUNT(*) FROM opportunities WHERE closed_at IS NULL GROUP BY stage"
+                )
+                stage_rows = cur.fetchall()
+                cur.execute("SELECT COUNT(*) FROM bookings")
+                bookings = cur.fetchone()[0]
+
+        running, growth = 0, []
+        for wk, n in weekly:
+            running += n
+            growth.append({"week": wk, "followers": running})
+        growth = growth[-12:]
+        stages = {s: c for (s, c) in stage_rows}
+        return {
+            "status": "success",
+            "community": {
+                "size": community_size,
+                "followers_tracked": followers_tracked,
+                "likes": likes,
+                "comments": comments,
+                "posts": posts,
+                "growth": growth,
+                "top_posts": [
+                    {"shortcode": sc, "likes": lk, "comments": cm} for (sc, lk, cm) in top
+                ],
+            },
+            "pipeline": [
+                {"stage": s, "count": stages.get(s, 0)}
+                for s in nexus_interactions.PIPELINE_STAGES
+            ],
+            "booked": bookings,
+        }
+    except Exception as e:
+        logger.error(f"[cockpit/analytics] query failed: {e}")
+        return {"status": "error", "detail": "Could not load analytics."}
 
 
 # ── Content Studio (Sprint 5, the Studio pillar) — the cockpit's first write

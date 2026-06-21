@@ -9,7 +9,6 @@ import { RequireAuth } from './cockpit/auth/RequireAuth'
 import { AppShell } from './cockpit/shell/AppShell'
 import { OverviewPage } from './cockpit/pages/OverviewPage'
 import { WorkQueuePage } from './cockpit/pages/WorkQueuePage'
-import { AnalyticsPage } from './cockpit/pages/AnalyticsPage'
 import { PipelinePage } from './cockpit/pages/PipelinePage'
 import { InboxPage } from './cockpit/pages/InboxPage'
 import { ContentStudioPage } from './cockpit/pages/ContentStudioPage'
@@ -28,6 +27,11 @@ const LandingPage = lazy(() =>
   import('./landing/LandingPage').then((m) => ({ default: m.LandingPage })),
 )
 
+// Analytics — code-split so recharts stays out of the initial cockpit bundle.
+const AnalyticsPage = lazy(() =>
+  import('./cockpit/pages/AnalyticsPage').then((m) => ({ default: m.AnalyticsPage })),
+)
+
 const router = createBrowserRouter([
   {
     path: '/',
@@ -39,7 +43,9 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <OverviewPage /> },
       ...(FEATURES.workQueue ? [{ path: 'queue', element: <WorkQueuePage /> }] : []),
-      ...(FEATURES.analytics ? [{ path: 'analytics', element: <AnalyticsPage /> }] : []),
+      ...(FEATURES.analytics
+        ? [{ path: 'analytics', element: <Suspense fallback={null}><AnalyticsPage /></Suspense> }]
+        : []),
       { path: 'pipeline', element: <PipelinePage /> },
       { path: 'inbox', element: <InboxPage /> },
       ...(FEATURES.content ? [{ path: 'content', element: <ContentStudioPage /> }] : []),
