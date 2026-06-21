@@ -1,31 +1,210 @@
-import { PageHeader } from '../components/PageHeader'
-import { Placeholder } from '../components/Placeholder'
+import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
+import type { CSSProperties } from 'react'
+import { Icon } from '../components/Icon'
+import type { IconName } from '../components/Icon'
 import { StatCard } from '../components/StatCard'
+import { useAuth } from '../auth/AuthProvider'
+import { FEATURES } from '../lib/flags'
+import { fetchPipeline, SAMPLE_PIPELINE } from '../lib/pipeline'
+import { deriveKpis, type Kpi } from '../lib/analytics'
+import { fetchQueue, rankQueue, SAMPLE_QUEUE, type QueueItem } from '../lib/workqueue'
 
-const STATS = [
-  { label: 'Open leads', value: '—', note: 'Connects in Ticket 5.1' },
-  { label: 'Unread messages', value: '—', note: 'Connects in Ticket 5.2' },
-  { label: 'Booked consultations', value: '—', note: 'North-star metric' },
-  { label: 'Reply rate', value: '—', note: 'Awaiting data' },
-]
+type State =
+  | { kind: 'loading' }
+  | { kind: 'error' }
+  | { kind: 'ready'; kpis: Kpi[]; top: QueueItem | null; pending: number; sample: boolean }
 
+function greeting(): string {
+  const h = new Date().getHours()
+  if (h < 12) return 'Good morning'
+  if (h < 18) return 'Good afternoon'
+  return 'Good evening'
+}
+
+const DATELINE = new Date().toLocaleDateString(undefined, {
+  weekday: 'long',
+  month: 'long',
+  day: 'numeric',
+})
+
+/**
+ * Ticket 5.4 — the Overview, the OS home pulse. A calm daily launchpad in three
+ * executive bands: a Fraunces greeting, the real pipeline KPIs (Instrument
+ * voice), and the single highest-priority next move (the one bronze signature)
+ * straight from the Work Queue. A pulse, not a control room.
+ */
 export function OverviewPage() {
-  return (
-    <div className="mx-auto max-w-[1200px]">
-      <PageHeader title="Overview" subtitle="Your command center at a glance." />
+  const { session, devBypass } = useAuth()
+  const [state, setState] = useState<State>({ kind: 'loading' })
 
-      <div className="mb-8 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        {STATS.map((s) => (
-          <StatCard key={s.label} {...s} />
+  useEffect(() => {
+    if (devBypass) {
+      const ranked = rankQueue(SAMPLE_QUEUE)
+      setState({
+        kind: 'ready',
+        kpis: deriveKpis(SAMPLE_PIPELINE),
+        top: ranked[0] ?? null,
+        pending: ranked.length,
+        sample: true,
+      })
+      return
+    }
+    const token = session?.access_token
+    if (!token) {
+      setState({ kind: 'loading' })
+      return
+    }
+    const controller = new AbortController()
+    setState({ kind: 'loading' })
+    Promise.all([
+      fetchPipeline(token, controller.signal),
+      fetchQueue(token, controller.signal),
+    ])
+      .then(([stages, items]) => {
+        const ranked = rankQueue(items)
+        setState({
+          kind: 'ready',
+          kpis: deriveKpis(stages),
+          top: ranked[0] ?? null,
+          pending: ranked.length,
+          sample: false,
+        })
+      })
+      .catch((err: unknown) => {
+        if ((err as { name?: string } | null)?.name !== 'AbortError') setState({ kind: 'error' })
+      })
+    return () => controller.abort()
+  }, [session?.access_token, devBypass])
+
+  return (
+    <div className="mx-auto max-w-[1100px]">
+      <header className="mb-8">
+        <h2 className="font-serif text-3xl font-light leading-tight text-ink">{greeting()}.</h2>
+        <p className="mt-1.5 font-mono text-[11px] uppercase tracking-[0.14em] text-faint">{DATELINE}</p>
+      </header>
+
+      {state.kind === 'loading' && <PulseSkeleton />}
+      {state.kind === 'error' && <PulseError />}
+
+      {state.kind === 'ready' && (
+        <>
+          <div className="mb-9 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            {state.kpis.map((k) => (
+              <StatCard key={k.label} {...k} />
+            ))}
+          </div>
+
+          <div className="mb-3 font-mono text-[10px] uppercase tracking-[0.14em] text-faint">
+            Where to start
+          </div>
+          {state.top ? (
+            <NextMove top={state.top} pending={state.pending} />
+          ) : (
+            <ClearState />
+          )}
+
+          <div className="mt-9 flex flex-wrap gap-3">
+            <QuickJump to="/pipeline" icon="columns" label="Pipeline" />
+            {FEATURES.content && <QuickJump to="/content" icon="sparkle" label="Content Studio" />}
+            {FEATURES.analytics && <QuickJump to="/analytics" icon="chart" label="Analytics" />}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+function NextMove({ top, pending }: { top: QueueItem; pending: number }) {
+  const queueLive = FEATURES.workQueue
+  const to = queueLive ? '/queue' : '/pipeline'
+  return (
+    <Link
+      to={to}
+      className="group block rounded-card border border-line bg-surface p-5 transition-colors hover:bg-raised"
+    >
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="rounded bg-accent/15 px-1.5 py-px font-mono text-[10px] uppercase tracking-wider text-accent">
+              Next
+            </span>
+            <span className="truncate text-sm font-medium text-ink">{top.name}</span>
+          </div>
+          <div className="mt-2 text-base text-ink">{top.action}</div>
+          <div className="mt-1.5 text-xs leading-relaxed text-muted">
+            <span className="text-faint">Reason · </span>
+            {top.reason}
+          </div>
+        </div>
+        <div className="flex shrink-0 flex-col items-end gap-2.5">
+          <span className="font-mono text-sm tabular-nums text-accent">{top.confidence}%</span>
+          <span className="flex items-center gap-1 text-xs text-muted transition-colors group-hover:text-ink">
+            {queueLive ? 'Open the queue' : 'Open the board'}
+            <Icon name="arrowRight" size={13} />
+          </span>
+        </div>
+      </div>
+      <span className="mt-4 block h-[3px] w-full overflow-hidden rounded-full bg-ink/10">
+        <span
+          className="cq-grow block h-full rounded-full bg-accent"
+          style={{ '--w': `${top.confidence}%` } as CSSProperties}
+        />
+      </span>
+      <div className="mt-3 font-mono text-[10px] text-faint">
+        {pending} {pending === 1 ? 'person' : 'people'} waiting on a next move
+      </div>
+    </Link>
+  )
+}
+
+function QuickJump({ to, icon, label }: { to: string; icon: IconName; label: string }) {
+  return (
+    <Link
+      to={to}
+      className="inline-flex items-center gap-2 rounded-control border border-line px-3.5 py-2 text-sm text-muted transition-colors hover:bg-raised hover:text-ink"
+    >
+      <Icon name={icon} size={15} />
+      {label}
+    </Link>
+  )
+}
+
+function ClearState() {
+  return (
+    <div className="flex flex-col items-center rounded-card border border-line bg-surface px-8 py-12 text-center">
+      <span className="mb-3 grid h-11 w-11 place-items-center rounded-control border border-line bg-raised text-success">
+        <Icon name="check" size={20} />
+      </span>
+      <h3 className="text-sm font-semibold text-ink">You&rsquo;re all caught up</h3>
+      <p className="mt-1.5 max-w-sm text-sm text-muted">No one is waiting on a next move right now.</p>
+    </div>
+  )
+}
+
+function PulseSkeleton() {
+  return (
+    <div aria-hidden>
+      <div className="mb-9 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <div key={i} className="h-24 animate-pulse rounded-card border border-line bg-surface" />
         ))}
       </div>
+      <div className="h-28 animate-pulse rounded-card border border-line bg-surface" />
+    </div>
+  )
+}
 
-      <Placeholder
-        icon="grid"
-        title="The Overview dashboard lands in Ticket 5.4"
-        body="Once the pipeline and inbox are live, this surface unifies the funnel — booked consultations, lead velocity, and channel health — in one calm view."
-        ticket="Ticket 5.4 · Overview"
-      />
+function PulseError() {
+  return (
+    <div className="flex flex-col items-center rounded-card border border-line bg-surface px-8 py-16 text-center">
+      <span className="mb-4 grid h-12 w-12 place-items-center rounded-control border border-line bg-raised text-danger">
+        <Icon name="alert" size={22} />
+      </span>
+      <h3 className="text-base font-semibold text-ink">Couldn&rsquo;t load your overview</h3>
+      <p className="mt-2 max-w-md text-sm text-muted">
+        The pulse couldn&rsquo;t be reached. Check your connection and reload.
+      </p>
     </div>
   )
 }
