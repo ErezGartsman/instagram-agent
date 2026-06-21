@@ -105,9 +105,9 @@ export function OverviewPage() {
           )}
 
           <div className="mt-9 flex flex-wrap gap-3">
-            <QuickJump to="/pipeline" icon="columns" label="Pipeline" />
-            {FEATURES.content && <QuickJump to="/content" icon="sparkle" label="Content Studio" />}
-            {FEATURES.analytics && <QuickJump to="/analytics" icon="chart" label="Analytics" />}
+            <QuickJump to="/app/pipeline" icon="columns" label="Pipeline" />
+            {FEATURES.content && <QuickJump to="/app/content" icon="sparkle" label="Content Studio" />}
+            {FEATURES.analytics && <QuickJump to="/app/analytics" icon="chart" label="Analytics" />}
           </div>
         </>
       )}
@@ -117,7 +117,7 @@ export function OverviewPage() {
 
 function NextMove({ top, pending }: { top: QueueItem; pending: number }) {
   const queueLive = FEATURES.workQueue
-  const to = queueLive ? '/queue' : '/pipeline'
+  const to = queueLive ? '/app/queue' : '/app/pipeline'
   return (
     <Link
       to={to}

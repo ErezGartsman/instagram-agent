@@ -12,22 +12,22 @@ export type NavSection = { label?: string; items: NavItem[] }
  * Insight (measure). Feature-flagged surfaces stay dark until ready.
  */
 export const NAV_SECTIONS: NavSection[] = [
-  { items: [{ to: '/', label: 'Overview', icon: 'grid' }] },
+  { items: [{ to: '/app', label: 'Overview', icon: 'grid' }] },
   {
     label: 'Work',
     items: [
       ...(FEATURES.workQueue
-        ? [{ to: '/queue', label: 'Work queue', icon: 'queue' as IconName }]
+        ? [{ to: '/app/queue', label: 'Work queue', icon: 'queue' as IconName }]
         : []),
-      { to: '/pipeline', label: 'Pipeline', icon: 'columns' },
-      { to: '/inbox', label: 'Inbox', icon: 'inbox' },
+      { to: '/app/pipeline', label: 'Pipeline', icon: 'columns' },
+      { to: '/app/inbox', label: 'Inbox', icon: 'inbox' },
     ],
   },
   {
     label: 'Studio',
     items: [
       ...(FEATURES.content
-        ? [{ to: '/content', label: 'Content', icon: 'sparkle' as IconName }]
+        ? [{ to: '/app/content', label: 'Content', icon: 'sparkle' as IconName }]
         : []),
     ],
   },
@@ -35,7 +35,7 @@ export const NAV_SECTIONS: NavSection[] = [
     label: 'Insight',
     items: [
       ...(FEATURES.analytics
-        ? [{ to: '/analytics', label: 'Analytics', icon: 'chart' as IconName }]
+        ? [{ to: '/app/analytics', label: 'Analytics', icon: 'chart' as IconName }]
         : []),
     ],
   },

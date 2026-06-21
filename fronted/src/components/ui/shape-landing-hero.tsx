@@ -119,7 +119,7 @@ export function HeroGeometric({
 
           <motion.div custom={3} variants={fadeUpVariants} initial="hidden" animate="visible">
             <a
-              href="/"
+              href="/app"
               className="inline-flex items-center gap-2 rounded-full border border-[#c9aa71]/40 bg-[#c9aa71]/10 px-5 py-2.5 text-sm text-[#e8cf9c] transition-colors hover:bg-[#c9aa71]/20"
             >
               Enter the cockpit

@@ -13,7 +13,7 @@ export function NotFoundPage() {
         ticket="404"
       />
       <div className="mt-6 text-center">
-        <Link to="/" className="text-sm text-accent transition-opacity hover:opacity-80">
+        <Link to="/app" className="text-sm text-accent transition-opacity hover:opacity-80">
           Return to Overview
         </Link>
       </div>

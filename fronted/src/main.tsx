@@ -33,8 +33,18 @@ const AnalyticsPage = lazy(() =>
 )
 
 const router = createBrowserRouter([
+  // The public front door — the premium marketing landing at the root.
   {
     path: '/',
+    element: (
+      <Suspense fallback={<div className="min-h-screen w-full bg-[#100c0a]" />}>
+        <LandingPage />
+      </Suspense>
+    ),
+  },
+  // The cockpit (CRM) — behind Supabase auth at /app. index = the Overview pulse.
+  {
+    path: '/app',
     element: (
       <RequireAuth>
         <AppShell />
@@ -51,14 +61,6 @@ const router = createBrowserRouter([
       ...(FEATURES.content ? [{ path: 'content', element: <ContentStudioPage /> }] : []),
       { path: '*', element: <NotFoundPage /> },
     ],
-  },
-  {
-    path: '/landing',
-    element: (
-      <Suspense fallback={null}>
-        <LandingPage />
-      </Suspense>
-    ),
   },
   {
     path: '/legacy/*',
