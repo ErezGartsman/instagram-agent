@@ -1,19 +1,19 @@
-import HeroSection_05 from '@/components/ui/hero-section-with-gradient'
+import { HeroGeometric } from '@/components/ui/shape-landing-hero'
 
 /**
  * Public Nexus marketing landing page, served at /landing.
  *
- * Fully isolated from the Graphite Atelier cockpit: it renders OUTSIDE
- * `.cockpit-root` (no dark reset, no auth gate) and inside `.landing-root`,
- * which carries its own light, shadcn-style theme. Lazy-loaded so its deps
- * (gsap, framer-motion, lucide) never weigh down the cockpit bundle.
+ * Now an immersive Graphite Atelier hero — warm obsidian with floating
+ * champagne-bronze / sage shapes (framer-motion), the "logic meets magic"
+ * statement in the Machine sans + the Human serif. Renders OUTSIDE
+ * `.cockpit-root` (no auth gate); the `.landing-root` wrapper only supplies the
+ * base reset + font family — the hero paints its own obsidian background.
+ * Lazy-loaded so its motion deps never weigh down the cockpit bundle.
  */
 export function LandingPage() {
   return (
-    <div className="landing-root min-h-screen w-full bg-white">
-      <div className="mx-auto max-w-6xl px-4 py-10 sm:py-16">
-        <HeroSection_05 />
-      </div>
+    <div className="landing-root bg-[#100c0a]">
+      <HeroGeometric badge="Nexus OS" title1="Where the logic" title2="meets the magic" />
     </div>
   )
 }
