@@ -5809,7 +5809,6 @@ def _handle_whatsapp_message(channel: MessagingChannel, wa_id: str,
         with get_db_conn() as conn:
             session_id = _db_get_or_create_channel_session(conn, "whatsapp", wa_id)
             bot_state  = _db_get_session_state(conn, session_id)
-            history    = _db_load_history(conn, session_id, limit=12)
             _db_save_message(conn, session_id, "user", text)
             _db_touch_session(conn, session_id)
             conn.commit()
