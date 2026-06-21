@@ -432,7 +432,10 @@ class TestHumanTakeover:
         run.assert_not_called()
         channel.send_text.assert_not_called()
 
-    def test_handle_runs_funnel_when_not_takeover(self):
+    def test_handle_sends_one_handoff_on_first_contact(self):
+        # Ticket 4.6 intake-assistant: first contact (state None) → exactly ONE
+        # transparent handoff message + opportunity opened inward (Work Queue),
+        # and the retired funnel is NEVER called.
         channel = MagicMock()
         with patch.object(main, "get_db_conn", return_value=_cm_conn()), \
              patch.object(main, "check_rate_limit"), \
@@ -444,6 +447,35 @@ class TestHumanTakeover:
              patch.object(main, "_db_save_message"), \
              patch.object(main, "_db_touch_session"), \
              patch.object(main, "_wa_run_qualification") as run, \
+             patch.object(main, "_wa_send_and_persist") as send, \
+             patch.object(main.nexus_hooks, "on_funnel_event") as funnel, \
              patch.object(main, "_audit"):
             main._handle_whatsapp_message(channel, "972500000000", "היי", "wamid.1")
-        run.assert_called_once()
+        run.assert_not_called()                       # counselor funnel retired
+        send.assert_called_once()                     # exactly one outward message
+        assert send.call_args.args[3] == _cfg("whatsapp.handoff_ack")
+        assert send.call_args.args[4] == main._WA_STATE_HANDOFF
+        funnel.assert_called_once()                   # opportunity opened inward
+
+    def test_handle_stays_silent_after_handoff(self):
+        # Subsequent messages (already handed off) → silent ingest: no outward
+        # message, no funnel. The brain keeps reading; the bot never replies.
+        channel = MagicMock()
+        with patch.object(main, "get_db_conn", return_value=_cm_conn()), \
+             patch.object(main, "check_rate_limit"), \
+             patch.object(main, "is_crisis", return_value=False), \
+             patch.object(main, "_db_get_or_create_channel_session",
+                          return_value="sid-1"), \
+             patch.object(main, "_db_get_session_state",
+                          return_value=main._WA_STATE_HANDOFF), \
+             patch.object(main, "_db_load_history", return_value=[]), \
+             patch.object(main, "_db_save_message"), \
+             patch.object(main, "_db_touch_session"), \
+             patch.object(main, "_wa_run_qualification") as run, \
+             patch.object(main, "_wa_send_and_persist") as send, \
+             patch.object(main.nexus_hooks, "on_funnel_event") as funnel, \
+             patch.object(main, "_audit"):
+            main._handle_whatsapp_message(channel, "972500000000", "עוד הודעה", "wamid.2")
+        run.assert_not_called()
+        send.assert_not_called()
+        funnel.assert_not_called()

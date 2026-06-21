@@ -14,11 +14,24 @@ dashboard to manage all leads and conversations in one place. It begins once the
 real number (0546150955) is stable in production. Keep proposals and architecture
 decisions pointed at that north star.
 
-## 3. Bot voice — context-aware, never robotic (Sprint 5 guardrail)
-The WhatsApp funnel must NOT fire the psychological opener on a bare greeting
-("hi", "היי"). Initiate the funnel only on clear intent (or after a delay); on a
-bare greeting, stay silent or send an ultra-brief, human acknowledgment. The bot
-is a person, not a tripwire.
+## 3. WhatsApp bot — intake assistant, NOT a counselor (LOCKED, Ticket 4.6)
+Pivoted 2026-06-21 after the funnel sent generic "therapist" advice to emotionally
+heavy messages and killed leads. The WhatsApp bot's OUTWARD persona is strictly an
+intake assistant / clinic manager. **Absolute rule:** on first contact it sends
+exactly ONE fully transparent automated handoff message (`whatsapp.handoff_ack` —
+"this is automated… Erez reads and replies personally"), then goes COMPLETELY
+SILENT. Zero conversational looping, zero AI advice/insights/qualification. The
+old qualification funnel (`_wa_run_qualification`, opener/insight/price/booking) is
+RETIRED — kept in code for rollback only; do not re-wire without an explicit
+decision to reverse this pivot.
+
+**Inward, the brain keeps running silently:** inbound messages are still persisted,
+the opportunity is still opened (so the person lands in the Work Queue), and the
+daily formation cron still builds the Person-360 (goal / tension / essence). The
+Machine organizes the data; the Human (Erez) does the actual consulting.
+
+**Safety exception:** the crisis gate (`is_crisis` → `crisis.message`) ALWAYS fires,
+upstream of everything — never silence a self-harm signal.
 
 ## 4. Cockpit design discipline — "Graphite Atelier" is the absolute source of truth (Sprint 5 guardrail)
 The Cockpit's visual system is **"Graphite Atelier"** — a "quiet sanctuary that hides a

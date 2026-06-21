@@ -560,7 +560,19 @@ _DEFAULT_CONFIG = {
     ),
     # Ticket 4.5 — strict intent gate. The funnel opens ONLY on explicit intent;
     # a bare greeting / vague comment gets this ultra-brief human ack instead.
+    # RETIRED by Ticket 4.6 (intake-assistant pivot) — kept for reference/rollback.
     "whatsapp.greeting_ack": "היי! 🙂 מה קורה?",
+    # Ticket 4.6 — intake-assistant pivot. The bot is NOT a counselor. It sends
+    # exactly ONE fully transparent handoff message on first contact, then goes
+    # completely silent — Erez does the consulting himself. Transparent (states
+    # it's automated), warm, and sets the "he'll reply personally" expectation.
+    # Gender-neutral by construction. Tune live via app_config without a redeploy.
+    "whatsapp.handoff_ack": (
+        "היי, זו הודעה אוטומטית 🤖\n"
+        "קיבלתי את ההודעה שלך והיא הגיעה לארז.\n"
+        "ארז קורא ומגיב בעצמו לכל פנייה אישית כזו, אז זה יכול לקחת קצת זמן — "
+        "אבל הוא יחזור אליך באופן אישי. תודה על הסבלנות ❤️"
+    ),
     "whatsapp.intent_gate_instructions": (
         "אתה שומר-סף קפדני לפתיחת שיחת ייעוץ. החזר intent=true רק אם ההודעה מביעה "
         "כוונה מפורשת לאחת מאלה: (1) לקבוע או לתאם שיחה/פגישה; (2) לקבל פרטים או "
@@ -5503,6 +5515,7 @@ _WA_STATE_STORY    = "wa_awaiting_story"
 _WA_STATE_INTEREST = "wa_awaiting_interest"
 _WA_STATE_PRICE    = "wa_offered_price"
 _WA_STATE_TAKEOVER = "wa_human_takeover"   # Coexistence: Erez is handling manually
+_WA_STATE_HANDOFF  = "wa_handed_off"       # Intake-assistant: acked once, now silent (4.6)
 
 # Anti-cringe guard: the insight prompt forbids these, AND the output is checked
 # against them in CODE (prompt-only is not a guarantee). Matched normalized +
@@ -5683,7 +5696,13 @@ def _wa_open_funnel(channel: MessagingChannel, wa_id: str, session_id: str) -> N
 def _wa_run_qualification(channel: MessagingChannel, wa_id: str, session_id: str,
                           text: str, bot_state: Optional[str],
                           history: list) -> None:
-    """The WhatsApp funnel. Crisis already handled upstream by the caller."""
+    """The WhatsApp qualification funnel. Crisis already handled upstream.
+
+    RETIRED by Ticket 4.6 (the intake-assistant pivot) — no longer called by
+    _handle_whatsapp_message; the bot no longer counsels or qualifies on
+    WhatsApp. Kept intact for reference and quick rollback only. Do not re-wire
+    without an explicit decision to reverse the pivot.
+    """
 
     # ── State 4: price offered — waiting for a yes ────────────────────────────
     if bot_state == _WA_STATE_PRICE:
@@ -5804,7 +5823,28 @@ def _handle_whatsapp_message(channel: MessagingChannel, wa_id: str,
         _audit("whatsapp_suppressed_takeover", wa_id=wa_id)
         return
 
-    _wa_run_qualification(channel, wa_id, session_id, text, bot_state, history)
+    # ── Intake-assistant mode (Ticket 4.6) — the bot is NOT a counselor ───────
+    # Outward, it sends exactly ONE fully transparent handoff message on first
+    # contact, then goes completely silent. The qualification funnel (insights,
+    # price, booking) is RETIRED — never again does AI send "advice" on WhatsApp.
+    #
+    # The brain keeps running silently: the inbound message is already persisted
+    # above, so the daily formation cron still builds the Person-360 (goal /
+    # tension / essence). We also open the opportunity inward, so the person lands
+    # in the Atelier Work Queue for Erez to handle personally — the pipeline
+    # signal WITHOUT the funnel's conversation. (Crisis is handled upstream;
+    # `history` is unused here by design — the machine reads, it does not reply.)
+    if bot_state is None:
+        _wa_send_and_persist(channel, wa_id, session_id,
+                             _get_config("whatsapp.handoff_ack"), _WA_STATE_HANDOFF)
+        nexus_hooks.on_funnel_event(
+            "engaged", "whatsapp", session_id=session_id, stage="engaged",
+            dedup_key=f"engaged:{session_id}")
+        _audit("whatsapp_handoff_ack", wa_id=wa_id, session_id=session_id)
+    else:
+        # Already acked (or a legacy in-flight funnel state) → stay silent and
+        # keep ingesting for the Work Queue. Zero conversational looping.
+        _audit("whatsapp_silent_ingest", wa_id=wa_id, session_id=session_id)
 
 
 @app.get("/api/powerbi/config", dependencies=[Depends(require_auth)])
