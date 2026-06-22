@@ -10,7 +10,7 @@ export function Topbar() {
 
   return (
     <header className="flex h-16 shrink-0 items-center justify-between border-b border-line bg-bg px-8">
-      <h1 className="text-base font-semibold text-ink">{title}</h1>
+      <h1 className="text-sm font-medium text-muted">{title}</h1>
       <div className="flex items-center gap-4">
         {devBypass && (
           <span className="rounded-control border border-line px-2 py-0.5 text-xs text-warn">

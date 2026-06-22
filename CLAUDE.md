@@ -45,11 +45,17 @@ component references the semantic Tailwind utilities only — `bg-bg`, `bg-surfa
 `text-ink`, `text-muted`, `text-faint`, `border-line`, `text-accent`, `text-sage`,
 `text-success` / `text-warn` / `text-danger`, `font-serif` — never raw hex.
 
-Primitives (warm obsidian): bg `#100c0a` · surface `#1a1512` · raised `#241d17` · ink `#f2ebe0`
-(parchment) · muted `#a99c8c` · faint `#6f6357` · line parchment/9% · accent `#c9aa71`
-(**champagne bronze — the one signature**, appears once with weight per view) · sage `#8a9a82`
-(quiet supporting tone, live/calm cues, never competes with bronze) · success `#7fa97f` ·
-warn `#d8a657` · danger `#d08770` (warm — attention, never alarm). Radius 6 (controls) / 8 (cards).
+Primitives (warm obsidian, calibrated 2026-06-22): bg `#0c0907` · surface `#191310` · raised
+`#231c15` · ink `#f2ebe0` (parchment) · muted `#a99c8c` · faint `#6f6357` · line parchment/16%
+· accent `#c9aa71` (**champagne bronze — the one signature**, appears once with weight per view)
+· sage `#8a9a82` (quiet supporting tone, live/calm cues, never competes with bronze) · success
+`#7fa97f` · warn `#d8a657` · danger `#d08770` (warm — attention, never alarm). Radius 9 (controls)
+/ 14 (cards).
+
+**Shadow exception** (approved 2026-06-22 by Erez): `--shadow-card: 0 2px 12px rgba(0,0,0,0.40)`
+— one ambient shadow for card surfaces only, applied via `[box-shadow:var(--shadow-card)]`. Never
+decorative, never colored, never used outside `.rounded-card`. Creates the tactile "floating panel"
+feel at sufficient bg-to-surface contrast; invisible to users consciously.
 
 **Three typographic voices** — the signature risk, made structural (Machine vs. Human):
 **Inter** for all UI / queue / system data (the Machine); **JetBrains Mono** `tabular-nums` for
@@ -63,7 +69,8 @@ to 40% opacity (~260ms) while the thread + memory rise (`cq-rise`); the Human/Fr
 recalls a touch slower (`cq-rise-slow`, ~420ms); the confidence bar draws once (`cq-grow`), never
 loops; hover is color/opacity only, never scale.
 
-Discipline: flat — no shadows / gradients / blur; elevation via surface + border shifts only; one
+Discipline: elevation via surface + border shifts first; `--shadow-card` permitted on card surfaces
+(see approved exception above) — never decorative, never colored; no gradients; no blur; one
 signature element, everything else quiet; sentence case; two weights. Apply real craft — never
 templated or default-looking UI. When extending the system consult `ui-ux-pro-max`; adhere to this
 aesthetic, don't drift.
