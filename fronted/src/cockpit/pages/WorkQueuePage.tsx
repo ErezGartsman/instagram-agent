@@ -5,7 +5,14 @@ import { Icon } from '../components/Icon'
 import type { IconName } from '../components/Icon'
 import { useAuth } from '../auth/AuthProvider'
 import { CHANNEL_LABELS, relativeTime } from '../lib/pipeline'
-import { fetchQueue, rankQueue, SAMPLE_QUEUE, type QueueItem } from '../lib/workqueue'
+import {
+  fetchQueue,
+  postQueueAction,
+  rankQueue,
+  SAMPLE_QUEUE,
+  type QueueActionType,
+  type QueueItem,
+} from '../lib/workqueue'
 
 type State =
   | { kind: 'loading' }
@@ -14,8 +21,8 @@ type State =
 
 // ── The Action Loop ──────────────────────────────────────────────────────────
 // Four moves on a lead, each with its own emotional read encoded in the exit
-// direction: a win files RIGHT, a dismissal sweeps LEFT, a snooze settles DOWN.
-type ActionType = 'send' | 'done' | 'snooze' | 'dismiss'
+// direction: a win/send files RIGHT, a dismissal sweeps LEFT, a snooze settles DOWN.
+type ActionType = QueueActionType
 type ExitDir = 'right' | 'left' | 'down'
 
 const EXIT_DIR: Record<ActionType, ExitDir> = {
@@ -31,20 +38,21 @@ const ACTION_VERB: Record<ActionType, string> = {
   dismiss: 'Dismissed',
 }
 
-const UNDO_MS = 4500 // how long the Undo safety-net stays up
-const NET_MS = 700 // mocked network round-trip (runs in the background — never blocks the UI)
-const SIMULATE_FAILURE = false // flip to prove the rollback path: card animates back in on a failed commit
+// The optimistic UI commits to the backend only when the undo window closes
+// (Gmail-style) — so Undo truly cancels, with no compensating request.
+const UNDO_MS = 4500
+const DEV_SIMULATE_FAILURE = false // dev-bypass only: flip to exercise the rollback path locally
 
 // Easing tuples (typed so Framer reads them as cubic-bezier, not number[]).
 const EASE: [number, number, number, number] = [0.25, 0.4, 0.25, 1]
 const EASE_OUT: [number, number, number, number] = [0.4, 0, 0.2, 1]
 
 /**
- * Ticket 5.2 — the 3-pane Work Queue, the core of the Decision Engine, now with
- * the Action Loop (P0 ①): act on a lead and the card leaves with intent while the
- * next rises into the light. Optimistic + Undo — zero spinners; the operator is
- * lightning-fast, with a safety net. API calls are mocked here (console + a
- * background timeout) so the visual flow is perfected before the Python wiring.
+ * Ticket 5.2 — the 3-pane Work Queue, the core of the Decision Engine, with the
+ * Action Loop (P0 ①) now wired to the real backend: act on a lead and the card
+ * leaves while the next rises. Optimistic + Undo — zero spinners; the actual
+ * `POST /api/cockpit/queue/{id}/action` fires when the undo window closes, and a
+ * failure rolls the card back. Dev-bypass mocks the call so local UI needs no API.
  */
 export function WorkQueuePage() {
   const { session, devBypass } = useAuth()
@@ -70,31 +78,48 @@ export function WorkQueuePage() {
     return () => controller.abort()
   }, [session?.access_token, devBypass])
 
+  // The single seam to the backend. Resolves on success; throws on failure so the
+  // Board rolls the card back. Dev-bypass never calls the API (local UI work).
+  const token = session?.access_token
+  const commit = useCallback(
+    async (id: string, type: ActionType) => {
+      if (devBypass || !token) {
+        console.log(`[action] ${type} → ${id} (dev mock — backend not called)`)
+        if (DEV_SIMULATE_FAILURE) throw new Error('simulated failure')
+        return
+      }
+      await postQueueAction(token, id, type)
+    },
+    [devBypass, token],
+  )
+
   if (state.kind === 'loading') return <QueueSkeleton />
   if (state.kind === 'error') return <QueueError />
   if (state.items.length === 0) return <QueueEmpty />
 
-  return <Board initialItems={state.items} sample={state.sample} />
+  return <Board initialItems={state.items} sample={state.sample} commit={commit} />
 }
 
-type Toast = { item: QueueItem; index: number; type: ActionType }
+type Toast = { item: QueueItem; index: number; type: ActionType; kind: 'undo' | 'error' }
+type Pending = { item: QueueItem; index: number; type: ActionType; timer: ReturnType<typeof setTimeout> }
 
-function Board({ initialItems, sample }: { initialItems: QueueItem[]; sample: boolean }) {
+function Board({
+  initialItems,
+  sample,
+  commit,
+}: {
+  initialItems: QueueItem[]
+  sample: boolean
+  commit: (id: string, type: ActionType) => Promise<void>
+}) {
   const reduce = useReducedMotion()
   const [items, setItems] = useState<QueueItem[]>(initialItems)
   const [selectedId, setSelectedId] = useState<string | null>(initialItems[0]?.id ?? null)
   const [exitDir, setExitDir] = useState<ExitDir>('right')
   const [toast, setToast] = useState<Toast | null>(null)
 
-  const undoTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const netTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  useEffect(
-    () => () => {
-      if (undoTimer.current) clearTimeout(undoTimer.current)
-      if (netTimer.current) clearTimeout(netTimer.current)
-    },
-    [],
-  )
+  const pendingRef = useRef<Pending | null>(null)
+  const toastHideRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const selected = useMemo(
     () => items.find((i) => i.id === selectedId) ?? items[0],
@@ -108,6 +133,39 @@ function Board({ initialItems, sample }: { initialItems: QueueItem[]; sample: bo
     return next
   }
 
+  // Send the optimistic action to the backend; roll the card back in on failure.
+  const runCommit = useCallback(
+    (p: Pending) => {
+      void commit(p.item.id, p.type).catch(() => {
+        setItems((prev) => (prev.some((i) => i.id === p.item.id) ? prev : insertAt(prev, p.index, p.item)))
+        setSelectedId(p.item.id)
+        if (toastHideRef.current) clearTimeout(toastHideRef.current)
+        setToast({ item: p.item, index: p.index, type: p.type, kind: 'error' })
+        toastHideRef.current = setTimeout(() => setToast(null), 4000)
+        console.warn(`[action] ✗ ${p.type} → ${p.item.id} failed — restored`)
+      })
+    },
+    [commit],
+  )
+
+  // Commit a still-pending move now (a newer action arrived, or we're unmounting),
+  // so rapid draining persists every card and nothing is lost on navigate.
+  const flushPending = useCallback(() => {
+    const p = pendingRef.current
+    if (!p) return
+    clearTimeout(p.timer)
+    pendingRef.current = null
+    runCommit(p)
+  }, [runCommit])
+
+  useEffect(
+    () => () => {
+      flushPending()
+      if (toastHideRef.current) clearTimeout(toastHideRef.current)
+    },
+    [flushPending],
+  )
+
   const move = useCallback(
     (delta: number) => {
       if (!selected) return
@@ -118,15 +176,15 @@ function Board({ initialItems, sample }: { initialItems: QueueItem[]; sample: bo
     [items, selected],
   )
 
-  // Work the queue: optimistic remove + advance, with the Undo net and a mocked
-  // commit running in the background. Side effects stay at the top level (not in a
-  // state updater) so StrictMode's double-invoke can't fire them twice.
+  // Optimistic: the card leaves instantly; the real write fires when the undo
+  // window closes. Side effects stay top-level (not in a state updater) so
+  // StrictMode's double-invoke can't double-fire them.
   const act = useCallback(
     (id: string, type: ActionType) => {
       const idx = items.findIndex((i) => i.id === id)
       if (idx === -1) return
       const item = items[idx]
-      console.log(`[action] ${type} → ${id} :: mock POST /api/cockpit/queue/${id}/action`)
+      flushPending() // persist any prior pending move first
 
       setExitDir(EXIT_DIR[type])
       setItems((prev) => prev.filter((i) => i.id !== id))
@@ -134,36 +192,33 @@ function Board({ initialItems, sample }: { initialItems: QueueItem[]; sample: bo
         curr === id ? (items[idx + 1]?.id ?? items[idx - 1]?.id ?? null) : curr,
       )
 
-      // Undo window — one undoable action at a time.
-      if (undoTimer.current) clearTimeout(undoTimer.current)
-      setToast({ item, index: idx, type })
-      undoTimer.current = setTimeout(() => setToast(null), UNDO_MS)
+      if (toastHideRef.current) {
+        clearTimeout(toastHideRef.current)
+        toastHideRef.current = null
+      }
+      setToast({ item, index: idx, type, kind: 'undo' })
 
-      // The "network" resolving after the optimistic UI already moved on.
-      if (netTimer.current) clearTimeout(netTimer.current)
-      netTimer.current = setTimeout(() => {
-        if (SIMULATE_FAILURE) {
-          console.warn(`[action] ✗ ${type} → ${id} failed — rolling back`)
-          setItems((prev) => insertAt(prev, idx, item))
-          setSelectedId(item.id)
-          setToast(null)
-        } else {
-          console.log(`[action] ✓ ${type} → ${id} committed`)
-        }
-      }, NET_MS)
+      const timer = setTimeout(() => {
+        const p = pendingRef.current
+        pendingRef.current = null
+        setToast((t) => (t && t.kind === 'undo' && t.item.id === id ? null : t))
+        if (p) runCommit(p)
+      }, UNDO_MS)
+      pendingRef.current = { item, index: idx, type, timer }
     },
-    [items],
+    [items, flushPending, runCommit],
   )
 
   const undo = useCallback(() => {
-    if (!toast) return
-    if (undoTimer.current) clearTimeout(undoTimer.current)
-    if (netTimer.current) clearTimeout(netTimer.current) // cancel the pending commit
-    setItems((prev) => insertAt(prev, toast.index, toast.item))
-    setSelectedId(toast.item.id)
-    console.log(`[action] ⤺ undo ${toast.type} → ${toast.item.id} (request canceled)`)
+    const p = pendingRef.current
+    if (!p) return
+    clearTimeout(p.timer)
+    pendingRef.current = null
+    setItems((prev) => insertAt(prev, p.index, p.item))
+    setSelectedId(p.item.id)
+    console.log(`[action] ⤺ undo ${p.type} → ${p.item.id} (canceled before commit)`)
     setToast(null)
-  }, [toast])
+  }, [])
 
   const onKeyDown = (e: KeyboardEvent<HTMLElement>) => {
     if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')) {
@@ -359,11 +414,11 @@ function Board({ initialItems, sample }: { initialItems: QueueItem[]; sample: bo
         </div>
       )}
 
-      {/* Undo toast — the safety net that makes acting fearless. */}
+      {/* Undo toast (the safety net) — or an error toast when a commit fails. */}
       <AnimatePresence>
         {toast && (
           <motion.div
-            key={`${toast.item.id}:${toast.type}`}
+            key={`${toast.item.id}:${toast.type}:${toast.kind}`}
             role="status"
             initial={reduce ? { opacity: 0 } : { opacity: 0, y: 16 }}
             animate={{ opacity: 1, y: 0 }}
@@ -371,24 +426,35 @@ function Board({ initialItems, sample }: { initialItems: QueueItem[]; sample: bo
             transition={{ duration: 0.2, ease: EASE }}
             className="fixed bottom-6 left-1/2 z-50 flex -translate-x-1/2 items-center gap-2.5 overflow-hidden rounded-card border border-line bg-surface px-4 py-2.5 backdrop-blur-xl [box-shadow:var(--shadow-card)]"
           >
-            <span className="text-sm text-ink">{ACTION_VERB[toast.type]}</span>
-            <span className="text-xs text-faint">·</span>
-            <span className="max-w-[160px] truncate text-sm text-muted">{toast.item.name}</span>
-            <button
-              type="button"
-              onClick={undo}
-              className="ml-1 inline-flex items-center gap-1 rounded-control px-2 py-1 text-xs font-medium text-glow transition-colors hover:bg-raised"
-            >
-              <Icon name="arrowRight" size={12} className="rotate-180" /> Undo
-            </button>
-            {!reduce && (
-              <motion.span
-                aria-hidden
-                initial={{ scaleX: 1 }}
-                animate={{ scaleX: 0 }}
-                transition={{ duration: UNDO_MS / 1000, ease: 'linear' }}
-                className="absolute bottom-0 left-0 h-0.5 w-full origin-left bg-glow/60"
-              />
+            {toast.kind === 'error' ? (
+              <>
+                <Icon name="alert" size={14} className="text-danger" />
+                <span className="text-sm text-ink">Couldn&rsquo;t save</span>
+                <span className="text-xs text-faint">·</span>
+                <span className="max-w-[180px] truncate text-sm text-muted">{toast.item.name} restored</span>
+              </>
+            ) : (
+              <>
+                <span className="text-sm text-ink">{ACTION_VERB[toast.type]}</span>
+                <span className="text-xs text-faint">·</span>
+                <span className="max-w-[160px] truncate text-sm text-muted">{toast.item.name}</span>
+                <button
+                  type="button"
+                  onClick={undo}
+                  className="ml-1 inline-flex items-center gap-1 rounded-control px-2 py-1 text-xs font-medium text-glow transition-colors hover:bg-raised"
+                >
+                  <Icon name="arrowRight" size={12} className="rotate-180" /> Undo
+                </button>
+                {!reduce && (
+                  <motion.span
+                    aria-hidden
+                    initial={{ scaleX: 1 }}
+                    animate={{ scaleX: 0 }}
+                    transition={{ duration: UNDO_MS / 1000, ease: 'linear' }}
+                    className="absolute bottom-0 left-0 h-0.5 w-full origin-left bg-glow/60"
+                  />
+                )}
+              </>
             )}
           </motion.div>
         )}
