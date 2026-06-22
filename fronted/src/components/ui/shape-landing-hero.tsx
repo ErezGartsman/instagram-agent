@@ -74,7 +74,7 @@ export function HeroGeometric({
   };
 
   return (
-    <div className="relative min-h-screen w-full flex items-center justify-center overflow-hidden bg-[#100c0a]">
+    <div className="relative min-h-screen w-full flex items-center justify-center overflow-hidden bg-[#0c0907]">
       <div className="absolute inset-0 bg-gradient-to-br from-[#c9aa71]/[0.06] via-transparent to-[#8a9a82]/[0.06] blur-3xl" />
 
       <div className="absolute inset-0 overflow-hidden">
@@ -129,7 +129,7 @@ export function HeroGeometric({
         </div>
       </div>
 
-      <div className="absolute inset-0 bg-gradient-to-t from-[#100c0a] via-transparent to-[#100c0a]/80 pointer-events-none" />
+      <div className="absolute inset-0 bg-gradient-to-t from-[#0c0907] via-transparent to-[#0c0907]/80 pointer-events-none" />
     </div>
   );
 }
