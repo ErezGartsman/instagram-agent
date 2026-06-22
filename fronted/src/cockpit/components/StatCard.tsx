@@ -16,6 +16,11 @@ export function StatCard({
     <motion.div
       initial={reduce ? false : { opacity: 0, y: 16 }}
       animate={{ opacity: 1, y: 0 }}
+      whileHover={
+        reduce
+          ? undefined
+          : { y: -4, boxShadow: '0 0 36px rgba(124,58,237,0.32), inset 0 1px 0 rgba(255,255,255,0.14)' }
+      }
       transition={{ duration: 0.4, delay: index * 0.08, ease: [0.25, 0.4, 0.25, 1] }}
       className="rounded-card border border-line bg-surface p-6 backdrop-blur-xl [box-shadow:var(--shadow-card)]"
     >
