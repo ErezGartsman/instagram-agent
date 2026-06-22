@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import type { CSSProperties } from 'react'
+import { motion, useReducedMotion } from 'framer-motion'
 import { Icon } from '../components/Icon'
 import type { IconName } from '../components/Icon'
 import { StatCard } from '../components/StatCard'
@@ -110,12 +111,17 @@ export function OverviewPage() {
   )
 }
 
+const MotionLink = motion(Link)
+
 function NextMove({ top, pending }: { top: QueueItem; pending: number }) {
   const queueLive = FEATURES.workQueue
   const to = queueLive ? '/app/queue' : '/app/pipeline'
+  const reduce = useReducedMotion()
   return (
-    <Link
+    <MotionLink
       to={to}
+      whileHover={reduce ? undefined : { y: -3, boxShadow: '0 0 36px rgba(124,58,237,0.28), inset 0 1px 0 rgba(255,255,255,0.12)' }}
+      transition={{ duration: 0.18, ease: 'easeOut' }}
       className="group block rounded-card border border-line bg-surface p-5 backdrop-blur-xl transition-colors hover:bg-raised [box-shadow:var(--shadow-card)]"
     >
       <div className="flex items-start justify-between gap-4">
@@ -152,19 +158,23 @@ function NextMove({ top, pending }: { top: QueueItem; pending: number }) {
       <div className="mt-3 font-mono text-[10px] text-faint">
         {pending} {pending === 1 ? 'person' : 'people'} waiting on a next move
       </div>
-    </Link>
+    </MotionLink>
   )
 }
 
 function QuickJump({ to, icon, label }: { to: string; icon: IconName; label: string }) {
+  const reduce = useReducedMotion()
   return (
-    <Link
+    <MotionLink
       to={to}
+      whileHover={reduce ? undefined : { scale: 1.04, y: -1 }}
+      whileTap={reduce ? undefined : { scale: 0.97 }}
+      transition={{ duration: 0.14, ease: 'easeOut' }}
       className="inline-flex items-center gap-2 rounded-control border border-line px-3.5 py-2 text-sm text-muted transition-colors hover:bg-raised hover:text-ink"
     >
       <Icon name={icon} size={15} />
       {label}
-    </Link>
+    </MotionLink>
   )
 }
 
