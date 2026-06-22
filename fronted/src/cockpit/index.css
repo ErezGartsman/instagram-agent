@@ -171,6 +171,38 @@
 .cockpit-root .cq-rise-slow { animation: cq-rise-slow 0.42s ease both; }
 .cockpit-root .cq-grow      { animation: cq-grow 0.7s cubic-bezier(0.22, 1, 0.36, 1) both; }
 
+/* ── Animated glow search (Topbar) ───────────────────────────────────────────
+   A conic violet→electric-blue ring that orbits the field. Discipline: it stays
+   PAUSED at rest — no decorative idle loop — and only spins while the field is
+   hovered/focused, so neon stays tied to the active state. The reduced-motion
+   guard below flattens the orbit to a static glow automatically. */
+@keyframes cq-orbit { to { transform: rotate(1turn); } }
+
+.cockpit-root .cq-search-glow {
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    #7c3aed 60deg,    /* deep violet */
+    #3b82f6 140deg,   /* electric blue */
+    #a78bfa 220deg,   /* bright violet */
+    transparent 300deg
+  );
+  filter: blur(7px);
+  opacity: 0.35;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+  animation: cq-orbit 4.5s linear infinite;
+  animation-play-state: paused;
+}
+.cockpit-root .cq-search:hover .cq-search-glow,
+.cockpit-root .cq-search:focus-within .cq-search-glow {
+  opacity: 0.9;
+  animation-play-state: running;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .cockpit-root *,
   .cockpit-root *::before,
