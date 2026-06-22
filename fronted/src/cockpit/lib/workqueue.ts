@@ -50,6 +50,28 @@ export async function fetchQueue(token: string, signal?: AbortSignal): Promise<Q
   return data.items ?? []
 }
 
+/** The Action Loop moves an operator can take on a queued lead. */
+export type QueueActionType = 'send' | 'done' | 'snooze' | 'dismiss'
+
+/**
+ * Apply one Work Queue action. Resolves on success; THROWS on any non-2xx so the
+ * optimistic UI can roll the card back (the backend returns real status codes for
+ * exactly this reason). `snoozeHours` only applies to 'snooze' (server defaults it).
+ */
+export async function postQueueAction(
+  token: string,
+  id: string,
+  type: QueueActionType,
+  opts: { snoozeHours?: number } = {},
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/cockpit/queue/${id}/action`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ type, snooze_hours: opts.snoozeHours ?? null }),
+  })
+  if (!res.ok) throw new Error(`action ${res.status}`)
+}
+
 /** Highest confidence first — a stable client-side fallback ordering. The
  *  server already ranks by the rule-engine priority; this only re-sorts if a
  *  caller hands us an unranked list. */

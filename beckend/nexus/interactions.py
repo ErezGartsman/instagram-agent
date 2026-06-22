@@ -26,6 +26,7 @@ INTERACTION_KINDS = {
     "context_provided", "stage_change", "booking_created", "booking_canceled",
     "outreach_click", "contacted", "note_added", "merged", "alert_sent",
     "crm_synced", "formation_run",
+    "handled", "snoozed",            # cockpit Action Loop — operator queue moves
 }
 
 # Forward-only pipeline. 'booked' may be reached from any open stage (a lead
@@ -224,3 +225,46 @@ def close_opportunity(
                  "to": outcome, "reason": reason, "by": by},
     )
     return True
+
+
+def snooze_opportunity(
+    conn,
+    opportunity_id: str,
+    *,
+    hours: float,
+    kind: str = "snoozed",
+    by: str = "system",
+    reason: str | None = None,
+):
+    """
+    Take an OPEN opportunity off the immediate Work Queue until NOW()+hours,
+    WITHOUT closing it (closed_at stays NULL — it remains a live pipeline
+    episode). The Work Queue filters `snoozed_until <= NOW()`, so the lead simply
+    resurfaces when the timer passes.
+
+    Used by the cockpit Action Loop: kind='handled' (Done — a short cool-off) and
+    kind='snoozed' (an explicit defer). Logs the operator's decision as the
+    matching interaction (the feedback signal the ranking otherwise lacks).
+    Commit-free. Returns the new snoozed_until datetime, or None when the
+    opportunity is missing or already closed (no-op).
+    """
+    if kind not in ("handled", "snoozed"):
+        raise ValueError(f"invalid snooze kind {kind!r}")
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE opportunities "
+            "SET snoozed_until = NOW() + (%s * interval '1 hour'), updated_at = NOW() "
+            "WHERE id = %s AND closed_at IS NULL "
+            "RETURNING person_id, source_channel, snoozed_until",
+            (hours, opportunity_id),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        person_id, source_channel, snoozed_until = str(row[0]), row[1], row[2]
+    log_interaction(
+        conn, kind, source_channel or "system", person_id=person_id,
+        payload={"opportunity_id": opportunity_id, "hours": hours,
+                 "reason": reason, "by": by},
+    )
+    return snoozed_until

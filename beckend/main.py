@@ -1645,7 +1645,8 @@ def cockpit_queue(user: dict = Depends(require_cockpit_user)):
                     "LEFT JOIN LATERAL (SELECT urgency, emotional_state, topic, created_at "
                     "                   FROM session_summaries WHERE person_id = p.id "
                     "                   ORDER BY created_at DESC LIMIT 1) ss ON TRUE "
-                    "WHERE o.closed_at IS NULL"
+                    "WHERE o.closed_at IS NULL "
+                    "  AND (o.snoozed_until IS NULL OR o.snoozed_until <= NOW())"
                 )
                 rows = cur.fetchall()
                 person_ids = [r[3] for r in rows]
@@ -1715,6 +1716,110 @@ def cockpit_queue(user: dict = Depends(require_cockpit_user)):
     except Exception as e:
         logger.error(f"[cockpit/queue] query failed: {e}")
         return {"status": "error", "detail": "Could not load the work queue."}
+
+
+# ── Work Queue Action Loop (P0 ①) — the cockpit's steering wheel ──────────────
+# One operator move on a lead, mapped onto the existing stage machine. Unlike the
+# other cockpit reads (which return 200 + {status:error} on failure), this returns
+# REAL HTTP status codes so the optimistic frontend can roll the card back cleanly.
+_QUEUE_ACTIONS = {"send", "done", "snooze", "dismiss"}
+_DONE_COOLOFF_HOURS = 72       # "handled today" → cool off ~3 days; stays OPEN
+_SNOOZE_DEFAULT_HOURS = 24     # explicit snooze default when the client sends none
+
+
+class QueueActionBody(BaseModel):
+    type: str
+    snooze_hours: Optional[float] = None   # snooze only; server applies the default
+    reason: Optional[str] = None
+    message: Optional[str] = None          # phase-2 forward-compat (send); ignored in v1
+
+
+def _dispatch_outreach(conn, person_id: str, channel: Optional[str],
+                       message: Optional[str], *, by: str,
+                       reason: Optional[str] = None) -> None:
+    """
+    The 'Send message' seam. v1 records that the operator did the outreach (a
+    `contacted` signal — its recency reset drops the lead in the ranking). Phase 2
+    fills the real WhatsApp send in here WITHOUT changing the endpoint contract:
+    resolve the recipient from the identity layer, KapsoChannel.send_text(...),
+    persist the verbatim body to the `messages` table (PII discipline — the
+    interaction stays ref-only), and stamp the returned message_id onto the
+    payload. The `message` field already rides the request for that day.
+    """
+    nexus_interactions.log_interaction(
+        conn, "contacted", channel or "cockpit", person_id=person_id,
+        payload={"by": by, "via": "cockpit", "reason": reason},
+    )
+
+
+@app.post("/api/cockpit/queue/{opportunity_id}/action")
+def cockpit_queue_action(opportunity_id: str, body: QueueActionBody,
+                         user: dict = Depends(require_cockpit_user)):
+    """
+    Apply one Work Queue move to an opportunity:
+
+      send    → record the outreach (`contacted`); lead stays OPEN (recency drop).
+      done    → "handled today": a short cool-off snooze; stays OPEN.
+      snooze  → explicit defer (snooze_hours, default 24h); stays OPEN.
+      dismiss → close the opportunity as 'lost'.
+
+    Idempotent where it matters: dismiss on an already-closed lead is a 200 no-op;
+    acting (send/done/snooze) on a closed lead is 409. Unknown id → 404; unknown
+    action → 400; anything unexpected → 500. Every move logs the operator's
+    decision (attributed via `by`) — the feedback the ranking engine will learn from.
+    """
+    action = (body.type or "").strip().lower()
+    if action not in _QUEUE_ACTIONS:
+        raise HTTPException(status_code=400, detail=f"Unknown action {body.type!r}.")
+    by = user.get("email") or user.get("sub") or "operator"
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT person_id, stage, source_channel, closed_at "
+                    "FROM opportunities WHERE id = %s",
+                    (opportunity_id,),
+                )
+                row = cur.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Opportunity not found.")
+            person_id, stage, channel, closed_at = str(row[0]), row[1], row[2], row[3]
+
+            if closed_at is not None:
+                # Already closed: dismiss is a benign no-op; acting on it is a conflict.
+                if action == "dismiss":
+                    return {"status": "success", "id": opportunity_id, "type": action,
+                            "stage": stage, "closed": True, "snoozed_until": None}
+                raise HTTPException(status_code=409, detail="This lead is already closed.")
+
+            snoozed_until = None
+            closed = False
+            if action == "send":
+                _dispatch_outreach(conn, person_id, channel, body.message,
+                                   by=by, reason=body.reason)
+            elif action == "done":
+                snoozed_until = nexus_interactions.snooze_opportunity(
+                    conn, opportunity_id, hours=_DONE_COOLOFF_HOURS,
+                    kind="handled", by=by, reason=body.reason)
+            elif action == "snooze":
+                hours = (body.snooze_hours if (body.snooze_hours and body.snooze_hours > 0)
+                         else _SNOOZE_DEFAULT_HOURS)
+                snoozed_until = nexus_interactions.snooze_opportunity(
+                    conn, opportunity_id, hours=hours,
+                    kind="snoozed", by=by, reason=body.reason)
+            elif action == "dismiss":
+                nexus_interactions.close_opportunity(
+                    conn, opportunity_id, "lost", reason=body.reason, by=by)
+                closed, stage = True, "lost"
+            conn.commit()
+        return {"status": "success", "id": opportunity_id, "type": action,
+                "stage": stage, "closed": closed,
+                "snoozed_until": snoozed_until.isoformat() if snoozed_until else None}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[cockpit/queue/action] {action} on {opportunity_id} failed: {e}")
+        raise HTTPException(status_code=500, detail="Could not apply the action.")
 
 
 @app.get("/api/cockpit/analytics")

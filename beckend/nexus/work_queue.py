@@ -32,6 +32,8 @@ KIND_LABELS = {
     "note_added":       "Note added",
     "alert_sent":       "Alert sent",
     "crm_synced":       "Synced to CRM",
+    "handled":          "Handled in the queue",
+    "snoozed":          "Snoozed for later",
 }
 
 # Base priority by stage — closer to a booking is hotter, with captured/briefed
