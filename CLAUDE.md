@@ -33,47 +33,55 @@ Machine organizes the data; the Human (Erez) does the actual consulting.
 **Safety exception:** the crisis gate (`is_crisis` → `crisis.message`) ALWAYS fires,
 upstream of everything — never silence a self-harm signal.
 
-## 4. Cockpit design discipline — "Graphite Atelier" is the absolute source of truth (Sprint 5 guardrail)
-The Cockpit's visual system is **"Graphite Atelier"** — a "quiet sanctuary that hides a
-precision instrument": the calm, low-lit warmth of a private study fused with the razor-sharp
-organization of a command center. Derived via the `ui-ux-pro-max` skill and locked by Erez
-on 2026-06-20, it **permanently supersedes "Graphite Command"** (the cool-slate / electric-blue
-skin) and the earlier buckssauce browns. References: Linear (typography, keyboard-first),
-Notion dark (editorial negative space), an Aman-resort lounge at night (warm ambient light,
-nothing screaming). Canonical tokens live in `fronted/src/cockpit/index.css` (`@theme`); every
-component references the semantic Tailwind utilities only — `bg-bg`, `bg-surface`, `bg-raised`,
-`text-ink`, `text-muted`, `text-faint`, `border-line`, `text-accent`, `text-sage`,
-`text-success` / `text-warn` / `text-danger`, `font-serif` — never raw hex.
+## 4. Cockpit design discipline — Neon Glassmorphism Engine (pivoted 2026-06-22)
+Graphite Atelier (warm obsidian / champagne bronze) is **retired**. The new system
+is the **Neon Glassmorphism Engine**, pivoted on Erez's directive 2026-06-22.
+References: Dealstack (violet glassmorphism CRM), G.Take (deep navy glass cards),
+21st.dev component library aesthetic.
 
-Primitives (warm obsidian, calibrated 2026-06-22): bg `#0c0907` · surface `#191310` · raised
-`#231c15` · ink `#f2ebe0` (parchment) · muted `#a99c8c` · faint `#6f6357` · line parchment/16%
-· accent `#c9aa71` (**champagne bronze — the one signature**, appears once with weight per view)
-· sage `#8a9a82` (quiet supporting tone, live/calm cues, never competes with bronze) · success
-`#7fa97f` · warn `#d8a657` · danger `#d08770` (warm — attention, never alarm). Radius 9 (controls)
-/ 14 (cards).
+**Three-layer depth architecture — never collapse any layer:**
+1. **Void + dual ambient glow** — CSS radial gradients on `.cockpit-root`: violet
+   crown top (`rgba(109,40,217,0.35)`) + electric-blue depth bottom-right
+   (`rgba(59,130,246,0.22)`) + secondary violet bottom-left (`rgba(109,40,217,0.12)`)
+   over `#060012` void base. No images, no canvas — pure CSS.
+2. **Glass panels** — `bg-surface` (`rgba(255,255,255,0.08)`) + `backdrop-blur-xl`
+   on section-level containers: Sidebar, Topbar, StatCard, feature cards.
+   **Never on list rows** (GPU cost). List rows get `bg-surface` rgba only.
+3. **Neon signatures** — `--color-accent: #7c3aed` (violet-700) for fills/badges;
+   `--color-glow: #a78bfa` (violet-400) for pip glow, confidence %, gradient tips.
+   One neon `box-shadow` per active element only — never decorative.
 
-**Shadow exception** (approved 2026-06-22 by Erez): `--shadow-card: 0 2px 12px rgba(0,0,0,0.40)`
-— one ambient shadow for card surfaces only, applied via `[box-shadow:var(--shadow-card)]`. Never
-decorative, never colored, never used outside `.rounded-card`. Creates the tactile "floating panel"
-feel at sufficient bg-to-surface contrast; invisible to users consciously.
+Canonical tokens in `fronted/src/cockpit/index.css` (`@theme`). Semantic utilities
+only — `bg-surface`, `bg-raised`, `text-ink`, `text-muted`, `text-faint`,
+`border-line`, `text-accent`, `text-glow`, `text-sage`, `text-success` / `text-warn`
+/ `text-danger` — never raw hex in components.
 
-**Three typographic voices** — the signature risk, made structural (Machine vs. Human):
-**Inter** for all UI / queue / system data (the Machine); **JetBrains Mono** `tabular-nums` for
-every numeral — KPIs, counts, %, timestamps (the Instrument); **Fraunces** (light, soft optical)
-for the Memory layer only — the emotional summary / core human problem (the Human). The sans stays
-quiet; the serif speaks.
+**Primitives (neon void, 2026-06-22):** bg `#060012` · surface `rgba(255,255,255,0.08)`
+glass · raised `rgba(255,255,255,0.12)` hover glass · ink `#ffffff` · muted `#a1a1aa` ·
+faint `#52525b` · line `rgba(255,255,255,0.08)` · accent `#7c3aed` · glow `#a78bfa` ·
+sage `#60a5fa` (electric blue) · success `#7fa97f` · warn `#d8a657` · danger `#d08770`.
+Radius 9px (controls) / 14px (cards).
 
-**Motion** — the whisper budget (CSS only, never a heavy anim lib; honors `prefers-reduced-motion`
-via the global guard): the "one-thing" focus mechanic — on select, unselected queue rows recede
-to 40% opacity (~260ms) while the thread + memory rise (`cq-rise`); the Human/Fraunces layer
-recalls a touch slower (`cq-rise-slow`, ~420ms); the confidence bar draws once (`cq-grow`), never
-loops; hover is color/opacity only, never scale.
+**Elevation:** `--shadow-card: 0 0 24px rgba(124,58,237,0.20), inset 0 1px 0 rgba(255,255,255,0.08)`
+on glass cards. `--shadow-glow: 0 0 8px rgba(167,139,250,0.90), 0 0 16px rgba(124,58,237,0.50)`
+for the active nav pip. No flat black shadows — glow-based only.
 
-Discipline: elevation via surface + border shifts first; `--shadow-card` permitted on card surfaces
-(see approved exception above) — never decorative, never colored; no gradients; no blur; one
-signature element, everything else quiet; sentence case; two weights. Apply real craft — never
-templated or default-looking UI. When extending the system consult `ui-ux-pro-max`; adhere to this
-aesthetic, don't drift.
+**Typography — two voices (the logic machine):**
+**Inter** for all UI. **JetBrains Mono** `tabular-nums` for every numeral.
+**Fraunces** is reserved for the Overview `greeting()` heading ONLY — `font-serif` on
+that one `<h2>` — and **nowhere else in the cockpit**. It is "the human voice in the
+machine" per Erez's decision. Enforce strictly; reject any other `font-serif` usage.
+
+**Framer Motion** — in bundle. `StatCard` uses stagger entrance (`delay: index * 0.08s`)
+with `useReducedMotion()` guard. Never continuous/looping — `cq-grow` is the only
+draw-once CSS exception.
+
+**Motion whisper budget** (CSS): `cq-rise` 0.26s · `cq-rise-slow` 0.42s · `cq-grow`
+0.7s. All killed by global `prefers-reduced-motion` guard in `index.css`.
+
+Discipline: glass over void always. Backdrop-blur on section containers only. Neon
+glow on active states only. No warm tones anywhere. Sentence case; two weights max.
+When extending, consult `ui-ux-pro-max`; never drift back toward warm/flat.
 
 ---
 

@@ -28,12 +28,6 @@ const DATELINE = new Date().toLocaleDateString(undefined, {
   day: 'numeric',
 })
 
-/**
- * Ticket 5.4 — the Overview, the OS home pulse. A calm daily launchpad in three
- * executive bands: a Fraunces greeting, the real pipeline KPIs (Instrument
- * voice), and the single highest-priority next move (the one bronze signature)
- * straight from the Work Queue. A pulse, not a control room.
- */
 export function OverviewPage() {
   const { session, devBypass } = useAuth()
   const [state, setState] = useState<State>({ kind: 'loading' })
@@ -80,6 +74,7 @@ export function OverviewPage() {
   return (
     <div className="mx-auto max-w-[1100px]">
       <header className="mb-8">
+        {/* font-serif (Fraunces) is permitted here and ONLY here — the human voice */}
         <h2 className="font-serif text-3xl font-light leading-tight text-ink">{greeting()}.</h2>
         <p className="mt-1.5 font-mono text-[11px] uppercase tracking-[0.14em] text-faint">{DATELINE}</p>
       </header>
@@ -90,8 +85,8 @@ export function OverviewPage() {
       {state.kind === 'ready' && (
         <>
           <div className="mb-9 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            {state.kpis.map((k) => (
-              <StatCard key={k.label} {...k} />
+            {state.kpis.map((k, i) => (
+              <StatCard key={k.label} {...k} index={i} />
             ))}
           </div>
 
@@ -121,12 +116,12 @@ function NextMove({ top, pending }: { top: QueueItem; pending: number }) {
   return (
     <Link
       to={to}
-      className="group block rounded-card border border-line bg-surface p-5 transition-colors hover:bg-raised"
+      className="group block rounded-card border border-line bg-surface p-5 backdrop-blur-xl transition-colors hover:bg-raised [box-shadow:var(--shadow-card)]"
     >
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <span className="rounded bg-accent/15 px-1.5 py-px font-mono text-[10px] uppercase tracking-wider text-accent">
+            <span className="rounded bg-[rgba(124,58,237,0.20)] border border-[rgba(167,139,250,0.25)] px-1.5 py-px font-mono text-[10px] uppercase tracking-wider text-glow">
               Next
             </span>
             <span className="truncate text-sm font-medium text-ink">{top.name}</span>
@@ -138,16 +133,19 @@ function NextMove({ top, pending }: { top: QueueItem; pending: number }) {
           </div>
         </div>
         <div className="flex shrink-0 flex-col items-end gap-2.5">
-          <span className="font-mono text-sm tabular-nums text-accent">{top.confidence}%</span>
+          <span className="font-mono text-sm tabular-nums text-glow [text-shadow:0_0_8px_rgba(167,139,250,0.6)]">
+            {top.confidence}%
+          </span>
           <span className="flex items-center gap-1 text-xs text-muted transition-colors group-hover:text-ink">
             {queueLive ? 'Open the queue' : 'Open the board'}
             <Icon name="arrowRight" size={13} />
           </span>
         </div>
       </div>
-      <span className="mt-4 block h-[3px] w-full overflow-hidden rounded-full bg-ink/10">
+      {/* Neon confidence bar */}
+      <span className="mt-4 block h-[3px] w-full overflow-hidden rounded-full bg-white/[0.08]">
         <span
-          className="cq-grow block h-full rounded-full bg-accent"
+          className="cq-grow block h-full rounded-full bg-gradient-to-r from-[#7c3aed] to-[#a78bfa] [box-shadow:0_0_8px_rgba(124,58,237,0.70)]"
           style={{ '--w': `${top.confidence}%` } as CSSProperties}
         />
       </span>
@@ -172,7 +170,7 @@ function QuickJump({ to, icon, label }: { to: string; icon: IconName; label: str
 
 function ClearState() {
   return (
-    <div className="flex flex-col items-center rounded-card border border-line bg-surface px-8 py-12 text-center">
+    <div className="flex flex-col items-center rounded-card border border-line bg-surface px-8 py-12 backdrop-blur-xl text-center [box-shadow:var(--shadow-card)]">
       <span className="mb-3 grid h-11 w-11 place-items-center rounded-control border border-line bg-raised text-success">
         <Icon name="check" size={20} />
       </span>
@@ -187,17 +185,17 @@ function PulseSkeleton() {
     <div aria-hidden>
       <div className="mb-9 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         {Array.from({ length: 4 }).map((_, i) => (
-          <div key={i} className="h-24 animate-pulse rounded-card border border-line bg-surface" />
+          <div key={i} className="h-24 animate-pulse rounded-card border border-line bg-white/[0.04]" />
         ))}
       </div>
-      <div className="h-28 animate-pulse rounded-card border border-line bg-surface" />
+      <div className="h-28 animate-pulse rounded-card border border-line bg-white/[0.04]" />
     </div>
   )
 }
 
 function PulseError() {
   return (
-    <div className="flex flex-col items-center rounded-card border border-line bg-surface px-8 py-16 text-center">
+    <div className="flex flex-col items-center rounded-card border border-line bg-surface px-8 py-16 backdrop-blur-xl text-center [box-shadow:var(--shadow-card)]">
       <span className="mb-4 grid h-12 w-12 place-items-center rounded-control border border-line bg-raised text-danger">
         <Icon name="alert" size={22} />
       </span>

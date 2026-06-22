@@ -9,7 +9,7 @@ export function Topbar() {
   const title = NAV.find((n) => n.to === pathname)?.label ?? 'Cockpit'
 
   return (
-    <header className="flex h-16 shrink-0 items-center justify-between border-b border-line bg-bg px-8">
+    <header className="flex h-16 shrink-0 items-center justify-between border-b border-line bg-surface backdrop-blur-xl px-8">
       <h1 className="text-sm font-medium text-muted">{title}</h1>
       <div className="flex items-center gap-4">
         {devBypass && (

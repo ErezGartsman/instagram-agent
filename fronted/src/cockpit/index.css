@@ -1,88 +1,104 @@
 /* ─────────────────────────────────────────────────────────────────────────────
-   NEXUS Cockpit — design system entry
-   Tokens are the "Graphite Atelier" skin (via ui-ux-pro-max) — a quiet sanctuary
-   that hides a precision instrument: elevation via surface + border shifts; one
-   sanctioned ambient shadow (--shadow-card, approved 2026-06-22, cards only);
-   4px grid; radius 9/14; warm obsidian surfaces; one signature accent (champagne
-   bronze). Three typographic voices — Inter (machine UI) · JetBrains Mono (data /
-   numerals) · Fraunces (the human Memory layer).
+   NEXUS Cockpit — Neon Glassmorphism Engine
+   Pivoted 2026-06-22 from Graphite Atelier (warm obsidian) on Erez's directive.
 
-   Tailwind v4 is loaded WITHOUT preflight so the legacy Nexus app at /legacy keeps
-   its own base styles; the Cockpit gets a reset scoped to `.cockpit-root` instead.
+   Three-layer depth system:
+   1. Void + ambient dual-glow — violet crown (top) + electric-blue depth (bottom-right),
+      pure CSS radial gradients on .cockpit-root, no images.
+   2. Glass panels — backdrop-blur-xl + rgba(255,255,255,0.08) surfaces. Section-level
+      containers only (Sidebar, Topbar, StatCard, feature cards). List rows stay flat rgba
+      for GPU safety.
+   3. Neon signatures — violet (#7c3aed) fills; #a78bfa bright-violet for glow text + pip.
+
+   Typography: Inter (machine UI) · JetBrains Mono (data/numerals).
+   Fraunces (serif) is reserved EXCLUSIVELY for the Overview "Good afternoon." greeting —
+   the single human voice in the machine. No exceptions.
+
+   Tailwind v4 loaded WITHOUT preflight; cockpit scoped to .cockpit-root.
    ──────────────────────────────────────────────────────────────────────────── */
 @layer theme, base, components, utilities;
 @import "tailwindcss/theme.css" layer(theme);
 @import "tailwindcss/utilities.css" layer(utilities);
 
-/* Only scan the typed Cockpit sources — never the legacy .jsx app. */
 @source "../**/*.{ts,tsx}";
-/* Landing marketing surface — isolated, light theme (src/components, src/landing). */
 @source "../components/**/*.{ts,tsx}";
 @source "../landing/**/*.{ts,tsx}";
 
 @theme {
-  /* Surfaces — warm obsidian, layered dark→lighter for elevation.
-     Calibrated 2026-06-22: bg darkened for a larger luminance jump to surface,
-     so cards read as floating panels rather than painted rectangles. */
-  --color-bg: #0c0907;        /* page background — deep warm obsidian   */
-  --color-surface: #191310;   /* cards, panels, sidebar — espresso      */
-  --color-raised: #231c15;    /* hover / raised layer — warm graphite   */
-  --color-ink: #f2ebe0;       /* primary text — parchment               */
-  --color-muted: #a99c8c;     /* secondary text — warm taupe            */
-  --color-faint: #6f6357;     /* tertiary text — timestamps, hints      */
-  --color-line: rgba(242, 235, 224, 0.16); /* hairline borders (~16%) — crisp */
-  --color-accent: #c9aa71;    /* champagne bronze — the single signature */
-  --color-sage: #8a9a82;      /* quiet supporting tone — live / calm cues */
+  /* ── Void base ───────────────────────────────────────────────────────────── */
+  --color-bg: #060012;          /* deepest void — also used by text-bg utility  */
 
-  /* Status palette — warm-tuned: attention, never alarm */
-  --color-success: #7fa97f;   /* warm sage-green */
-  --color-warn: #d8a657;      /* muted ochre     */
-  --color-danger: #d08770;    /* terracotta      */
+  /* ── Glass surfaces — RGBA, not solid fills ─────────────────────────────── */
+  --color-surface: rgba(255, 255, 255, 0.08);   /* primary glass panel         */
+  --color-raised:  rgba(255, 255, 255, 0.12);   /* hover / active glass layer  */
 
-  /* Radius — open curves for a crafted, non-template feel */
+  /* ── Text hierarchy ─────────────────────────────────────────────────────── */
+  --color-ink:   #ffffff;   /* pure white — primary text  */
+  --color-muted: #a1a1aa;   /* zinc-400   — secondary     */
+  --color-faint: #52525b;   /* zinc-600   — hints/labels  */
+
+  /* ── Glass borders — ultra-whisper white hairlines ──────────────────────── */
+  --color-line: rgba(255, 255, 255, 0.08);
+
+  /* ── Neon accent system ─────────────────────────────────────────────────── */
+  --color-accent: #7c3aed;   /* violet-700 — base fills, badges              */
+  --color-glow:   #a78bfa;   /* violet-400 — neon text, pip, gradient tips   */
+  --color-sage:   #60a5fa;   /* blue-400   — electric blue / live / tech cue */
+
+  /* ── Status palette — warm-tuned, attention not alarm ───────────────────── */
+  --color-success: #7fa97f;
+  --color-warn:    #d8a657;
+  --color-danger:  #d08770;
+
+  /* ── Radius ─────────────────────────────────────────────────────────────── */
   --radius-control: 9px;
-  --radius-card: 14px;
+  --radius-card:    14px;
 
-  /* Elevation — one sanctioned ambient shadow for card surfaces only.
-     Invisible to users consciously; critical for the tactile floating feel.
-     NEVER use decorative or colored shadows; NEVER apply outside .rounded-card. */
-  --shadow-card: 0 2px 12px rgba(0, 0, 0, 0.40);
+  /* ── Glass elevation system ─────────────────────────────────────────────── */
+  /* Card: ambient violet glow + inset top-edge highlight */
+  --shadow-card: 0 0 24px rgba(124, 58, 237, 0.20), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  /* Pip: lit filament — for active nav marker and neon accents */
+  --shadow-glow: 0 0 8px rgba(167, 139, 250, 0.90), 0 0 16px rgba(124, 58, 237, 0.50);
 
-  /* Type — three voices: Inter (machine UI) · JetBrains Mono (data) · Fraunces (human) */
-  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
-  --font-serif: "Fraunces", "Iowan Old Style", Georgia, serif;
+  /* ── Type voices ─────────────────────────────────────────────────────────── */
+  --font-sans:  "Inter",          system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono:  "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --font-serif: "Fraunces",       "Iowan Old Style", Georgia, serif; /* greeting ONLY */
 
   /* ── Landing marketing surface — shadcn-family tokens (light) ──────────────
-     ADDITIVE ONLY: these names are NOT used anywhere in the cockpit, so they
-     never alter Graphite Atelier. They power the public /landing hero + the
-     shadcn Button. We deliberately do NOT redefine --color-muted or
-     --color-accent here — those carry cockpit meaning (warm taupe / bronze). */
-  --color-background: #ffffff;
-  --color-foreground: #1f2937;
-  --color-primary: #18181b;
-  --color-primary-foreground: #fafafa;
-  --color-secondary: #f4f4f5;
-  --color-secondary-foreground: #18181b;
-  --color-destructive: #ef4444;
+     ADDITIVE ONLY: these names are NOT used in the cockpit. */
+  --color-background:             #ffffff;
+  --color-foreground:             #1f2937;
+  --color-primary:                #18181b;
+  --color-primary-foreground:     #fafafa;
+  --color-secondary:              #f4f4f5;
+  --color-secondary-foreground:   #18181b;
+  --color-destructive:            #ef4444;
   --color-destructive-foreground: #fafafa;
-  --color-accent-foreground: #18181b;
-  --color-border: #e5e7eb;
-  --color-input: #e5e7eb;
-  --color-ring: #a1a1aa;
+  --color-accent-foreground:      #18181b;
+  --color-border:                 #e5e7eb;
+  --color-input:                  #e5e7eb;
+  --color-ring:                   #a1a1aa;
 }
 
 @layer base {
-  /* Minimal global reset — only what's safe for the legacy app to share. */
   html,
   body { margin: 0; }
   #root { min-height: 100vh; }
 
-  /* Scoped reset — restores the bits Tailwind's preflight would have provided,
-     but ONLY inside the Cockpit subtree. */
+  /* Scoped reset — only inside the Cockpit subtree. */
   .cockpit-root {
     font-family: var(--font-sans);
-    background: var(--color-bg);
+    /* Three-layer ambient void:
+       violet crown bleeds above viewport (top) →
+       electric-blue depth pool (bottom-right) →
+       secondary violet wrap (bottom-left) →
+       deep void base */
+    background:
+      radial-gradient(ellipse 80% 60% at 50% -10%,  rgba(109, 40, 217, 0.35) 0%, transparent 70%),
+      radial-gradient(ellipse 50% 50% at 92% 105%,  rgba(59, 130, 246, 0.22) 0%, transparent 70%),
+      radial-gradient(ellipse 40% 40% at  5%  90%,  rgba(109, 40, 217, 0.12) 0%, transparent 70%),
+      #060012;
     color: var(--color-ink);
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
@@ -92,7 +108,6 @@
   .cockpit-root *::before,
   .cockpit-root *::after {
     box-sizing: border-box;
-    /* Tailwind's border utilities assume this default border model. */
     border-width: 0;
     border-style: solid;
     border-color: var(--color-line);
@@ -108,17 +123,15 @@
     background: none;
     cursor: pointer;
   }
-  .cockpit-root input { font: inherit; color: inherit; }
-  .cockpit-root a { color: inherit; text-decoration: none; }
+  .cockpit-root input  { font: inherit; color: inherit; }
+  .cockpit-root a      { color: inherit; text-decoration: none; }
   .cockpit-root :focus-visible {
-    outline: 2px solid var(--color-accent);
+    outline: 2px solid var(--color-glow);
     outline-offset: 2px;
   }
 }
 
-/* ── Landing surface reset — scoped to .landing-root, mirroring the cockpit's
-   own scoped reset (Tailwind preflight is off). Keeps the public marketing page
-   self-contained; it never leaks into .cockpit-root and vice-versa. */
+/* ── Landing surface reset — scoped to .landing-root ────────────────────────── */
 @layer base {
   .landing-root {
     font-family: var(--font-sans);
@@ -139,13 +152,9 @@
   .landing-root p { margin: 0; }
 }
 
-/* ── Graphite Atelier motion — the whisper budget ────────────────────────────
-   The "one-thing" focus mechanic. Unselected queue rows recede via Tailwind
-   opacity transitions; the selected person's thread + memory pane rise into
-   view. The Human (Fraunces) layer recalls a touch slower than the Machine, so
-   it reads as remembered, not rendered. The confidence bar draws once, never
-   loops. All of these inherit the reduced-motion kill-switch above (they live
-   inside .cockpit-root). */
+/* ── Motion — the whisper budget ─────────────────────────────────────────────
+   CSS-only keyframes. Framer Motion handles component entrances in TSX.
+   cq-grow is the single draw-once exception; it never loops. */
 @keyframes cq-rise {
   from { opacity: 0; transform: translateY(8px); }
   to   { opacity: 1; transform: translateY(0); }
@@ -158,16 +167,15 @@
   from { width: 0; }
   to   { width: var(--w, 0%); }
 }
-.cockpit-root .cq-rise      { animation: cq-rise 0.26s ease both; }
+.cockpit-root .cq-rise      { animation: cq-rise      0.26s ease both; }
 .cockpit-root .cq-rise-slow { animation: cq-rise-slow 0.42s ease both; }
 .cockpit-root .cq-grow      { animation: cq-grow 0.7s cubic-bezier(0.22, 1, 0.36, 1) both; }
 
-/* Respect reduced-motion across the whole Cockpit (!important beats any layer). */
 @media (prefers-reduced-motion: reduce) {
   .cockpit-root *,
   .cockpit-root *::before,
   .cockpit-root *::after {
-    animation-duration: 0.01ms !important;
+    animation-duration:  0.01ms !important;
     transition-duration: 0.01ms !important;
   }
 }
