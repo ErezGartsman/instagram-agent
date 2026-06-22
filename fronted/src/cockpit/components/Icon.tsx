@@ -13,6 +13,8 @@ export type IconName =
   | 'clock'
   | 'queue'
   | 'chart'
+  | 'x'
+  | 'send'
 
 type Props = { name: IconName; size?: number } & Omit<SVGProps<SVGSVGElement>, 'name'>
 
@@ -123,6 +125,20 @@ export function Icon({ name, size = 18, ...rest }: Props) {
           <rect x="6" y="11" width="3" height="6" rx="0.5" />
           <rect x="11" y="7" width="3" height="10" rx="0.5" />
           <rect x="16" y="13" width="3" height="4" rx="0.5" />
+        </svg>
+      )
+    case 'x':
+      return (
+        <svg {...common}>
+          <line x1="18" y1="6" x2="6" y2="18" />
+          <line x1="6" y1="6" x2="18" y2="18" />
+        </svg>
+      )
+    case 'send':
+      return (
+        <svg {...common}>
+          <path d="M22 2 11 13" />
+          <path d="M22 2 15 22 11 13 2 9z" />
         </svg>
       )
   }
