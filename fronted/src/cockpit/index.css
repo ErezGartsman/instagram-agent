@@ -59,6 +59,8 @@
   --shadow-card: 0 0 24px rgba(124, 58, 237, 0.20), inset 0 1px 0 rgba(255, 255, 255, 0.08);
   /* Pip: lit filament — for active nav marker and neon accents */
   --shadow-glow: 0 0 8px rgba(167, 139, 250, 0.90), 0 0 16px rgba(124, 58, 237, 0.50);
+  /* Search focus: crisp violet ring + calm dual-glow bloom (static — no spin) */
+  --shadow-search-focus: 0 0 0 1px rgba(124, 58, 237, 0.35), 0 0 22px rgba(124, 58, 237, 0.20), 0 0 36px rgba(59, 130, 246, 0.10);
 
   /* ── Type voices ─────────────────────────────────────────────────────────── */
   --font-sans:  "Inter",          system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -171,37 +173,15 @@
 .cockpit-root .cq-rise-slow { animation: cq-rise-slow 0.42s ease both; }
 .cockpit-root .cq-grow      { animation: cq-grow 0.7s cubic-bezier(0.22, 1, 0.36, 1) both; }
 
-/* ── Animated glow search (Topbar) ───────────────────────────────────────────
-   A conic violet→electric-blue ring that orbits the field. Discipline: it stays
-   PAUSED at rest — no decorative idle loop — and only spins while the field is
-   hovered/focused, so neon stays tied to the active state. The reduced-motion
-   guard below flattens the orbit to a static glow automatically. */
-@keyframes cq-orbit { to { transform: rotate(1turn); } }
-
-.cockpit-root .cq-search-glow {
-  position: absolute;
-  inset: -2px;
-  border-radius: inherit;
-  background: conic-gradient(
-    from 0deg,
-    transparent 0deg,
-    #7c3aed 60deg,    /* deep violet */
-    #3b82f6 140deg,   /* electric blue */
-    #a78bfa 220deg,   /* bright violet */
-    transparent 300deg
-  );
-  filter: blur(7px);
-  opacity: 0.35;
-  pointer-events: none;
-  transition: opacity 0.3s ease;
-  animation: cq-orbit 4.5s linear infinite;
-  animation-play-state: paused;
+/* ── Glass search focus (Topbar) — static dual-glow bloom, no motion ───────────
+   Scoped CSS (not a JIT focus utility) so it's reliable; the reduced-motion guard
+   flattens the transition. */
+.cockpit-root .cq-search { transition: border-color 0.3s ease, box-shadow 0.3s ease; }
+.cockpit-root .cq-search:focus-within {
+  border-color: rgba(124, 58, 237, 0.6);
+  box-shadow: var(--shadow-search-focus);
 }
-.cockpit-root .cq-search:hover .cq-search-glow,
-.cockpit-root .cq-search:focus-within .cq-search-glow {
-  opacity: 0.9;
-  animation-play-state: running;
-}
+.cockpit-root .cq-search:focus-within svg { color: var(--color-glow); }
 
 @media (prefers-reduced-motion: reduce) {
   .cockpit-root *,
