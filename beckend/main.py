@@ -237,7 +237,7 @@ def _fetch_jwks(supabase_url: str) -> dict:
         return {}
 
     try:
-        url = f"{supabase_url.rstrip('/')}/.well-known/jwks.json"
+        url = f"{supabase_url.rstrip('/')}/auth/v1/.well-known/jwks.json"
         logger.debug("[JWKS_FETCH_URL] %s", url[:60])  # Log first 60 chars of URL
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=5) as resp:
