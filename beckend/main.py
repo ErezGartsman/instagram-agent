@@ -130,13 +130,15 @@ class Settings(BaseSettings):
     kapso_api_base:        str = "https://api.kapso.ai/meta/whatsapp/v24.0"
 
     # ── Cockpit (Sprint 5 command center — Supabase auth) ──────────────────────
-    # supabase_jwt_secret:    the project's JWT secret (Supabase -> Settings -> API
-    #   -> JWT Secret). HS256 — verifies the access token the browser presents.
+    # supabase_url:            the Supabase project URL (https://<project-ref>.supabase.co).
+    #   Used to fetch JWKS for asymmetric ES256 token verification (new standard).
+    # supabase_jwt_secret:    legacy HS256 symmetric secret for backward compatibility.
     #   Empty string => the Cockpit auth endpoints return 503, so CI and
     #   unconfigured deploys fail closed rather than ever trusting an unverified token.
     # cockpit_allowed_emails: optional comma-separated allow-list. Empty => any
     #   Supabase-authenticated user is accepted (the Supabase signup restriction is
     #   the primary gate); set it to lock the Cockpit to specific addresses.
+    supabase_url:           str = ""
     supabase_jwt_secret:    str = ""
     cockpit_allowed_emails: str = ""
 
@@ -218,57 +220,132 @@ def require_auth(
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
 
-# ── Cockpit auth — verify the Supabase access token (JWT, HS256) ──────────────
+# ── JWKS cache for asymmetric JWT verification (Supabase ES256) ───────────────
+_jwks_cache = {}  # { "keys": [...] }
+_jwks_cache_time = 0
+_JWKS_CACHE_TTL = 3600  # 1 hour
+
+def _fetch_jwks(supabase_url: str) -> dict:
+    """Fetch JWKS from Supabase. Cached for 1 hour to avoid hammering the API."""
+    global _jwks_cache, _jwks_cache_time
+    now = time.time()
+    if _jwks_cache and (now - _jwks_cache_time) < _JWKS_CACHE_TTL:
+        return _jwks_cache
+    try:
+        url = f"{supabase_url.rstrip('/')}/.well-known/jwks.json"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            _jwks_cache = json.loads(resp.read())
+            _jwks_cache_time = now
+            return _jwks_cache
+    except Exception as e:
+        logger.warning("[JWKS] Failed to fetch from %s: %s", url, e)
+        return {}
+
+def _get_key_for_kid(jwks: dict, kid: str) -> Optional[str]:
+    """Extract PEM public key for a given key ID from JWKS."""
+    try:
+        import json as json_mod
+        from jwt import algorithms
+        for key_data in jwks.get("keys", []):
+            if key_data.get("kid") == kid:
+                # Reconstruct the public key from JWK (ES256 P-256)
+                return algorithms.ECAlgorithm.from_jwk(json_mod.dumps(key_data))
+        return None
+    except Exception:
+        return None
+
+# ── Cockpit auth — verify Supabase access token (ES256 asymmetric or HS256 legacy) ──
 def require_cockpit_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
 ) -> dict:
     """
-    Authenticate a Cockpit request by verifying the Supabase access token sent as
-    `Authorization: Bearer <jwt>`. Returns the decoded claims on success.
+    Authenticate a Cockpit request by verifying the Supabase access token.
+    Supports both asymmetric (ES256) and legacy symmetric (HS256) keys.
 
     Fail-closed behaviour:
-      • SUPABASE_JWT_SECRET unset       -> 503 (Cockpit auth not configured).
-      • missing / malformed / expired   -> 401.
-      • valid token whose email is not
-        on COCKPIT_ALLOWED_EMAILS        -> 403.
+      • No credentials configured      -> 503
+      • missing / malformed / expired  -> 401
+      • token email not on allow-list  -> 403
 
-    The JWT secret is the Supabase project's HS256 signing secret; it stays on the
-    server. The browser only ever holds the public anon key.
+    Flow:
+    1. Try asymmetric ES256 (new Supabase standard) using JWKS
+    2. Fall back to HS256 (legacy) if JWKS unavailable
     """
     if not settings.supabase_jwt_secret:
         raise HTTPException(status_code=503, detail="Cockpit auth is not configured.")
     if credentials is None or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Missing bearer token.")
-    try:
-        claims = jwt.decode(
-            credentials.credentials,
-            settings.supabase_jwt_secret,
-            algorithms=["HS256"],
-            options={"verify_aud": False},
-            leeway=10,  # Clock skew tolerance (10s) for serverless cold-starts
-        )
-        # Enforce audience explicitly so the error is clear in logs if wrong.
-        aud = claims.get("aud", "")
-        if isinstance(aud, list):
-            aud_ok = "authenticated" in aud
-        else:
-            aud_ok = aud == "authenticated"
-        if not aud_ok:
-            logger.warning("[AUTH_AUD_MISMATCH] aud=%r", aud)
-            raise HTTPException(status_code=401, detail="Invalid token audience.")
-    except jwt.ExpiredSignatureError:
-        logger.warning("[AUTH_EXPIRED] Token timestamp outside acceptable range")
-        raise HTTPException(status_code=401, detail="Token expired — please sign in again.")
-    except jwt.InvalidSignatureError:
-        logger.error("[AUTH_SIG_INVALID] SUPABASE_JWT_SECRET mismatch or token tampered")
-        raise HTTPException(status_code=401, detail="Invalid token signature.")
-    except jwt.InvalidTokenError as exc:
-        logger.warning("[AUTH_DECODE_ERR] %s", type(exc).__name__)
-        raise HTTPException(status_code=401, detail="Malformed token.")
-    except jwt.PyJWTError as exc:
-        logger.warning("[AUTH_OTHER_ERR] %s", type(exc).__name__)
-        raise HTTPException(status_code=401, detail="Invalid token.")
 
+    token = credentials.credentials
+    claims = None
+
+    # Try asymmetric verification first (ES256 with JWKS)
+    if settings.supabase_url:
+        try:
+            # Decode header to get kid without verification
+            header = jwt.get_unverified_header(token)
+            kid = header.get("kid")
+            if kid:
+                jwks = _fetch_jwks(settings.supabase_url)
+                key = _get_key_for_kid(jwks, kid)
+                if key:
+                    try:
+                        claims = jwt.decode(
+                            token, key, algorithms=["ES256"],
+                            options={"verify_aud": False},
+                            leeway=10,
+                        )
+                        logger.info("[AUTH_ES256_OK]")
+                    except jwt.ExpiredSignatureError:
+                        logger.warning("[AUTH_EXPIRED]")
+                        raise HTTPException(status_code=401, detail="Token expired — please sign in again.")
+                    except jwt.InvalidSignatureError:
+                        logger.warning("[AUTH_ES256_SIG_INVALID]")
+                        raise HTTPException(status_code=401, detail="Invalid token signature.")
+                    except jwt.PyJWTError as e:
+                        logger.warning("[AUTH_ES256_ERROR] %s", type(e).__name__)
+                        raise HTTPException(status_code=401, detail="Invalid token.")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.debug("[AUTH_ES256_FALLBACK] %s", e)
+
+    # Fall back to HS256 (legacy symmetric)
+    if not claims:
+        try:
+            claims = jwt.decode(
+                token,
+                settings.supabase_jwt_secret,
+                algorithms=["HS256"],
+                options={"verify_aud": False},
+                leeway=10,
+            )
+            logger.info("[AUTH_HS256_OK]")
+        except jwt.ExpiredSignatureError:
+            logger.warning("[AUTH_EXPIRED]")
+            raise HTTPException(status_code=401, detail="Token expired — please sign in again.")
+        except jwt.InvalidSignatureError:
+            logger.error("[AUTH_SIG_INVALID]")
+            raise HTTPException(status_code=401, detail="Invalid token signature.")
+        except jwt.InvalidAlgorithmError:
+            logger.error("[AUTH_ALG_ERROR]")
+            raise HTTPException(status_code=401, detail="Invalid token — algorithm mismatch.")
+        except jwt.PyJWTError:
+            logger.warning("[AUTH_HS256_ERROR]")
+            raise HTTPException(status_code=401, detail="Invalid token.")
+
+    # Validate audience claim
+    aud = claims.get("aud", "")
+    if isinstance(aud, list):
+        aud_ok = "authenticated" in aud
+    else:
+        aud_ok = aud == "authenticated"
+    if not aud_ok:
+        logger.warning("[AUTH_AUD_MISMATCH] aud=%r", aud)
+        raise HTTPException(status_code=401, detail="Invalid token audience.")
+
+    # Check email allow-list
     email = (claims.get("email") or "").strip().lower()
     allow = [e.strip().lower() for e in settings.cockpit_allowed_emails.split(",") if e.strip()]
     if allow and email not in allow:
