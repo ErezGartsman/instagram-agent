@@ -42,7 +42,8 @@ type AuthValue = {
   /** True when the dev-only auth bypass is active (never in production). */
   devBypass: boolean
   recheck: () => void
-  signInWithEmail: (email: string) => Promise<{ error: string | null }>
+  signInWithPassword: (email: string, password: string) => Promise<{ error: string | null }>
+  signInWithGoogle: () => Promise<{ error: string | null }>
   signOut: () => Promise<void>
 }
 
@@ -128,10 +129,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       profile,
       devBypass: DEV_BYPASS,
       recheck,
-      signInWithEmail: async (email) => {
-        const { error } = await supabase.auth.signInWithOtp({
-          email,
-          options: { emailRedirectTo: `${window.location.origin}/app` },
+      signInWithPassword: async (email, password) => {
+        const { error } = await supabase.auth.signInWithPassword({ email, password })
+        return { error: error?.message ?? null }
+      },
+      signInWithGoogle: async () => {
+        const { error } = await supabase.auth.signInWithOAuth({
+          provider: 'google',
+          options: { redirectTo: `${window.location.origin}/app` },
         })
         return { error: error?.message ?? null }
       },

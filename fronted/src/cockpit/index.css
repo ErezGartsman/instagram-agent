@@ -176,12 +176,15 @@
 /* ── Glass search focus (Topbar) — static dual-glow bloom, no motion ───────────
    Scoped CSS (not a JIT focus utility) so it's reliable; the reduced-motion guard
    flattens the transition. */
-.cockpit-root .cq-search { transition: border-color 0.3s ease, box-shadow 0.3s ease; }
-.cockpit-root .cq-search:focus-within {
+.cockpit-root .cq-search,
+.cockpit-root .cq-field { transition: border-color 0.3s ease, box-shadow 0.3s ease; }
+.cockpit-root .cq-search:focus-within,
+.cockpit-root .cq-field:focus-within {
   border-color: rgba(124, 58, 237, 0.6);
   box-shadow: var(--shadow-search-focus);
 }
-.cockpit-root .cq-search:focus-within svg { color: var(--color-glow); }
+.cockpit-root .cq-search:focus-within svg,
+.cockpit-root .cq-field:focus-within svg { color: var(--color-glow); }
 
 @media (prefers-reduced-motion: reduce) {
   .cockpit-root *,
