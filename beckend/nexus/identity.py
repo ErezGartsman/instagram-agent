@@ -186,3 +186,28 @@ def attach_phone_identity(conn, person_id: str, raw_phone: object) -> str:
             (person_id, e164),
         )
         return "linked"
+
+
+def resolve_whatsapp_recipient(conn, person_id: str) -> str | None:
+    """
+    The lead's WhatsApp recipient id for an outbound send — digits, no '+',
+    exactly what the Meta/Kapso `to` field expects.
+
+    Prefers a 'whatsapp' identity (its external_id IS the wa_id Meta uses), and
+    falls back to a 'phone' identity (E.164 → digits). Returns None when the person
+    has no reachable WhatsApp number — callers MUST treat None as "cannot send",
+    never guess. Commit-free.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT channel, external_id FROM person_identity "
+            "WHERE person_id = %s AND channel IN ('whatsapp', 'phone')",
+            (person_id,),
+        )
+        rows = cur.fetchall()
+    chosen = next((eid for ch, eid in rows if ch == "whatsapp"), None) \
+        or next((eid for ch, eid in rows if ch == "phone"), None)
+    if not chosen:
+        return None
+    digits = re.sub(r"\D", "", str(chosen))
+    return digits or None

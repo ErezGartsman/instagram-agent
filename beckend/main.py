@@ -1734,21 +1734,54 @@ class QueueActionBody(BaseModel):
     message: Optional[str] = None          # phase-2 forward-compat (send); ignored in v1
 
 
-def _dispatch_outreach(conn, person_id: str, channel: Optional[str],
+def _wa_extract_message_id(resp: Optional[str]) -> Optional[str]:
+    """Best-effort pull of the wamid from a Meta/Kapso send response."""
+    try:
+        msgs = (json.loads(resp or "") or {}).get("messages") or []
+        return msgs[0].get("id") if msgs else None
+    except Exception:
+        return None
+
+
+def _dispatch_outreach(conn, person_id: str, opportunity_id: str,
                        message: Optional[str], *, by: str,
                        reason: Optional[str] = None) -> None:
     """
-    The 'Send message' seam. v1 records that the operator did the outreach (a
-    `contacted` signal — its recency reset drops the lead in the ranking). Phase 2
-    fills the real WhatsApp send in here WITHOUT changing the endpoint contract:
-    resolve the recipient from the identity layer, KapsoChannel.send_text(...),
-    persist the verbatim body to the `messages` table (PII discipline — the
-    interaction stays ref-only), and stamp the returned message_id onto the
-    payload. The `message` field already rides the request for that day.
+    The 'Send message' actuator. Resolves the lead's WhatsApp number from the
+    identity layer, sends via Kapso, records the verbatim body to outbound_messages
+    (operator-authored audit — distinct from the lead's out-of-system inbound), and
+    logs a REF-ONLY `contacted` signal ({by, message_id} — never the body).
+
+    Send-then-commit: the send is an un-rollback-able side effect, so we do it
+    BEFORE any writes — a failure raises (no DB changes) and the endpoint returns
+    non-2xx → the optimistic UI rolls the card back. Commit-free; the endpoint owns
+    the transaction. (The frontend's delayed commit means Undo still cancels before
+    a single message leaves.)
     """
+    text = (message or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Message is empty.")
+    recipient = nexus_identity.resolve_whatsapp_recipient(conn, person_id)
+    if not recipient:
+        raise HTTPException(status_code=422, detail="This lead has no WhatsApp number.")
+
+    resp = _KAPSO_CHANNEL.send_text(recipient, text)
+    if resp is None:
+        # _kapso_call logged the actionable reason (token scope, 24h-window, bad
+        # recipient). Surface a clean failure so the card rolls back.
+        raise HTTPException(status_code=502, detail="WhatsApp send failed.")
+    message_id = _wa_extract_message_id(resp)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO outbound_messages "
+            "(person_id, opportunity_id, channel, body, provider_message_id, sent_by) "
+            "VALUES (%s, %s, 'whatsapp', %s, %s, %s)",
+            (person_id, opportunity_id, text, message_id, by),
+        )
     nexus_interactions.log_interaction(
-        conn, "contacted", channel or "cockpit", person_id=person_id,
-        payload={"by": by, "via": "cockpit", "reason": reason},
+        conn, "contacted", "whatsapp", person_id=person_id,
+        payload={"by": by, "via": "cockpit", "message_id": message_id, "length": len(text)},
     )
 
 
@@ -1776,14 +1809,14 @@ def cockpit_queue_action(opportunity_id: str, body: QueueActionBody,
         with get_db_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT person_id, stage, source_channel, closed_at "
+                    "SELECT person_id, stage, closed_at "
                     "FROM opportunities WHERE id = %s",
                     (opportunity_id,),
                 )
                 row = cur.fetchone()
             if row is None:
                 raise HTTPException(status_code=404, detail="Opportunity not found.")
-            person_id, stage, channel, closed_at = str(row[0]), row[1], row[2], row[3]
+            person_id, stage, closed_at = str(row[0]), row[1], row[2]
 
             if closed_at is not None:
                 # Already closed: dismiss is a benign no-op; acting on it is a conflict.
@@ -1795,7 +1828,7 @@ def cockpit_queue_action(opportunity_id: str, body: QueueActionBody,
             snoozed_until = None
             closed = False
             if action == "send":
-                _dispatch_outreach(conn, person_id, channel, body.message,
+                _dispatch_outreach(conn, person_id, opportunity_id, body.message,
                                    by=by, reason=body.reason)
             elif action == "done":
                 snoozed_until = nexus_interactions.snooze_opportunity(
@@ -5186,9 +5219,13 @@ class WhatsAppChannel(MessagingChannel):
         is shared verbatim."""
         return _wa_graph_call(payload)
 
-    def send_text(self, recipient_id: str, text: str) -> None:
+    def send_text(self, recipient_id: str, text: str) -> Optional[str]:
+        """Returns the raw provider response (carries the wamid) on success, or
+        None on failure — so callers that need delivery confirmation (the cockpit
+        Action Loop) can detect it. Funnel callers ignore the return; behaviour is
+        unchanged and it still never raises."""
         body = (text or "").strip()[:4096] or "…"
-        self._send({
+        return self._send({
             "messaging_product": "whatsapp",
             "recipient_type":    "individual",
             "to":                recipient_id,

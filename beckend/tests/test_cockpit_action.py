@@ -48,9 +48,9 @@ def _mock_get_db_conn(row):
 
 
 OPP_ID = "11111111-1111-1111-1111-111111111111"
-OPEN_ROW = (OPP_ID, "captured", "whatsapp", None)
-CLOSED_ROW = (OPP_ID, "lost", "whatsapp",
-              datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc))
+# Rows match the endpoint's pre-check SELECT: (person_id, stage, closed_at).
+OPEN_ROW = (OPP_ID, "captured", None)
+CLOSED_ROW = (OPP_ID, "lost", datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc))
 
 
 def _post(client, **body):
@@ -101,10 +101,10 @@ class TestQueueAction:
         assert r.json()["closed"] is True
         assert close.call_args.args[2] == "lost"
 
-    def test_send_records_outreach(self, client):
+    def test_send_routes_to_dispatch(self, client):
         with patch.object(main, "get_db_conn", _mock_get_db_conn(OPEN_ROW)), \
              patch.object(main, "_dispatch_outreach") as disp:
-            r = _post(client, type="send")
+            r = _post(client, type="send", message="Hi Maya, here's the link")
         assert r.status_code == 200
         assert r.json()["closed"] is False
         disp.assert_called_once()
@@ -129,3 +129,49 @@ class TestQueueAction:
             r = _post(client, type="dismiss")
         assert r.status_code == 200
         assert r.json()["closed"] is True
+
+
+class TestSendOutreach:
+    """The real _dispatch_outreach flow (Kapso send) — Phase 2."""
+
+    def _send(self, client, message="Hi Maya, here's the link"):
+        return client.post(f"/api/cockpit/queue/{OPP_ID}/action",
+                           json={"type": "send", "message": message})
+
+    def test_send_success_is_ref_only(self, client):
+        with patch.object(main, "get_db_conn", _mock_get_db_conn(OPEN_ROW)), \
+             patch.object(main.nexus_identity, "resolve_whatsapp_recipient",
+                          return_value="972500000000"), \
+             patch.object(main._KAPSO_CHANNEL, "send_text",
+                          return_value='{"messages":[{"id":"wamid.ABC"}]}') as snd, \
+             patch.object(main.nexus_interactions, "log_interaction") as logi:
+            r = self._send(client, "Hi Maya, here's the booking link")
+        assert r.status_code == 200
+        assert r.json()["closed"] is False
+        assert snd.call_args.args[0] == "972500000000"          # resolved recipient
+        # PII discipline: the body must NOT land in the interaction payload.
+        payload = logi.call_args.kwargs.get("payload", {})
+        assert "booking link" not in str(payload)
+        assert payload.get("message_id") == "wamid.ABC"
+
+    def test_send_no_recipient_422(self, client):
+        with patch.object(main, "get_db_conn", _mock_get_db_conn(OPEN_ROW)), \
+             patch.object(main.nexus_identity, "resolve_whatsapp_recipient",
+                          return_value=None):
+            r = self._send(client)
+        assert r.status_code == 422
+
+    def test_send_kapso_failure_502(self, client):
+        with patch.object(main, "get_db_conn", _mock_get_db_conn(OPEN_ROW)), \
+             patch.object(main.nexus_identity, "resolve_whatsapp_recipient",
+                          return_value="972500000000"), \
+             patch.object(main._KAPSO_CHANNEL, "send_text", return_value=None):
+            r = self._send(client)
+        assert r.status_code == 502
+
+    def test_send_empty_message_400(self, client):
+        with patch.object(main, "get_db_conn", _mock_get_db_conn(OPEN_ROW)), \
+             patch.object(main.nexus_identity, "resolve_whatsapp_recipient",
+                          return_value="972500000000"):
+            r = self._send(client, "   ")
+        assert r.status_code == 400

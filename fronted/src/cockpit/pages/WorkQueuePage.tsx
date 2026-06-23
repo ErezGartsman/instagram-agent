@@ -47,6 +47,20 @@ const DEV_SIMULATE_FAILURE = false // dev-bypass only: flip to exercise the roll
 const EASE: [number, number, number, number] = [0.25, 0.4, 0.25, 1]
 const EASE_OUT: [number, number, number, number] = [0.4, 0, 0.2, 1]
 
+// Smart default for the Send composer — a personal starter Erez edits before
+// sending (never blind auto-send). Contextual to the suggested action.
+function draftFor(item: QueueItem): string {
+  const first = item.name.split(' ')[0] || 'there'
+  const a = (item.action || '').toLowerCase()
+  if (a.includes('book')) {
+    return `Hi ${first}, ready to find a time that works for you? Here's the link to book: `
+  }
+  if (a.includes('check') || a.includes('re-engage') || a.includes('nudge') || a.includes('reopen')) {
+    return `Hi ${first}, just checking in — how are things going? `
+  }
+  return `Hi ${first}, `
+}
+
 /**
  * Ticket 5.2 — the 3-pane Work Queue, the core of the Decision Engine, with the
  * Action Loop (P0 ①) now wired to the real backend: act on a lead and the card
@@ -82,13 +96,13 @@ export function WorkQueuePage() {
   // Board rolls the card back. Dev-bypass never calls the API (local UI work).
   const token = session?.access_token
   const commit = useCallback(
-    async (id: string, type: ActionType) => {
+    async (id: string, type: ActionType, message?: string) => {
       if (devBypass || !token) {
         console.log(`[action] ${type} → ${id} (dev mock — backend not called)`)
         if (DEV_SIMULATE_FAILURE) throw new Error('simulated failure')
         return
       }
-      await postQueueAction(token, id, type)
+      await postQueueAction(token, id, type, { message })
     },
     [devBypass, token],
   )
@@ -101,7 +115,13 @@ export function WorkQueuePage() {
 }
 
 type Toast = { item: QueueItem; index: number; type: ActionType; kind: 'undo' | 'error' }
-type Pending = { item: QueueItem; index: number; type: ActionType; timer: ReturnType<typeof setTimeout> }
+type Pending = {
+  item: QueueItem
+  index: number
+  type: ActionType
+  message?: string
+  timer: ReturnType<typeof setTimeout>
+}
 
 function Board({
   initialItems,
@@ -110,13 +130,15 @@ function Board({
 }: {
   initialItems: QueueItem[]
   sample: boolean
-  commit: (id: string, type: ActionType) => Promise<void>
+  commit: (id: string, type: ActionType, message?: string) => Promise<void>
 }) {
   const reduce = useReducedMotion()
   const [items, setItems] = useState<QueueItem[]>(initialItems)
   const [selectedId, setSelectedId] = useState<string | null>(initialItems[0]?.id ?? null)
   const [exitDir, setExitDir] = useState<ExitDir>('right')
   const [toast, setToast] = useState<Toast | null>(null)
+  const [composing, setComposing] = useState(false)
+  const [draft, setDraft] = useState('')
 
   const pendingRef = useRef<Pending | null>(null)
   const toastHideRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -136,7 +158,7 @@ function Board({
   // Send the optimistic action to the backend; roll the card back in on failure.
   const runCommit = useCallback(
     (p: Pending) => {
-      void commit(p.item.id, p.type).catch(() => {
+      void commit(p.item.id, p.type, p.message).catch(() => {
         setItems((prev) => (prev.some((i) => i.id === p.item.id) ? prev : insertAt(prev, p.index, p.item)))
         setSelectedId(p.item.id)
         if (toastHideRef.current) clearTimeout(toastHideRef.current)
@@ -180,7 +202,7 @@ function Board({
   // window closes. Side effects stay top-level (not in a state updater) so
   // StrictMode's double-invoke can't double-fire them.
   const act = useCallback(
-    (id: string, type: ActionType) => {
+    (id: string, type: ActionType, message?: string) => {
       const idx = items.findIndex((i) => i.id === id)
       if (idx === -1) return
       const item = items[idx]
@@ -204,10 +226,28 @@ function Board({
         setToast((t) => (t && t.kind === 'undo' && t.item.id === id ? null : t))
         if (p) runCommit(p)
       }, UNDO_MS)
-      pendingRef.current = { item, index: idx, type, timer }
+      pendingRef.current = { item, index: idx, type, message, timer }
     },
     [items, flushPending, runCommit],
   )
+
+  // Send composer — open (prefilled), edit, send. Resets when the lead changes.
+  useEffect(() => {
+    setComposing(false)
+  }, [selectedId])
+
+  const openComposer = useCallback(() => {
+    if (!selected) return
+    setDraft(draftFor(selected))
+    setComposing(true)
+  }, [selected])
+
+  const sendComposed = useCallback(() => {
+    const text = draft.trim()
+    if (!text || !selected) return
+    setComposing(false)
+    act(selected.id, 'send', text)
+  }, [draft, selected, act])
 
   const undo = useCallback(() => {
     const p = pendingRef.current
@@ -232,7 +272,7 @@ function Board({
       case 'ArrowUp': e.preventDefault(); move(-1); break
       case 'Enter':
       case 's':
-      case 'S': e.preventDefault(); act(selected.id, 'send'); break
+      case 'S': e.preventDefault(); openComposer(); break
       case 'e':
       case 'E': e.preventDefault(); act(selected.id, 'done'); break
       case 'z':
@@ -350,24 +390,69 @@ function Board({
                 {selected.reason}
               </div>
 
-              {/* Action Bar — the actuator (primary) + the triage trio. */}
-              <div className="mt-4 flex flex-wrap items-center gap-2">
-                <motion.button
-                  type="button"
-                  onClick={() => act(selected.id, 'send')}
-                  whileHover={reduce ? undefined : { scale: 1.03 }}
-                  whileTap={reduce ? undefined : { scale: 0.97 }}
-                  aria-label="Send message"
-                  className="inline-flex shrink-0 items-center gap-1.5 rounded-control bg-accent px-3.5 py-2 text-xs font-medium text-ink [box-shadow:var(--shadow-glow)]"
-                >
-                  <Icon name="send" size={14} /> Send message
-                </motion.button>
-                <div className="ml-auto flex items-center gap-2">
-                  <ActionButton icon="check" label="Done" tone="success" onClick={() => act(selected.id, 'done')} />
-                  <ActionButton icon="clock" label="Snooze" tone="warn" onClick={() => act(selected.id, 'snooze')} />
-                  <ActionButton icon="x" label="Dismiss" tone="danger" onClick={() => act(selected.id, 'dismiss')} />
+              {/* Action Bar — or the inline Send composer when drafting. */}
+              {composing ? (
+                <div className="mt-4 rounded-control border border-line bg-bg/70 p-2.5 backdrop-blur-xl [box-shadow:var(--shadow-card)]">
+                  <textarea
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      e.stopPropagation()
+                      if (e.key === 'Escape') {
+                        e.preventDefault()
+                        setComposing(false)
+                      } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                        e.preventDefault()
+                        sendComposed()
+                      }
+                    }}
+                    rows={3}
+                    autoFocus
+                    placeholder={`Message ${selected.name} on WhatsApp…`}
+                    className="w-full resize-none bg-transparent text-sm leading-relaxed text-ink outline-none placeholder:text-faint"
+                  />
+                  <div className="mt-2 flex items-center justify-between gap-2">
+                    <span className="font-mono text-[10px] text-faint">⌘↵ send · esc cancel · via WhatsApp</span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setComposing(false)}
+                        className="rounded-control px-3 py-1.5 text-xs text-muted transition-colors hover:bg-raised hover:text-ink"
+                      >
+                        Cancel
+                      </button>
+                      <motion.button
+                        type="button"
+                        onClick={sendComposed}
+                        disabled={!draft.trim()}
+                        whileHover={reduce || !draft.trim() ? undefined : { scale: 1.03 }}
+                        whileTap={reduce || !draft.trim() ? undefined : { scale: 0.97 }}
+                        className="inline-flex items-center gap-1.5 rounded-control bg-accent px-3.5 py-1.5 text-xs font-medium text-ink transition-opacity [box-shadow:var(--shadow-glow)] disabled:opacity-40 disabled:[box-shadow:none]"
+                      >
+                        <Icon name="send" size={13} /> Send
+                      </motion.button>
+                    </div>
+                  </div>
                 </div>
-              </div>
+              ) : (
+                <div className="mt-4 flex flex-wrap items-center gap-2">
+                  <motion.button
+                    type="button"
+                    onClick={openComposer}
+                    whileHover={reduce ? undefined : { scale: 1.03 }}
+                    whileTap={reduce ? undefined : { scale: 0.97 }}
+                    aria-label="Send message"
+                    className="inline-flex shrink-0 items-center gap-1.5 rounded-control bg-accent px-3.5 py-2 text-xs font-medium text-ink [box-shadow:var(--shadow-glow)]"
+                  >
+                    <Icon name="send" size={14} /> Send message
+                  </motion.button>
+                  <div className="ml-auto flex items-center gap-2">
+                    <ActionButton icon="check" label="Done" tone="success" onClick={() => act(selected.id, 'done')} />
+                    <ActionButton icon="clock" label="Snooze" tone="warn" onClick={() => act(selected.id, 'snooze')} />
+                    <ActionButton icon="x" label="Dismiss" tone="danger" onClick={() => act(selected.id, 'dismiss')} />
+                  </div>
+                </div>
+              )}
             </div>
           </section>
 
