@@ -74,11 +74,11 @@ export function LoginScreen() {
 
   return (
     <div className="relative flex min-h-screen items-center justify-center px-6">
-      {/* Vault glow — a soft violet pool behind the card for depth. */}
+      {/* Ambient gold glow — a soft champagne pool behind the card for warmth. */}
       <div
         aria-hidden
         className="pointer-events-none absolute left-1/2 top-1/2 h-[460px] w-[460px] -translate-x-1/2 -translate-y-1/2 rounded-full"
-        style={{ background: 'radial-gradient(circle, rgba(124,58,237,0.18) 0%, transparent 70%)' }}
+        style={{ background: 'radial-gradient(circle, rgba(184,134,11,0.12) 0%, transparent 70%)' }}
       />
 
       <motion.div
@@ -87,9 +87,9 @@ export function LoginScreen() {
         transition={{ duration: 0.42, ease: EASE }}
         className="relative w-[380px] max-w-full"
       >
-        {/* Brand */}
+        {/* Brand — Warm Gold Hexagon */}
         <div className="mb-7 flex items-center justify-center gap-3">
-          <span className="grid h-9 w-9 place-items-center rounded-control bg-accent text-bg [box-shadow:0_0_18px_rgba(124,58,237,0.55)]">
+          <span className="grid h-9 w-9 place-items-center rounded-control bg-accent text-bg [box-shadow:0_0_18px_rgba(184,134,11,0.45)]">
             <Hexagon size={18} strokeWidth={2} aria-hidden />
           </span>
           <div className="flex flex-col leading-tight">
@@ -163,7 +163,7 @@ export function LoginScreen() {
                   disabled={busy !== false}
                   whileHover={reduce || busy ? undefined : { scale: 1.02 }}
                   whileTap={reduce || busy ? undefined : { scale: 0.98 }}
-                  className="mt-6 flex w-full items-center justify-center gap-2 rounded-control bg-accent py-2.5 text-sm font-semibold text-ink [box-shadow:var(--shadow-glow)] transition-opacity disabled:opacity-60"
+                  className="mt-6 flex w-full items-center justify-center gap-2 rounded-control bg-accent py-2.5 text-sm font-semibold text-bg transition-all hover:opacity-90 disabled:opacity-60 [box-shadow:var(--shadow-glow)]"
                 >
                   {busy === 'password' ? (
                     <>

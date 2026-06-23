@@ -25,25 +25,25 @@
 @source "../landing/**/*.{ts,tsx}";
 
 @theme {
-  /* ── Void base ───────────────────────────────────────────────────────────── */
-  --color-bg: #060012;          /* deepest void — also used by text-bg utility  */
+  /* ── Void base — Warm Charcoal ──────────────────────────────────────────── */
+  --color-bg: #0e0b08;          /* warm charcoal — premium dark tone           */
 
-  /* ── Glass surfaces — RGBA, not solid fills ─────────────────────────────── */
-  --color-surface: rgba(255, 255, 255, 0.08);   /* primary glass panel         */
-  --color-raised:  rgba(255, 255, 255, 0.12);   /* hover / active glass layer  */
+  /* ── Glass surfaces — RGBA warm tone, not cool white ─────────────────────── */
+  --color-surface: rgba(255, 235, 180, 0.05);   /* champagne glass: elegant   */
+  --color-raised:  rgba(255, 235, 180, 0.08);   /* hover / active glass layer */
 
   /* ── Text hierarchy ─────────────────────────────────────────────────────── */
   --color-ink:   #ffffff;   /* pure white — primary text  */
   --color-muted: #a1a1aa;   /* zinc-400   — secondary     */
   --color-faint: #52525b;   /* zinc-600   — hints/labels  */
 
-  /* ── Glass borders — ultra-whisper white hairlines ──────────────────────── */
-  --color-line: rgba(255, 255, 255, 0.08);
+  /* ── Glass borders — warm gold hairlines ──────────────────────────────────── */
+  --color-line: rgba(255, 235, 180, 0.06);
 
-  /* ── Neon accent system ─────────────────────────────────────────────────── */
-  --color-accent: #7c3aed;   /* violet-700 — base fills, badges              */
-  --color-glow:   #a78bfa;   /* violet-400 — neon text, pip, gradient tips   */
-  --color-sage:   #60a5fa;   /* blue-400   — electric blue / live / tech cue */
+  /* ── Accent system — Dark Gold & Champagne (warm luxury) ──────────────────── */
+  --color-accent: #b8860b;   /* dark gold — primary fills & badges          */
+  --color-glow:   #d4a843;   /* amber-gold — warm glow & highlights         */
+  --color-sage:   #8fbc8f;   /* sage green — calm, therapeutic accent      */
 
   /* ── Status palette — warm-tuned, attention not alarm ───────────────────── */
   --color-success: #7fa97f;
@@ -54,13 +54,13 @@
   --radius-control: 9px;
   --radius-card:    14px;
 
-  /* ── Glass elevation system ─────────────────────────────────────────────── */
-  /* Card: ambient violet glow + inset top-edge highlight */
-  --shadow-card: 0 0 24px rgba(124, 58, 237, 0.20), inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  /* Pip: lit filament — for active nav marker and neon accents */
-  --shadow-glow: 0 0 8px rgba(167, 139, 250, 0.90), 0 0 16px rgba(124, 58, 237, 0.50);
-  /* Search focus: crisp violet ring + calm dual-glow bloom (static — no spin) */
-  --shadow-search-focus: 0 0 0 1px rgba(124, 58, 237, 0.35), 0 0 22px rgba(124, 58, 237, 0.20), 0 0 36px rgba(59, 130, 246, 0.10);
+  /* ── Glass elevation system — Warm Gold ──────────────────────────────────── */
+  /* Card: ambient gold glow + inset champagne top-edge */
+  --shadow-card: 0 0 24px rgba(180, 134, 11, 0.15), inset 0 1px 0 rgba(255, 235, 180, 0.08);
+  /* Pip: warm gold filament — for active nav and elegant accents */
+  --shadow-glow: 0 0 8px rgba(212, 168, 67, 0.85), 0 0 16px rgba(184, 134, 11, 0.40);
+  /* Search focus: gold ring + calm champagne glow (static) */
+  --shadow-search-focus: 0 0 0 1px rgba(184, 134, 11, 0.35), 0 0 22px rgba(184, 134, 11, 0.18), 0 0 36px rgba(212, 168, 67, 0.10);
 
   /* ── Type voices ─────────────────────────────────────────────────────────── */
   --font-sans:  "Inter",          system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -91,16 +91,16 @@
   /* Scoped reset — only inside the Cockpit subtree. */
   .cockpit-root {
     font-family: var(--font-sans);
-    /* Three-layer ambient void:
-       violet crown bleeds above viewport (top) →
-       electric-blue depth pool (bottom-right) →
-       secondary violet wrap (bottom-left) →
-       deep void base */
+    /* Three-layer ambient void (Warm Luxury):
+       Gold crown bleeds above viewport (top) →
+       Warm amber depth pool (bottom-right) →
+       Soft champagne wrap (bottom-left) →
+       warm charcoal base */
     background:
-      radial-gradient(ellipse 80% 60% at 50% -10%,  rgba(109, 40, 217, 0.35) 0%, transparent 70%),
-      radial-gradient(ellipse 50% 50% at 92% 105%,  rgba(59, 130, 246, 0.22) 0%, transparent 70%),
-      radial-gradient(ellipse 40% 40% at  5%  90%,  rgba(109, 40, 217, 0.12) 0%, transparent 70%),
-      #060012;
+      radial-gradient(ellipse 80% 60% at 50% -10%,  rgba(184, 134, 11, 0.22) 0%, transparent 70%),
+      radial-gradient(ellipse 50% 50% at 92% 105%,  rgba(212, 168, 67, 0.15) 0%, transparent 70%),
+      radial-gradient(ellipse 40% 40% at  5%  90%,  rgba(184, 134, 11, 0.08) 0%, transparent 70%),
+      #0e0b08;
     color: var(--color-ink);
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
@@ -173,14 +173,14 @@
 .cockpit-root .cq-rise-slow { animation: cq-rise-slow 0.42s ease both; }
 .cockpit-root .cq-grow      { animation: cq-grow 0.7s cubic-bezier(0.22, 1, 0.36, 1) both; }
 
-/* ── Glass search focus (Topbar) — static dual-glow bloom, no motion ───────────
+/* ── Glass input focus (Topbar & Login) — warm gold glow, no motion ────────────
    Scoped CSS (not a JIT focus utility) so it's reliable; the reduced-motion guard
    flattens the transition. */
 .cockpit-root .cq-search,
 .cockpit-root .cq-field { transition: border-color 0.3s ease, box-shadow 0.3s ease; }
 .cockpit-root .cq-search:focus-within,
 .cockpit-root .cq-field:focus-within {
-  border-color: rgba(124, 58, 237, 0.6);
+  border-color: rgba(184, 134, 11, 0.6);
   box-shadow: var(--shadow-search-focus);
 }
 .cockpit-root .cq-search:focus-within svg,
