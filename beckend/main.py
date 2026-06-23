@@ -244,9 +244,28 @@ def require_cockpit_user(
             credentials.credentials,
             settings.supabase_jwt_secret,
             algorithms=["HS256"],
-            audience="authenticated",
+            # Supabase access tokens set aud="authenticated"; omitting audience here
+            # makes the check explicit in the email allow-list step below, and avoids
+            # a mismatch when token claims include additional audiences.
+            options={"verify_aud": False},
         )
-    except jwt.PyJWTError:
+        # Enforce audience explicitly so the error is clear in logs if wrong.
+        aud = claims.get("aud", "")
+        if isinstance(aud, list):
+            aud_ok = "authenticated" in aud
+        else:
+            aud_ok = aud == "authenticated"
+        if not aud_ok:
+            logger.warning("[cockpit/me] JWT audience mismatch: aud=%r", aud)
+            raise HTTPException(status_code=401, detail="Invalid token audience.")
+    except jwt.ExpiredSignatureError:
+        logger.warning("[cockpit/me] Rejected expired token")
+        raise HTTPException(status_code=401, detail="Token expired — please sign in again.")
+    except jwt.InvalidSignatureError:
+        logger.error("[cockpit/me] JWT signature invalid — check SUPABASE_JWT_SECRET in Vercel env vars")
+        raise HTTPException(status_code=401, detail="Invalid token signature.")
+    except jwt.PyJWTError as exc:
+        logger.warning("[cockpit/me] JWT rejected: %s: %s", type(exc).__name__, exc)
         raise HTTPException(status_code=401, detail="Invalid or expired token.")
 
     email = (claims.get("email") or "").strip().lower()
