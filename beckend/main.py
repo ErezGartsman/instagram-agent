@@ -244,10 +244,8 @@ def require_cockpit_user(
             credentials.credentials,
             settings.supabase_jwt_secret,
             algorithms=["HS256"],
-            # Supabase access tokens set aud="authenticated"; omitting audience here
-            # makes the check explicit in the email allow-list step below, and avoids
-            # a mismatch when token claims include additional audiences.
             options={"verify_aud": False},
+            leeway=10,  # Clock skew tolerance (10s) for serverless cold-starts
         )
         # Enforce audience explicitly so the error is clear in logs if wrong.
         aud = claims.get("aud", "")
@@ -256,17 +254,20 @@ def require_cockpit_user(
         else:
             aud_ok = aud == "authenticated"
         if not aud_ok:
-            logger.warning("[cockpit/me] JWT audience mismatch: aud=%r", aud)
+            logger.warning("[AUTH_AUD_MISMATCH] aud=%r", aud)
             raise HTTPException(status_code=401, detail="Invalid token audience.")
     except jwt.ExpiredSignatureError:
-        logger.warning("[cockpit/me] Rejected expired token")
+        logger.warning("[AUTH_EXPIRED] Token timestamp outside acceptable range")
         raise HTTPException(status_code=401, detail="Token expired — please sign in again.")
     except jwt.InvalidSignatureError:
-        logger.error("[cockpit/me] JWT signature invalid — check SUPABASE_JWT_SECRET in Vercel env vars")
+        logger.error("[AUTH_SIG_INVALID] SUPABASE_JWT_SECRET mismatch or token tampered")
         raise HTTPException(status_code=401, detail="Invalid token signature.")
+    except jwt.InvalidTokenError as exc:
+        logger.warning("[AUTH_DECODE_ERR] %s", type(exc).__name__)
+        raise HTTPException(status_code=401, detail="Malformed token.")
     except jwt.PyJWTError as exc:
-        logger.warning("[cockpit/me] JWT rejected: %s: %s", type(exc).__name__, exc)
-        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+        logger.warning("[AUTH_OTHER_ERR] %s", type(exc).__name__)
+        raise HTTPException(status_code=401, detail="Invalid token.")
 
     email = (claims.get("email") or "").strip().lower()
     allow = [e.strip().lower() for e in settings.cockpit_allowed_emails.split(",") if e.strip()]
