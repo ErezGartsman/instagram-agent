@@ -231,15 +231,32 @@ def _fetch_jwks(supabase_url: str) -> dict:
     now = time.time()
     if _jwks_cache and (now - _jwks_cache_time) < _JWKS_CACHE_TTL:
         return _jwks_cache
+
+    if not supabase_url or not supabase_url.strip():
+        logger.warning("[JWKS_URL_EMPTY]")
+        return {}
+
     try:
         url = f"{supabase_url.rstrip('/')}/.well-known/jwks.json"
+        logger.debug("[JWKS_FETCH_URL] %s", url[:60])  # Log first 60 chars of URL
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=5) as resp:
-            _jwks_cache = json.loads(resp.read())
+            body = resp.read()
+            _jwks_cache = json.loads(body)
             _jwks_cache_time = now
+            logger.info("[JWKS_FETCHED_OK] keys=%d", len(_jwks_cache.get("keys", [])))
             return _jwks_cache
+    except urllib.error.HTTPError as e:
+        logger.warning("[JWKS_HTTP_ERROR] code=%d", e.code)
+        return {}
+    except urllib.error.URLError as e:
+        logger.warning("[JWKS_URL_ERROR] %s", str(e.reason)[:30])
+        return {}
+    except json.JSONDecodeError:
+        logger.warning("[JWKS_INVALID_JSON]")
+        return {}
     except Exception as e:
-        logger.warning("[JWKS] Failed to fetch from %s: %s", url, e)
+        logger.warning("[JWKS_UNKNOWN_ERROR] %s", type(e).__name__)
         return {}
 
 def _get_key_for_kid(jwks: dict, kid: str) -> Optional[str]:
