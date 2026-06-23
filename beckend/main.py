@@ -257,16 +257,28 @@ def require_cockpit_user(
             logger.warning("[AUTH_AUD_MISMATCH] aud=%r", aud)
             raise HTTPException(status_code=401, detail="Invalid token audience.")
     except jwt.ExpiredSignatureError:
-        logger.warning("[AUTH_EXPIRED] Token timestamp outside acceptable range")
+        logger.warning("[AUTH_EXPIRED]")
         raise HTTPException(status_code=401, detail="Token expired — please sign in again.")
     except jwt.InvalidSignatureError:
-        logger.error("[AUTH_SIG_INVALID] SUPABASE_JWT_SECRET mismatch or token tampered")
+        logger.error("[AUTH_SIG_INVALID]")
         raise HTTPException(status_code=401, detail="Invalid token signature.")
-    except jwt.InvalidTokenError as exc:
-        logger.warning("[AUTH_DECODE_ERR] %s", type(exc).__name__)
+    except jwt.InvalidAlgorithmError:
+        logger.error("[AUTH_ALG_ERROR]")
+        raise HTTPException(status_code=401, detail="Invalid token — algorithm mismatch.")
+    except jwt.InvalidKeyError:
+        logger.error("[AUTH_KEY_ERROR]")
+        raise HTTPException(status_code=401, detail="Invalid token — key error.")
+    except jwt.InvalidIssuerError:
+        logger.warning("[AUTH_ISSUER_ERROR]")
+        raise HTTPException(status_code=401, detail="Invalid token — issuer mismatch.")
+    except jwt.InvalidIssuedAtError:
+        logger.warning("[AUTH_ISSUEDTIME_ERROR]")
+        raise HTTPException(status_code=401, detail="Invalid token — issuedAt claim invalid.")
+    except jwt.InvalidTokenError:
+        logger.warning("[AUTH_DECODE_ERROR]")
         raise HTTPException(status_code=401, detail="Malformed token.")
-    except jwt.PyJWTError as exc:
-        logger.warning("[AUTH_OTHER_ERR] %s", type(exc).__name__)
+    except jwt.PyJWTError:
+        logger.warning("[AUTH_UNKNOWN_ERROR]")
         raise HTTPException(status_code=401, detail="Invalid token.")
 
     email = (claims.get("email") or "").strip().lower()
