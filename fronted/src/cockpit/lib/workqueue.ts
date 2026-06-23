@@ -62,12 +62,16 @@ export async function postQueueAction(
   token: string,
   id: string,
   type: QueueActionType,
-  opts: { snoozeHours?: number } = {},
+  opts: { snoozeHours?: number; message?: string } = {},
 ): Promise<void> {
   const res = await fetch(`${API_BASE}/api/cockpit/queue/${id}/action`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ type, snooze_hours: opts.snoozeHours ?? null }),
+    body: JSON.stringify({
+      type,
+      snooze_hours: opts.snoozeHours ?? null,
+      message: opts.message ?? null,
+    }),
   })
   if (!res.ok) throw new Error(`action ${res.status}`)
 }
