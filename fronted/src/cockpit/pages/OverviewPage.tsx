@@ -17,11 +17,12 @@ type State =
   | { kind: 'error' }
   | { kind: 'ready'; kpis: Kpi[]; top: QueueItem | null; pending: number; sample: boolean }
 
-function greeting(): string {
+function greeting(displayName: string): string {
   const h = new Date().getHours()
-  if (h < 12) return 'Good morning'
-  if (h < 18) return 'Good afternoon'
-  return 'Good evening'
+  const salutation = h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening'
+  // Use only the first name so "Good afternoon, Erez" stays clean.
+  const first = displayName.split(' ')[0]
+  return first ? `${salutation}, ${first}` : salutation
 }
 
 const DATELINE = new Date().toLocaleDateString(undefined, {
@@ -31,7 +32,7 @@ const DATELINE = new Date().toLocaleDateString(undefined, {
 })
 
 export function OverviewPage() {
-  const { session, devBypass } = useAuth()
+  const { session, devBypass, displayName } = useAuth()
   const [state, setState] = useState<State>({ kind: 'loading' })
   const [retryNonce, setRetryNonce] = useState(0)
   const retry = useCallback(() => {
@@ -82,7 +83,7 @@ export function OverviewPage() {
     <div className="mx-auto max-w-[1100px]">
       <header className="mb-8">
         {/* font-serif (Fraunces) is permitted here and ONLY here — the human voice */}
-        <h2 className="font-serif text-3xl font-light leading-tight text-ink">{greeting()}.</h2>
+        <h2 className="font-serif text-3xl font-light leading-tight text-ink">{greeting(displayName)}.</h2>
         <p className="mt-1.5 font-mono text-[11px] uppercase tracking-[0.14em] text-faint">{DATELINE}</p>
       </header>
 
