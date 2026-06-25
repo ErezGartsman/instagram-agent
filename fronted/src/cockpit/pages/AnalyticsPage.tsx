@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { AnimatePresence, motion } from 'framer-motion'
 import { ResponsiveContainer, AreaChart, Area, Tooltip } from 'recharts'
 import { PageHeader } from '../components/PageHeader'
+import { Icon } from '../components/Icon'
 import { SurfaceLoading, SurfaceError } from '../components/SurfaceStates'
 import { useAuth } from '../auth/AuthProvider'
 import { STAGE_LABELS } from '../lib/pipeline'
@@ -25,6 +27,7 @@ export function AnalyticsPage() {
   const { session, devBypass } = useAuth()
   const [state, setState] = useState<State>({ kind: 'loading' })
   const [retryNonce, setRetryNonce] = useState(0)
+  const [analystOpen, setAnalystOpen] = useState(false)
   const retry = useCallback(() => {
     setState({ kind: 'loading' })
     setRetryNonce((n) => n + 1)
@@ -52,7 +55,17 @@ export function AnalyticsPage() {
 
   return (
     <div className="mx-auto max-w-[1280px]">
-      <PageHeader title="Analytics" subtitle="Community reach and pipeline, from social glance to booked call." />
+      <div className="flex items-start justify-between gap-4">
+        <PageHeader title="Analytics" subtitle="Community reach and pipeline, from social glance to booked call." />
+        <button
+          type="button"
+          onClick={() => setAnalystOpen(true)}
+          className="mt-1 inline-flex shrink-0 items-center gap-1.5 rounded-control border border-glow/40 bg-glow/10 px-3.5 py-2 text-xs font-medium text-glow transition-colors hover:bg-glow/20"
+          aria-label="Open Nexus Data Analyst AI"
+        >
+          <span aria-hidden className="text-[10px]">✦</span> Ask AI
+        </button>
+      </div>
 
       {state.kind === 'ready' && state.sample && (
         <div className="mb-4 inline-flex items-center gap-2 rounded-control border border-line px-3 py-1 text-xs text-warn">
@@ -70,6 +83,8 @@ export function AnalyticsPage() {
         />
       )}
       {state.kind === 'ready' && <Bento data={state.data} />}
+
+      <DataAnalystPanel open={analystOpen} onClose={() => setAnalystOpen(false)} />
     </div>
   )
 }
@@ -258,5 +273,153 @@ function StatTile({
 
 function Label({ children }: { children: ReactNode }) {
   return <span className="font-mono text-[10px] uppercase tracking-[0.13em] text-faint">{children}</span>
+}
+
+// ── Nexus Data Analyst AI — high-fidelity vision mock ────────────────────────
+// Static mock panel showing the NLP-to-graph engine concept: the stakeholder
+// sees the vision without requiring a backend. Marked "Preview" so the intent
+// is clear. Real implementation arrives in a later workstream.
+
+const MOCK_WEEK_DATA = [
+  { day: 'Mon', leads: 2 }, { day: 'Tue', leads: 4 }, { day: 'Wed', leads: 3 },
+  { day: 'Thu', leads: 1 }, { day: 'Fri', leads: 5 }, { day: 'Sat', leads: 2 },
+  { day: 'Sun', leads: 3 },
+]
+const MOCK_MAX = Math.max(...MOCK_WEEK_DATA.map((d) => d.leads))
+
+const MOCK_CONVERSATION: { role: 'user' | 'ai'; text: string }[] = [
+  { role: 'user', text: 'How many unique leads contacted me this week?' },
+  {
+    role: 'ai',
+    text: '7 unique leads reached out this week — up 40% from last week. 3 are in the "captured" stage and ready for a booking link. Your strongest day was Friday with 5 new contacts.',
+  },
+]
+
+function DataAnalystPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const [query, setQuery] = useState('')
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  return (
+    <AnimatePresence>
+      {open && (
+        <>
+          {/* Scrim */}
+          <motion.div
+            key="scrim"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.18 }}
+            className="fixed inset-0 z-40 bg-bg/60 backdrop-blur-sm"
+            aria-hidden
+            onClick={onClose}
+          />
+
+          {/* Panel */}
+          <motion.aside
+            key="panel"
+            initial={{ x: 420, opacity: 0 }}
+            animate={{ x: 0, opacity: 1 }}
+            exit={{ x: 420, opacity: 0 }}
+            transition={{ type: 'spring', damping: 30, stiffness: 280, mass: 0.8 }}
+            className="fixed right-0 top-0 z-50 flex h-screen w-[400px] flex-col border-l border-line bg-surface backdrop-blur-xl [box-shadow:var(--shadow-card)]"
+            aria-label="Nexus Data Analyst AI"
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between border-b border-line px-5 py-4">
+              <div className="flex items-center gap-2.5">
+                <span className="text-glow" aria-hidden>✦</span>
+                <div>
+                  <div className="text-sm font-semibold text-ink">Nexus Data Analyst</div>
+                  <div className="font-mono text-[10px] text-faint">preview · NLP query engine</div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label="Close analyst panel"
+                className="grid h-7 w-7 place-items-center rounded-control text-faint transition-colors hover:bg-raised hover:text-ink"
+              >
+                <Icon name="x" size={15} />
+              </button>
+            </div>
+
+            {/* Mini chart — answers the mock query visually */}
+            <div className="border-b border-line px-5 py-4">
+              <div className="mb-2 font-mono text-[10px] uppercase tracking-[0.12em] text-faint">
+                New leads · this week
+              </div>
+              <div className="flex items-end gap-1.5 h-16">
+                {MOCK_WEEK_DATA.map(({ day, leads }) => (
+                  <div key={day} className="flex flex-1 flex-col items-center gap-1">
+                    <div
+                      className="w-full rounded-sm bg-glow/30 transition-all duration-500"
+                      style={{ height: `${(leads / MOCK_MAX) * 100}%`, minHeight: 2 }}
+                    />
+                    <span className="font-mono text-[8px] text-faint">{day}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-2 font-mono text-[10px] text-muted">
+                <span className="text-glow tabular-nums">7</span> total ·{' '}
+                <span className="text-success">↑ 40%</span> vs last week
+              </div>
+            </div>
+
+            {/* Conversation */}
+            <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+              <div className="flex flex-col gap-3">
+                {MOCK_CONVERSATION.map((msg, i) =>
+                  msg.role === 'user' ? (
+                    <div key={i} className="flex justify-end">
+                      <div className="max-w-[80%] rounded-card bg-accent px-3.5 py-2.5 [box-shadow:var(--shadow-glow)]">
+                        <p className="text-sm leading-relaxed text-ink">{msg.text}</p>
+                      </div>
+                    </div>
+                  ) : (
+                    <div key={i} className="flex justify-start">
+                      <div className="max-w-[88%] rounded-card border border-glow/20 bg-raised px-3.5 py-2.5">
+                        <div className="mb-1.5 flex items-center gap-1.5">
+                          <span className="text-[9px] text-glow" aria-hidden>✦</span>
+                          <span className="font-mono text-[9px] uppercase tracking-wide text-glow">Nexus</span>
+                        </div>
+                        <p className="text-sm leading-relaxed text-ink">{msg.text}</p>
+                      </div>
+                    </div>
+                  ),
+                )}
+              </div>
+            </div>
+
+            {/* Input area */}
+            <div className="border-t border-line px-5 py-4">
+              <div className="flex items-center gap-2 rounded-control border border-line bg-bg/60 px-3.5 py-2.5 focus-within:border-glow/40">
+                <input
+                  ref={inputRef}
+                  type="text"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Ask about your community…"
+                  className="flex-1 bg-transparent text-sm text-ink outline-none placeholder:text-faint"
+                  aria-label="Query the Nexus Data Analyst"
+                />
+                <button
+                  type="button"
+                  disabled
+                  title="NLP query engine — coming soon"
+                  className="grid h-6 w-6 shrink-0 place-items-center rounded-control bg-glow/20 text-glow opacity-50"
+                >
+                  <Icon name="send" size={12} />
+                </button>
+              </div>
+              <p className="mt-2 text-center font-mono text-[9px] text-faint">
+                NLP-to-graph engine · coming in the next workstream
+              </p>
+            </div>
+          </motion.aside>
+        </>
+      )}
+    </AnimatePresence>
+  )
 }
 
