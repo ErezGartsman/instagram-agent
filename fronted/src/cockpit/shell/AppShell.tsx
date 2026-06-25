@@ -1,18 +1,36 @@
+import { useCallback, useEffect, useState } from 'react'
 import { Outlet, useLocation } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import { Sidebar } from './Sidebar'
 import { Topbar } from './Topbar'
 import { CursorGlow } from '../components/CursorGlow'
+import { CommandPalette } from '../components/CommandPalette'
 
 /** The authenticated frame: cursor orb + fixed left nav + top bar + animated page well. */
 export function AppShell() {
   const location = useLocation()
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  const openPalette  = useCallback(() => setPaletteOpen(true), [])
+  const closePalette = useCallback(() => setPaletteOpen(false), [])
+
+  // Global ⌘K / Ctrl+K listener — owned here so it works on any page.
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault()
+        setPaletteOpen((prev) => !prev)
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [])
+
   return (
     <div className="flex h-screen w-full overflow-hidden">
       <CursorGlow />
       <Sidebar />
       <div className="flex min-w-0 flex-1 flex-col">
-        <Topbar />
+        <Topbar onOpenPalette={openPalette} />
         <main className="flex-1 overflow-y-auto px-10 py-10">
           <AnimatePresence mode="wait" initial={false}>
             <motion.div
@@ -28,6 +46,7 @@ export function AppShell() {
           </AnimatePresence>
         </main>
       </div>
+      <CommandPalette open={paletteOpen} onClose={closePalette} />
     </div>
   )
 }
