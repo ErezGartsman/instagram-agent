@@ -13,7 +13,7 @@ export const API_BASE = (
 
 // ── Command Palette search ────────────────────────────────────────────────────
 
-export type SearchResultType = 'page' | 'person' | 'content'
+export type SearchResultType = 'page' | 'person' | 'content' | 'action'
 
 export interface SearchResult {
   type: SearchResultType
