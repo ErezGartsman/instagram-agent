@@ -154,6 +154,33 @@
   .landing-root p { margin: 0; }
 }
 
+/* ── Skeleton shimmer — warm-gold sweep for loading states ───────────────────
+   A champagne-gold highlight sweeps left-to-right across skeleton blocks.
+   The pseudo-element keeps the base surface color separate from the animation.
+   Killed globally by the prefers-reduced-motion guard below. */
+@keyframes cq-shimmer {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(100%); }
+}
+
+.cockpit-root .cq-shimmer-block {
+  position: relative;
+  overflow: hidden;
+  background-color: rgba(255, 235, 180, 0.04);
+}
+.cockpit-root .cq-shimmer-block::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 235, 180, 0.07) 50%,
+    transparent 100%
+  );
+  animation: cq-shimmer 1.8s ease-in-out infinite;
+}
+
 /* ── Motion — the whisper budget ─────────────────────────────────────────────
    CSS-only keyframes. Framer Motion handles component entrances in TSX.
    cq-grow is the single draw-once exception; it never loops. */

@@ -1,7 +1,7 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { ResponsiveContainer, AreaChart, Area, Tooltip } from 'recharts'
 import { PageHeader } from '../components/PageHeader'
-import { Icon } from '../components/Icon'
+import { SurfaceLoading, SurfaceError } from '../components/SurfaceStates'
 import { useAuth } from '../auth/AuthProvider'
 import { STAGE_LABELS } from '../lib/pipeline'
 import { compact, fetchAnalytics, SAMPLE_ANALYTICS, type AnalyticsData } from '../lib/analytics'
@@ -24,6 +24,11 @@ const REDUCED =
 export function AnalyticsPage() {
   const { session, devBypass } = useAuth()
   const [state, setState] = useState<State>({ kind: 'loading' })
+  const [retryNonce, setRetryNonce] = useState(0)
+  const retry = useCallback(() => {
+    setState({ kind: 'loading' })
+    setRetryNonce((n) => n + 1)
+  }, [])
 
   useEffect(() => {
     if (devBypass) {
@@ -43,7 +48,7 @@ export function AnalyticsPage() {
         if ((err as { name?: string } | null)?.name !== 'AbortError') setState({ kind: 'error' })
       })
     return () => controller.abort()
-  }, [session?.access_token, devBypass])
+  }, [session?.access_token, devBypass, retryNonce])
 
   return (
     <div className="mx-auto max-w-[1280px]">
@@ -56,8 +61,14 @@ export function AnalyticsPage() {
         </div>
       )}
 
-      {state.kind === 'loading' && <BentoSkeleton />}
-      {state.kind === 'error' && <BentoError />}
+      {state.kind === 'loading' && <SurfaceLoading variant="bento" />}
+      {state.kind === 'error' && (
+        <SurfaceError
+          title="Couldn't load analytics"
+          body="The metrics couldn't be reached. Check your connection and try again."
+          onRetry={retry}
+        />
+      )}
       {state.kind === 'ready' && <Bento data={state.data} />}
     </div>
   )
@@ -249,29 +260,3 @@ function Label({ children }: { children: ReactNode }) {
   return <span className="font-mono text-[10px] uppercase tracking-[0.13em] text-faint">{children}</span>
 }
 
-function BentoSkeleton() {
-  return (
-    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4" aria-hidden>
-      {[2, 1, 1, 2, 2, 2, 1, 1].map((span, i) => (
-        <div
-          key={i}
-          className={`h-32 animate-pulse rounded-card border border-line bg-surface ${span === 2 ? 'sm:col-span-2' : ''}`}
-        />
-      ))}
-    </div>
-  )
-}
-
-function BentoError() {
-  return (
-    <div className="flex flex-col items-center rounded-card border border-line bg-surface px-8 py-16 text-center">
-      <span className="mb-4 grid h-12 w-12 place-items-center rounded-control border border-line bg-raised text-danger">
-        <Icon name="alert" size={22} />
-      </span>
-      <h3 className="text-base font-semibold text-ink">Couldn&rsquo;t load analytics</h3>
-      <p className="mt-2 max-w-md text-sm text-muted">
-        The metrics couldn&rsquo;t be reached. Check your connection and reload.
-      </p>
-    </div>
-  )
-}
