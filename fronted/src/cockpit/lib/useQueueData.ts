@@ -5,6 +5,8 @@ import { fetchQueue, rankQueue, SAMPLE_QUEUE, type QueueItem } from './workqueue
 // ── Constants ──────────────────────────────────────────────────────────────
 const POLL_MS = 30_000   // background poll interval
 const FOCUS_DEBOUNCE_MS = 500  // guard against rapid focus/blur cycling
+/** Minimum confidence score (0-100) for a lead to trigger a hot-lead alert. */
+export const HOT_LEAD_THRESHOLD = 70
 
 // ── Signature ──────────────────────────────────────────────────────────────
 // Cheap string identity for a queue snapshot. If this is unchanged we skip
@@ -41,6 +43,11 @@ export function useQueueData(
   token: string | null,
   devBypass: boolean,
   suppressRef: MutableRefObject<boolean>,
+  /** Called with the highest-confidence new lead whenever a background poll
+   *  surfaces an item above HOT_LEAD_THRESHOLD that wasn't in the previous
+   *  snapshot. Never fires on the initial load (avoids notifying for stale
+   *  items already in the queue when the cockpit opens). */
+  onHotLead?: (item: QueueItem) => void,
 ): {
   state: QueueDataState
   refetch: () => void
@@ -48,9 +55,15 @@ export function useQueueData(
   const [state, setState] = useState<QueueDataState>({ kind: 'loading' })
 
   // Refs that change without triggering re-renders.
-  const sigRef     = useRef('')                         // last known signature
-  const abortRef   = useRef<AbortController | null>(null)
-  const mountedRef = useRef(true)
+  const sigRef      = useRef('')
+  const abortRef    = useRef<AbortController | null>(null)
+  const mountedRef  = useRef(true)
+  // IDs seen in previous snapshots — used to detect genuinely new leads.
+  // Populated on first successful fetch; no notifications until then.
+  const seenIdsRef  = useRef<Set<string>>(new Set())
+  // Stable ref wrapper so doFetch doesn't need onHotLead in its deps.
+  const onHotLeadRef = useRef(onHotLead)
+  onHotLeadRef.current = onHotLead
 
   // ── Core fetch ────────────────────────────────────────────────────────────
   // isInitial=true  → show loading state on error, always apply result.
@@ -63,6 +76,7 @@ export function useQueueData(
       if (devBypass) {
         if (isInitial) {
           const items = rankQueue(SAMPLE_QUEUE)
+          seenIdsRef.current = new Set(items.map((i) => i.id))
           sigRef.current = queueSig(items)
           setState({ kind: 'ready', items, sample: true })
         }
@@ -77,13 +91,33 @@ export function useQueueData(
       abortRef.current = controller
 
       try {
-        const raw   = await fetchQueue(token, controller.signal)
+        const raw    = await fetchQueue(token, controller.signal)
         if (!mountedRef.current) return
         const items  = rankQueue(raw)
         const newSig = queueSig(items)
 
-        // Signature guard — nothing changed, skip setState entirely.
-        if (!isInitial && newSig === sigRef.current) return
+        if (isInitial) {
+          // Populate the seen-ID set without notification — these items were
+          // already in the queue when the cockpit opened.
+          seenIdsRef.current = new Set(items.map((i) => i.id))
+          sigRef.current = newSig
+          setState({ kind: 'ready', items, sample: false })
+          return
+        }
+
+        // Background poll — signature guard.
+        if (newSig === sigRef.current) return
+
+        // Hot-lead detection: new items above threshold that weren't seen before.
+        // If seenIds is empty (error recovery), populate silently — no spam.
+        if (seenIdsRef.current.size > 0 && onHotLeadRef.current) {
+          const newHot = items
+            .filter((i) => !seenIdsRef.current.has(i.id) && i.confidence >= HOT_LEAD_THRESHOLD)
+            .sort((a, b) => b.confidence - a.confidence)  // highest first
+          if (newHot.length > 0) onHotLeadRef.current(newHot[0])
+        }
+        // Always expand the seen set (even if seenIds was empty — recovery case).
+        items.forEach((i) => seenIdsRef.current.add(i.id))
 
         sigRef.current = newSig
         setState({ kind: 'ready', items, sample: false })

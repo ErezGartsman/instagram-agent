@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, KeyboardEvent, MouseEvent } from 'react'
 import { SurfaceLoading, SurfaceEmpty, SurfaceError } from '../components/SurfaceStates'
+import { HotLeadToast } from '../components/HotLeadToast'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { Icon } from '../components/Icon'
 import type { IconName } from '../components/Icon'
@@ -8,6 +9,7 @@ import { useAuth } from '../auth/AuthProvider'
 import { CHANNEL_LABELS, relativeTime } from '../lib/pipeline'
 import { postQueueAction, type QueueActionType, type QueueItem } from '../lib/workqueue'
 import { useQueueData } from '../lib/useQueueData'
+import { useNotifications } from '../lib/useNotifications'
 
 type State =
   | { kind: 'loading' }
@@ -67,10 +69,23 @@ export function WorkQueuePage() {
   const { session, devBypass } = useAuth()
   const token = session?.access_token ?? null
 
+  // ── Notifications ─────────────────────────────────────────────────────────
+  const { notify } = useNotifications()
+  const [hotLead, setHotLead] = useState<QueueItem | null>(null)
+  const dismissToast = useCallback(() => setHotLead(null), [])
+
+  const onHotLead = useCallback(
+    (item: QueueItem) => {
+      setHotLead(item)
+      notify(`Hot lead: ${item.name}`, `${item.action} · ${item.confidence}% confidence`)
+    },
+    [notify],
+  )
+
   // suppressRef: Board sets true while an optimistic action is in flight;
   // the hook reads it before every background setState. Stable ref — no renders.
   const suppressRef = useRef(false)
-  const { state, refetch } = useQueueData(token, devBypass, suppressRef)
+  const { state, refetch } = useQueueData(token, devBypass, suppressRef, onHotLead)
 
   // The single seam to the backend. Resolves on success; throws on failure so
   // the Board rolls the card back. Dev-bypass never calls the API.
@@ -106,13 +121,20 @@ export function WorkQueuePage() {
   )
 
   return (
-    <Board
-      initialItems={state.items}
-      liveItems={state.items}
-      sample={state.sample}
-      commit={commit}
-      suppressRef={suppressRef}
-    />
+    <>
+      <HotLeadToast
+        item={hotLead}
+        onDismiss={dismissToast}
+        onView={dismissToast}  // queue is already visible; dismiss is enough
+      />
+      <Board
+        initialItems={state.items}
+        liveItems={state.items}
+        sample={state.sample}
+        commit={commit}
+        suppressRef={suppressRef}
+      />
+    </>
   )
 }
 
