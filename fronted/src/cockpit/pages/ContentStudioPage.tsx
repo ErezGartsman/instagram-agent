@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { Icon } from '../components/Icon'
 import { SurfaceLoading, SurfaceError } from '../components/SurfaceStates'
@@ -44,13 +44,24 @@ export function ContentStudioPage() {
   const { session, devBypass } = useAuth()
   const token = session?.access_token
   const [searchParams] = useSearchParams()
-  const pieceId = searchParams.get('piece')
+  const pieceId   = searchParams.get('piece')
+  const triggerNew = searchParams.get('new') === '1'
+  const hasTriggeredNewRef = useRef(false)
   const [phase, setPhase] = useState<Phase>('loading')
   const [retryNonce, setRetryNonce] = useState(0)
   const retry = useCallback(() => {
     setPhase('loading')
     setRetryNonce((n) => n + 1)
   }, [])
+  // ?new=1 auto-trigger — fires once after content loads when opened from ⌘K.
+  // Stored in a ref so it doesn't cause a re-render and only fires once per open.
+  const onNewRef = useRef<(() => Promise<void>) | null>(null)
+  useEffect(() => {
+    if (!triggerNew || hasTriggeredNewRef.current || phase !== 'ready' || busy) return
+    hasTriggeredNewRef.current = true
+    void onNewRef.current?.()
+  }, [phase, triggerNew, busy])
+
   const [sample, setSample] = useState(false)
   const [items, setItems] = useState<ContentPiece[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -148,6 +159,8 @@ export function ContentStudioPage() {
       setBusy(false)
     }
   }, [busy, devBypass, token])
+  // Keep the ref current so the ?new=1 trigger effect always calls the latest version.
+  onNewRef.current = onNew
 
   const onDelete = useCallback(async () => {
     if (!selected || busy) return
