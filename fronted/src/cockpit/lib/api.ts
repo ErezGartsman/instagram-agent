@@ -26,6 +26,32 @@ export interface SearchResult {
   route: string
 }
 
+// ── WhatsApp thread ───────────────────────────────────────────────────────────
+
+export interface ThreadMessage {
+  /** 'user' = lead's inbound · 'assistant' = bot handoff ACK · 'operator' = Erez's reply */
+  role: 'user' | 'assistant' | 'operator'
+  body: string
+  at: string  // ISO 8601
+}
+
+/** Fetch the merged WhatsApp thread for a person (inbound + outbound). Returns [] on error. */
+export async function fetchThread(token: string, personId: string): Promise<ThreadMessage[]> {
+  try {
+    const res = await fetch(
+      `${API_BASE}/api/cockpit/thread/${encodeURIComponent(personId)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    )
+    if (!res.ok) return []
+    const data = await res.json() as { messages?: ThreadMessage[] }
+    return data.messages ?? []
+  } catch {
+    return []
+  }
+}
+
+// ── Command Palette search ────────────────────────────────────────────────────
+
 /** Unified cockpit search — people (open opps) + content pieces.
  *  Returns [] on error or when q < 2 chars (handled server-side too). */
 export async function searchCockpit(token: string, q: string): Promise<SearchResult[]> {

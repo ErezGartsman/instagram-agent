@@ -1832,6 +1832,65 @@ def cockpit_queue(user: dict = Depends(require_cockpit_user)):
         return {"status": "error", "detail": "Could not load the work queue."}
 
 
+@app.get("/api/cockpit/thread/{person_id}")
+def cockpit_thread(person_id: str, user: dict = Depends(require_cockpit_user)):
+    """
+    P2 WS1 — WhatsApp conversation thread for a person.
+    Merges inbound messages (messages table via sessions) with operator-authored
+    outbound messages (outbound_messages table). Returns oldest-first, max 150
+    messages per side. The 'assistant' role is the one-time handoff ACK the bot
+    sends on first contact; 'user' is the lead's inbound text; 'operator' is
+    what Erez sent via the cockpit Action Loop.
+    """
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                # Inbound: messages persisted by the WhatsApp handler
+                cur.execute(
+                    """
+                    SELECT m.role, m.content, m.created_at
+                    FROM messages m
+                    JOIN sessions s ON s.id = m.session_id
+                    WHERE s.person_id = %s AND s.channel = 'whatsapp'
+                    ORDER BY m.created_at DESC
+                    LIMIT 150
+                    """,
+                    (person_id,),
+                )
+                inbound = [
+                    {
+                        "role": r[0],   # 'user' | 'assistant'
+                        "body": r[1],
+                        "at": r[2].isoformat() if r[2] else None,
+                    }
+                    for r in cur.fetchall()
+                ]
+                # Outbound: operator-authored messages via the Action Loop Send
+                cur.execute(
+                    """
+                    SELECT body, sent_at
+                    FROM outbound_messages
+                    WHERE person_id = %s AND channel = 'whatsapp'
+                    ORDER BY sent_at DESC
+                    LIMIT 150
+                    """,
+                    (person_id,),
+                )
+                outbound = [
+                    {
+                        "role": "operator",
+                        "body": r[0],
+                        "at": r[1].isoformat() if r[1] else None,
+                    }
+                    for r in cur.fetchall()
+                ]
+        messages = sorted(inbound + outbound, key=lambda m: m["at"] or "")
+        return {"status": "success", "messages": messages}
+    except Exception as e:
+        logger.error(f"[cockpit/thread] query failed for {person_id}: {e}")
+        return {"status": "error", "detail": "Could not load conversation."}
+
+
 # ── Work Queue Action Loop (P0 ①) — the cockpit's steering wheel ──────────────
 # One operator move on a lead, mapped onto the existing stage machine. Unlike the
 # other cockpit reads (which return 200 + {status:error} on failure), this returns
