@@ -12,7 +12,6 @@ import { WorkQueuePage } from './cockpit/pages/WorkQueuePage'
 import { PipelinePage } from './cockpit/pages/PipelinePage'
 import { InboxPage } from './cockpit/pages/InboxPage'
 import { ContentStudioPage } from './cockpit/pages/ContentStudioPage'
-import { SettingsPage } from './cockpit/pages/SettingsPage'
 import { NotFoundPage } from './cockpit/pages/NotFoundPage'
 import { FEATURES } from './cockpit/lib/flags'
 
@@ -31,6 +30,12 @@ const LandingPage = lazy(() =>
 // Analytics — code-split so recharts stays out of the initial cockpit bundle.
 const AnalyticsPage = lazy(() =>
   import('./cockpit/pages/AnalyticsPage').then((m) => ({ default: m.AnalyticsPage })),
+)
+
+// Settings — lazy to break the AuthProvider circular evaluation order that
+// a static import would create in Rollup's production chunk.
+const SettingsPage = lazy(() =>
+  import('./cockpit/pages/SettingsPage').then((m) => ({ default: m.SettingsPage })),
 )
 
 const router = createBrowserRouter([
@@ -60,7 +65,7 @@ const router = createBrowserRouter([
       { path: 'pipeline', element: <PipelinePage /> },
       { path: 'inbox', element: <InboxPage /> },
       ...(FEATURES.content ? [{ path: 'content', element: <ContentStudioPage /> }] : []),
-      { path: 'settings', element: <SettingsPage /> },
+      { path: 'settings', element: <Suspense fallback={null}><SettingsPage /></Suspense> },
       { path: '*', element: <NotFoundPage /> },
     ],
   },

@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react'
 import { PageHeader } from '../components/PageHeader'
 import { useAuth } from '../auth/AuthProvider'
 import { useNotifications } from '../lib/useNotifications'
@@ -44,7 +45,7 @@ function SettingsSection({
   children,
 }: {
   title: string
-  children: React.ReactNode
+  children: ReactNode
 }) {
   return (
     <section>
@@ -66,7 +67,7 @@ function SettingsRow({
 }: {
   label: string
   description?: string
-  control: React.ReactNode
+  control: ReactNode
 }) {
   return (
     <div className="flex items-center justify-between gap-6 px-5 py-4">
