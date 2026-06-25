@@ -16,7 +16,7 @@ export type NavSection = { label?: string; items: NavItem[] }
  * `<item.icon />` directly, so swapping a glyph means swapping the import here.
  */
 export const NAV_SECTIONS: NavSection[] = [
-  { items: [{ to: '/app', label: 'Overview', icon: LayoutGrid }] },
+  { items: [{ to: '/app', label: 'Today', icon: LayoutGrid }] },
   {
     label: 'Work',
     items: [
@@ -40,7 +40,7 @@ export const NAV_SECTIONS: NavSection[] = [
     ],
   },
   {
-    label: 'Insight',
+    label: 'Intelligence',
     items: [
       ...(FEATURES.analytics
         ? [{ to: '/app/analytics', label: 'Analytics', icon: ChartColumn }]
