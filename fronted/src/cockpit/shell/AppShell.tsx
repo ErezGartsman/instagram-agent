@@ -21,6 +21,7 @@ export function AppShell() {
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -6 }}
               transition={{ duration: 0.22, ease: [0.25, 0.4, 0.25, 1] }}
+              className="h-full min-h-0"
             >
               <Outlet />
             </motion.div>

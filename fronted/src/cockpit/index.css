@@ -105,6 +105,23 @@
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
+    /* Firefox — thin warm-gold scrollbar on all scrollable children */
+    scrollbar-width: thin;
+    scrollbar-color: rgba(184, 134, 11, 0.22) transparent;
+  }
+
+  /* ── Custom scrollbars — Webkit (Chrome / Safari / Edge) ─────────────────
+     3 × 3 px warm-gold thumb. Covers every scrollable surface in the cockpit:
+     the main content area (vertical), Studio rail (vertical), Pipeline Kanban
+     (horizontal). Near-invisible at rest, brightens on hover. */
+  .cockpit-root ::-webkit-scrollbar       { width: 3px; height: 3px; }
+  .cockpit-root ::-webkit-scrollbar-track { background: transparent; }
+  .cockpit-root ::-webkit-scrollbar-thumb {
+    background: rgba(184, 134, 11, 0.22);
+    border-radius: 2px;
+  }
+  .cockpit-root ::-webkit-scrollbar-thumb:hover {
+    background: rgba(184, 134, 11, 0.45);
   }
   .cockpit-root *,
   .cockpit-root *::before,
