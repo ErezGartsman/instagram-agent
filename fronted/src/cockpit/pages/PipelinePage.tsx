@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { PageHeader } from '../components/PageHeader'
 import { Icon } from '../components/Icon'
+import { SurfaceLoading, SurfaceError } from '../components/SurfaceStates'
 import { useAuth } from '../auth/AuthProvider'
 import {
   fetchPipeline,
@@ -20,6 +21,11 @@ type State =
 export function PipelinePage() {
   const { session, devBypass } = useAuth()
   const [state, setState] = useState<State>({ kind: 'loading' })
+  const [retryNonce, setRetryNonce] = useState(0)
+  const retry = useCallback(() => {
+    setState({ kind: 'loading' })
+    setRetryNonce((n) => n + 1)
+  }, [])
 
   useEffect(() => {
     if (devBypass) {
@@ -41,7 +47,7 @@ export function PipelinePage() {
         }
       })
     return () => controller.abort()
-  }, [session?.access_token, devBypass])
+  }, [session?.access_token, devBypass, retryNonce])
 
   return (
     <div className="mx-auto max-w-[1400px]">
@@ -54,8 +60,14 @@ export function PipelinePage() {
         </div>
       )}
 
-      {state.kind === 'loading' && <BoardSkeleton />}
-      {state.kind === 'error' && <BoardError />}
+      {state.kind === 'loading' && <SurfaceLoading variant="board" />}
+      {state.kind === 'error' && (
+        <SurfaceError
+          title="Couldn't load the pipeline"
+          body="The lead board couldn't be reached. Check your connection and try again."
+          onRetry={retry}
+        />
+      )}
       {state.kind === 'ready' && (
         <div className="flex gap-4 overflow-x-auto pb-4">
           {state.stages.map((s) => (
@@ -111,33 +123,3 @@ function LeadCard({ lead }: { lead: Lead }) {
   )
 }
 
-function BoardSkeleton() {
-  return (
-    <div className="flex gap-4 overflow-x-auto pb-4" aria-hidden>
-      {Array.from({ length: 5 }).map((_, c) => (
-        <div key={c} className="flex w-[264px] shrink-0 flex-col">
-          <div className="mb-3 h-4 w-24 animate-pulse rounded-control bg-surface" />
-          <div className="flex flex-col gap-2">
-            {Array.from({ length: 2 }).map((__, i) => (
-              <div key={i} className="h-20 animate-pulse rounded-card border border-line bg-surface" />
-            ))}
-          </div>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-function BoardError() {
-  return (
-    <div className="flex flex-col items-center rounded-card border border-line bg-surface px-8 py-16 text-center">
-      <span className="mb-4 grid h-12 w-12 place-items-center rounded-control border border-line bg-raised text-danger">
-        <Icon name="alert" size={22} />
-      </span>
-      <h3 className="text-base font-semibold text-ink">Couldn&rsquo;t load the pipeline</h3>
-      <p className="mt-2 max-w-md text-sm text-muted">
-        The lead board couldn&rsquo;t be reached. Check your connection and reload.
-      </p>
-    </div>
-  )
-}

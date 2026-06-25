@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Icon } from '../components/Icon'
+import { SurfaceLoading, SurfaceError } from '../components/SurfaceStates'
 import { useAuth } from '../auth/AuthProvider'
 import { relativeTime } from '../lib/pipeline'
 import {
@@ -42,6 +43,11 @@ export function ContentStudioPage() {
   const { session, devBypass } = useAuth()
   const token = session?.access_token
   const [phase, setPhase] = useState<Phase>('loading')
+  const [retryNonce, setRetryNonce] = useState(0)
+  const retry = useCallback(() => {
+    setPhase('loading')
+    setRetryNonce((n) => n + 1)
+  }, [])
   const [sample, setSample] = useState(false)
   const [items, setItems] = useState<ContentPiece[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -73,7 +79,7 @@ export function ContentStudioPage() {
         if ((err as { name?: string } | null)?.name !== 'AbortError') setPhase('error')
       })
     return () => controller.abort()
-  }, [token, devBypass])
+  }, [token, devBypass, retryNonce])
 
   const selected = useMemo(
     () => items.find((i) => i.id === selectedId) ?? null,
@@ -153,8 +159,14 @@ export function ContentStudioPage() {
     }
   }, [selected, busy, devBypass, token, items])
 
-  if (phase === 'loading') return <StudioSkeleton />
-  if (phase === 'error') return <StudioError />
+  if (phase === 'loading') return <SurfaceLoading variant="rail" />
+  if (phase === 'error') return (
+    <SurfaceError
+      title="Couldn't load the Studio"
+      body="Your content couldn't be reached. Check your connection and try again."
+      onRetry={retry}
+    />
+  )
 
   return (
     <div className="flex h-full min-h-0 overflow-hidden rounded-card border border-line bg-bg">
@@ -339,32 +351,3 @@ function RailItem({
   )
 }
 
-function StudioSkeleton() {
-  return (
-    <div className="flex h-full min-h-0 overflow-hidden rounded-card border border-line bg-bg" aria-hidden>
-      <div className="w-[280px] shrink-0 border-r border-line bg-surface p-3">
-        {Array.from({ length: 5 }).map((_, i) => (
-          <div key={i} className="mb-1 h-12 animate-pulse rounded-control bg-raised/60" />
-        ))}
-      </div>
-      <div className="flex-1 p-6">
-        <div className="h-7 w-2/3 animate-pulse rounded-control bg-surface" />
-        <div className="mt-5 h-40 animate-pulse rounded-card bg-surface" />
-      </div>
-    </div>
-  )
-}
-
-function StudioError() {
-  return (
-    <div className="flex h-full flex-col items-center justify-center rounded-card border border-line bg-surface px-8 text-center">
-      <span className="mb-4 grid h-12 w-12 place-items-center rounded-control border border-line bg-raised text-danger">
-        <Icon name="alert" size={22} />
-      </span>
-      <h3 className="text-base font-semibold text-ink">Couldn&rsquo;t load the Studio</h3>
-      <p className="mt-2 max-w-md text-sm text-muted">
-        Your content couldn&rsquo;t be reached. Check your connection and reload.
-      </p>
-    </div>
-  )
-}

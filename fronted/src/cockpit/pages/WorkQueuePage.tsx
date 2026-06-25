@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { SurfaceLoading, SurfaceEmpty, SurfaceError } from '../components/SurfaceStates'
 import type { CSSProperties, KeyboardEvent, MouseEvent } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { Icon } from '../components/Icon'
@@ -71,6 +72,11 @@ function draftFor(item: QueueItem): string {
 export function WorkQueuePage() {
   const { session, devBypass } = useAuth()
   const [state, setState] = useState<State>({ kind: 'loading' })
+  const [retryNonce, setRetryNonce] = useState(0)
+  const retry = useCallback(() => {
+    setState({ kind: 'loading' })
+    setRetryNonce((n) => n + 1)
+  }, [])
 
   useEffect(() => {
     if (devBypass) {
@@ -90,7 +96,7 @@ export function WorkQueuePage() {
         if ((err as { name?: string } | null)?.name !== 'AbortError') setState({ kind: 'error' })
       })
     return () => controller.abort()
-  }, [session?.access_token, devBypass])
+  }, [session?.access_token, devBypass, retryNonce])
 
   // The single seam to the backend. Resolves on success; throws on failure so the
   // Board rolls the card back. Dev-bypass never calls the API (local UI work).
@@ -107,9 +113,24 @@ export function WorkQueuePage() {
     [devBypass, token],
   )
 
-  if (state.kind === 'loading') return <QueueSkeleton />
-  if (state.kind === 'error') return <QueueError />
-  if (state.items.length === 0) return <QueueEmpty />
+  if (state.kind === 'loading') return <SurfaceLoading variant="queue" />
+  if (state.kind === 'error') return (
+    <SurfaceError
+      title="Couldn't load the queue"
+      body="The work queue couldn't be reached. Check your connection and try again."
+      onRetry={retry}
+      className="h-full"
+    />
+  )
+  if (state.items.length === 0) return (
+    <SurfaceEmpty
+      flavor="win"
+      title="Queue clear"
+      body="No one is waiting on a next move right now."
+      copilotSlot={null}
+      className="h-full"
+    />
+  )
 
   return <Board initialItems={state.items} sample={state.sample} commit={commit} />
 }
@@ -699,46 +720,3 @@ function Fact({ label, value, mono = false }: { label: string; value: string; mo
   )
 }
 
-function QueueSkeleton() {
-  return (
-    <div className="flex h-full min-h-0 overflow-hidden rounded-card border border-line bg-bg" aria-hidden>
-      <div className="w-[300px] shrink-0 border-r border-line bg-surface p-3">
-        {Array.from({ length: 6 }).map((_, i) => (
-          <div key={i} className="mb-1 h-14 animate-pulse rounded-control bg-raised/60" />
-        ))}
-      </div>
-      <div className="flex-1 p-6">
-        <div className="h-5 w-40 animate-pulse rounded-control bg-surface" />
-      </div>
-      <div className="w-[300px] shrink-0 border-l border-line p-5">
-        <div className="h-20 animate-pulse rounded-card bg-surface" />
-      </div>
-    </div>
-  )
-}
-
-function QueueError() {
-  return (
-    <div className="flex h-full flex-col items-center justify-center rounded-card border border-line bg-surface px-8 text-center">
-      <span className="mb-4 grid h-12 w-12 place-items-center rounded-control border border-line bg-raised text-danger">
-        <Icon name="alert" size={22} />
-      </span>
-      <h3 className="text-base font-semibold text-ink">Couldn&rsquo;t load the queue</h3>
-      <p className="mt-2 max-w-md text-sm text-muted">
-        The work queue couldn&rsquo;t be reached. Check your connection and reload.
-      </p>
-    </div>
-  )
-}
-
-function QueueEmpty() {
-  return (
-    <div className="flex h-full flex-col items-center justify-center rounded-card border border-line bg-surface px-8 text-center">
-      <span className="mb-4 grid h-12 w-12 place-items-center rounded-control border border-line bg-raised text-success">
-        <Icon name="check" size={22} />
-      </span>
-      <h3 className="text-base font-semibold text-ink">Queue clear</h3>
-      <p className="mt-2 max-w-md text-sm text-muted">No one is waiting on a next move right now.</p>
-    </div>
-  )
-}

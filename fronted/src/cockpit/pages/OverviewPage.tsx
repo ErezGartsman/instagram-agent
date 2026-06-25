@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import type { CSSProperties } from 'react'
 import { motion, useReducedMotion } from 'framer-motion'
 import { Icon } from '../components/Icon'
 import type { IconName } from '../components/Icon'
 import { StatCard } from '../components/StatCard'
+import { SurfaceLoading, SurfaceEmpty, SurfaceError } from '../components/SurfaceStates'
 import { useAuth } from '../auth/AuthProvider'
 import { FEATURES } from '../lib/flags'
 import { fetchPipeline, SAMPLE_PIPELINE } from '../lib/pipeline'
@@ -32,6 +33,11 @@ const DATELINE = new Date().toLocaleDateString(undefined, {
 export function OverviewPage() {
   const { session, devBypass } = useAuth()
   const [state, setState] = useState<State>({ kind: 'loading' })
+  const [retryNonce, setRetryNonce] = useState(0)
+  const retry = useCallback(() => {
+    setState({ kind: 'loading' })
+    setRetryNonce((n) => n + 1)
+  }, [])
 
   useEffect(() => {
     if (devBypass) {
@@ -70,7 +76,7 @@ export function OverviewPage() {
         if ((err as { name?: string } | null)?.name !== 'AbortError') setState({ kind: 'error' })
       })
     return () => controller.abort()
-  }, [session?.access_token, devBypass])
+  }, [session?.access_token, devBypass, retryNonce])
 
   return (
     <div className="mx-auto max-w-[1100px]">
@@ -80,8 +86,14 @@ export function OverviewPage() {
         <p className="mt-1.5 font-mono text-[11px] uppercase tracking-[0.14em] text-faint">{DATELINE}</p>
       </header>
 
-      {state.kind === 'loading' && <PulseSkeleton />}
-      {state.kind === 'error' && <PulseError />}
+      {state.kind === 'loading' && <SurfaceLoading variant="grid" />}
+      {state.kind === 'error' && (
+        <SurfaceError
+          title="Couldn't load your overview"
+          body="The pulse couldn't be reached. Check your connection and try again."
+          onRetry={retry}
+        />
+      )}
 
       {state.kind === 'ready' && (
         <>
@@ -97,7 +109,12 @@ export function OverviewPage() {
           {state.top ? (
             <NextMove top={state.top} pending={state.pending} />
           ) : (
-            <ClearState />
+            <SurfaceEmpty
+              flavor="win"
+              title="You're all caught up"
+              body="No one is waiting on a next move right now."
+              copilotSlot={null}
+            />
           )}
 
           <div className="mt-9 flex flex-wrap gap-3">
@@ -178,41 +195,3 @@ function QuickJump({ to, icon, label }: { to: string; icon: IconName; label: str
   )
 }
 
-function ClearState() {
-  return (
-    <div className="flex flex-col items-center rounded-card border border-line bg-surface px-8 py-12 backdrop-blur-xl text-center [box-shadow:var(--shadow-card)]">
-      <span className="mb-3 grid h-11 w-11 place-items-center rounded-control border border-line bg-raised text-success">
-        <Icon name="check" size={20} />
-      </span>
-      <h3 className="text-sm font-semibold text-ink">You&rsquo;re all caught up</h3>
-      <p className="mt-1.5 max-w-sm text-sm text-muted">No one is waiting on a next move right now.</p>
-    </div>
-  )
-}
-
-function PulseSkeleton() {
-  return (
-    <div aria-hidden>
-      <div className="mb-9 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        {Array.from({ length: 4 }).map((_, i) => (
-          <div key={i} className="h-24 animate-pulse rounded-card border border-line bg-white/[0.04]" />
-        ))}
-      </div>
-      <div className="h-28 animate-pulse rounded-card border border-line bg-white/[0.04]" />
-    </div>
-  )
-}
-
-function PulseError() {
-  return (
-    <div className="flex flex-col items-center rounded-card border border-line bg-surface px-8 py-16 backdrop-blur-xl text-center [box-shadow:var(--shadow-card)]">
-      <span className="mb-4 grid h-12 w-12 place-items-center rounded-control border border-line bg-raised text-danger">
-        <Icon name="alert" size={22} />
-      </span>
-      <h3 className="text-base font-semibold text-ink">Couldn&rsquo;t load your overview</h3>
-      <p className="mt-2 max-w-md text-sm text-muted">
-        The pulse couldn&rsquo;t be reached. Check your connection and reload.
-      </p>
-    </div>
-  )
-}

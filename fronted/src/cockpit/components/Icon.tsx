@@ -15,6 +15,7 @@ export type IconName =
   | 'chart'
   | 'x'
   | 'send'
+  | 'refresh'
 
 type Props = { name: IconName; size?: number } & Omit<SVGProps<SVGSVGElement>, 'name'>
 
@@ -139,6 +140,13 @@ export function Icon({ name, size = 18, ...rest }: Props) {
         <svg {...common}>
           <path d="M22 2 11 13" />
           <path d="M22 2 15 22 11 13 2 9z" />
+        </svg>
+      )
+    case 'refresh':
+      return (
+        <svg {...common}>
+          <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+          <path d="M3 3v5h5" />
         </svg>
       )
   }
