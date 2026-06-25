@@ -33,11 +33,13 @@ from google.genai import types as genai_types
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
 from nexus import bookings as nexus_bookings
+from nexus import copilot as nexus_copilot
 from nexus import db as nexus_db
 from nexus import erasure as nexus_erasure
 from nexus import hooks as nexus_hooks
@@ -178,6 +180,15 @@ class Settings(BaseSettings):
     # Analytics view; leave empty to disable it gracefully.
     powerbi_report_id: str = ""
     powerbi_tenant_id: str = ""
+
+    # ── P2 Ambient Copilot (Claude reasoning core — additive alongside Gemini) ──
+    # anthropic_api_key:        the Anthropic API key powering the cockpit Copilot
+    #   (drafts via claude-opus-4-8, nudges/summaries via claude-haiku-4-5). Empty
+    #   => the Copilot endpoints fail closed (503) and the cockpit shows it offline.
+    #   The Gemini formation cron (_call_llm) is UNTOUCHED — this is a new seam.
+    # copilot_timeout_seconds:  hard per-call deadline for Claude requests.
+    anthropic_api_key:       str = ""
+    copilot_timeout_seconds: int = 60
 
     model_config = {"env_file": ".env"}
 
@@ -526,6 +537,14 @@ def get_db_conn():
 # their own connection (e.g. the post-capture spine) obtain one through this
 # bridge. See docs/NEXUS_V1_INTEGRATION_MAP.md for the full hook contract.
 nexus_db.configure(get_db_conn)
+
+# Hand the Anthropic key to the P2 Copilot reasoning core. Empty key => the
+# Copilot stays inert (endpoints 503) without crashing import — same fail-closed
+# posture as every other optional integration. Additive to Gemini, not a swap.
+nexus_copilot.configure(
+    api_key=settings.anthropic_api_key,
+    timeout=settings.copilot_timeout_seconds,
+)
 
 
 # ─── Schema Cache ─────────────────────────────────────────────────────────────
@@ -1832,63 +1851,189 @@ def cockpit_queue(user: dict = Depends(require_cockpit_user)):
         return {"status": "error", "detail": "Could not load the work queue."}
 
 
+def _db_whatsapp_thread(conn, person_id: str, limit: int = 150) -> list:
+    """
+    Merge a person's WhatsApp conversation into one chronological list of
+    {role, body, at}. Inbound bodies live in `messages` (via sessions); operator
+    replies live in `outbound_messages`. Roles: 'user' = lead inbound,
+    'assistant' = the one-time bot handoff ACK, 'operator' = Erez's reply.
+    Commit-free; the caller owns the connection. Shared by the WS1 thread view
+    and the P2 Copilot context envelope.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT m.role, m.content, m.created_at
+            FROM messages m
+            JOIN sessions s ON s.id = m.session_id
+            WHERE s.person_id = %s AND s.channel = 'whatsapp'
+            ORDER BY m.created_at DESC
+            LIMIT %s
+            """,
+            (person_id, limit),
+        )
+        inbound = [
+            {"role": r[0], "body": r[1], "at": r[2].isoformat() if r[2] else None}
+            for r in cur.fetchall()
+        ]
+        cur.execute(
+            """
+            SELECT body, sent_at
+            FROM outbound_messages
+            WHERE person_id = %s AND channel = 'whatsapp'
+            ORDER BY sent_at DESC
+            LIMIT %s
+            """,
+            (person_id, limit),
+        )
+        outbound = [
+            {"role": "operator", "body": r[0], "at": r[1].isoformat() if r[1] else None}
+            for r in cur.fetchall()
+        ]
+    return sorted(inbound + outbound, key=lambda m: m["at"] or "")
+
+
+def _db_person360(conn, person_id: str) -> Optional[dict]:
+    """
+    Gather the memory-first Person-360 for one person (essence / goal / tension +
+    the latest session-summary read), shaped for nexus.copilot's context envelope.
+    Returns None when the person doesn't exist. Commit-free.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT p.display_name, p.wa_ref_code, p.lifecycle_stage,
+                   pp.summary, pp.attributes,
+                   ss.urgency, ss.emotional_state, ss.topic
+            FROM person p
+            LEFT JOIN person_profile pp ON pp.person_id = p.id
+            LEFT JOIN LATERAL (
+                SELECT urgency, emotional_state, topic
+                FROM session_summaries WHERE person_id = p.id
+                ORDER BY created_at DESC LIMIT 1
+            ) ss ON TRUE
+            WHERE p.id = %s
+            """,
+            (person_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    (display_name, wa_ref, stage, summary, attributes,
+     urgency, emotional_state, topic) = row
+    attrs = attributes if isinstance(attributes, dict) else {}
+    name = display_name or (f"Lead {wa_ref}" if wa_ref else "Lead")
+    return {
+        "name": name,
+        "channel": "whatsapp",
+        "handle": wa_ref,
+        "stage": stage,
+        "essence": summary,
+        "goal": attrs.get("goal"),
+        "tension": attrs.get("tension") or emotional_state,
+        "emotional_state": emotional_state,
+        "topic": topic,
+        "urgency": urgency,
+    }
+
+
 @app.get("/api/cockpit/thread/{person_id}")
 def cockpit_thread(person_id: str, user: dict = Depends(require_cockpit_user)):
     """
-    P2 WS1 — WhatsApp conversation thread for a person.
-    Merges inbound messages (messages table via sessions) with operator-authored
-    outbound messages (outbound_messages table). Returns oldest-first, max 150
-    messages per side. The 'assistant' role is the one-time handoff ACK the bot
-    sends on first contact; 'user' is the lead's inbound text; 'operator' is
-    what Erez sent via the cockpit Action Loop.
+    P2 WS1 — WhatsApp conversation thread for a person. Merges inbound messages
+    with operator-authored outbound messages, oldest-first (see _db_whatsapp_thread).
     """
     try:
         with get_db_conn() as conn:
-            with conn.cursor() as cur:
-                # Inbound: messages persisted by the WhatsApp handler
-                cur.execute(
-                    """
-                    SELECT m.role, m.content, m.created_at
-                    FROM messages m
-                    JOIN sessions s ON s.id = m.session_id
-                    WHERE s.person_id = %s AND s.channel = 'whatsapp'
-                    ORDER BY m.created_at DESC
-                    LIMIT 150
-                    """,
-                    (person_id,),
-                )
-                inbound = [
-                    {
-                        "role": r[0],   # 'user' | 'assistant'
-                        "body": r[1],
-                        "at": r[2].isoformat() if r[2] else None,
-                    }
-                    for r in cur.fetchall()
-                ]
-                # Outbound: operator-authored messages via the Action Loop Send
-                cur.execute(
-                    """
-                    SELECT body, sent_at
-                    FROM outbound_messages
-                    WHERE person_id = %s AND channel = 'whatsapp'
-                    ORDER BY sent_at DESC
-                    LIMIT 150
-                    """,
-                    (person_id,),
-                )
-                outbound = [
-                    {
-                        "role": "operator",
-                        "body": r[0],
-                        "at": r[1].isoformat() if r[1] else None,
-                    }
-                    for r in cur.fetchall()
-                ]
-        messages = sorted(inbound + outbound, key=lambda m: m["at"] or "")
+            messages = _db_whatsapp_thread(conn, person_id)
         return {"status": "success", "messages": messages}
     except Exception as e:
         logger.error(f"[cockpit/thread] query failed for {person_id}: {e}")
         return {"status": "error", "detail": "Could not load conversation."}
+
+
+# ── P2 WS2 — Copilot Reasoning Core (Claude) ─────────────────────────────────
+# The cockpit's drafting brain. Two endpoints over nexus.copilot: a context
+# envelope (Person-360 + WS1 thread, for inspection / WS4 wiring) and an SSE
+# stream that drafts Erez's next reply token-by-token. Human-in-the-loop always:
+# the Copilot drafts, Erez reviews and sends. Fail-closed: no key => 503.
+
+class CopilotStreamBody(BaseModel):
+    person_id: str
+    intent: Optional[str] = None   # operator steer; empty => draft the natural next reply
+
+
+@app.get("/api/cockpit/copilot/context")
+def cockpit_copilot_context(person_id: str, user: dict = Depends(require_cockpit_user)):
+    """
+    The context envelope the Copilot reasons over: the Person-360 + the WS1
+    WhatsApp thread, plus the assembled prompt envelope (handy for WS4 + debugging)
+    and whether the Claude key is configured. Read-only; never calls the model.
+    """
+    try:
+        with get_db_conn() as conn:
+            person = _db_person360(conn, person_id)
+            if person is None:
+                raise HTTPException(status_code=404, detail="Lead not found.")
+            thread = _db_whatsapp_thread(conn, person_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[cockpit/copilot/context] failed for {person_id}: {e}")
+        return {"status": "error", "detail": "Could not load Copilot context."}
+
+    return {
+        "status": "success",
+        "available": nexus_copilot.is_available(),
+        "person": person,
+        "thread": thread,
+        "envelope": nexus_copilot.build_context_envelope(person, thread),
+    }
+
+
+@app.post("/api/cockpit/copilot/stream")
+def cockpit_copilot_stream(body: CopilotStreamBody,
+                           user: dict = Depends(require_cockpit_user)):
+    """
+    Stream a reply draft as Server-Sent Events. Each token arrives as
+    `data: {"type":"delta","text":"…"}`; the stream closes with
+    `data: {"type":"done","text":"<full draft>"}` (or `{"type":"error",...}`).
+    The full draft is the channel WS4's composer prefills onto the Action Loop's
+    `message` field — the Copilot never sends. 503 when no Claude key is set.
+    """
+    if not nexus_copilot.is_available():
+        raise HTTPException(status_code=503, detail="Copilot is not configured.")
+
+    # Gather context up front (DB connection closes before the long-lived stream).
+    try:
+        with get_db_conn() as conn:
+            person = _db_person360(conn, body.person_id)
+            if person is None:
+                raise HTTPException(status_code=404, detail="Lead not found.")
+            thread = _db_whatsapp_thread(conn, body.person_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[cockpit/copilot/stream] context failed for {body.person_id}: {e}")
+        raise HTTPException(status_code=500, detail="Could not load Copilot context.")
+
+    def _event_source():
+        collected: list[str] = []
+        try:
+            for chunk in nexus_copilot.stream_reply_draft(person, thread, body.intent):
+                collected.append(chunk)
+                yield f"data: {json.dumps({'type': 'delta', 'text': chunk}, ensure_ascii=False)}\n\n"
+            full = "".join(collected)
+            yield f"data: {json.dumps({'type': 'done', 'text': full}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            logger.error(f"[cockpit/copilot/stream] draft failed for {body.person_id}: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'detail': 'Draft failed.'}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        _event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── Work Queue Action Loop (P0 ①) — the cockpit's steering wheel ──────────────
