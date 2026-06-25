@@ -6,8 +6,6 @@ configure, no availability gate. Tests pin the CONTRACT that the draft prompt is
 built from, exactly like test_nexus_work_queue pins the ranking contract.
 """
 
-import pytest
-
 from nexus import copilot
 
 

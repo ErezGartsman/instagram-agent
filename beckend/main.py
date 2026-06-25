@@ -31,7 +31,6 @@ import psycopg2.pool
 from google import genai
 from google.genai import types as genai_types
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
