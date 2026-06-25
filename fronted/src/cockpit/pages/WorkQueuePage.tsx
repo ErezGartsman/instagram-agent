@@ -880,3 +880,19 @@ function Fact({ label, value, mono = false }: { label: string; value: string; mo
   )
 }
 
+// ── QueueEmpty ─────────────────────────────────────────────────────────────────
+// Shown when the Board drains to zero via optimistic actions (all cards removed
+// before the next background poll reloads). Same "Queue clear" surface as the
+// outer WorkQueuePage empty state — full-height so it fills the Board's slot.
+function QueueEmpty() {
+  return (
+    <SurfaceEmpty
+      flavor="win"
+      title="Queue clear"
+      body="No one is waiting on a next move right now."
+      copilotSlot={<CopilotNudge />}
+      className="h-full"
+    />
+  )
+}
+
