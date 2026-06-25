@@ -21,6 +21,12 @@ psycopg2-binary>=2.9.0
 # a clean Vercel install.
 google-genai>=1.0.0
 
+# LLM — Anthropic SDK powering the P2 cockpit Copilot (drafts via claude-opus-4-8,
+# nudges/summaries via claude-haiku-4-5). Additive alongside google-genai; the
+# Gemini formation cron is unchanged. Imported lazily in nexus/copilot.py so an
+# unconfigured deploy (no ANTHROPIC_API_KEY) never needs the dep at import time.
+anthropic>=0.49.0
+
 # Timezone database — guarantees zoneinfo("Asia/Jerusalem") on minimal Vercel
 # images (used to format Calendly booking times in Israel time for WhatsApp).
 tzdata>=2024.1
