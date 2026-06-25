@@ -27,6 +27,13 @@ const PAGE_RESULTS: SearchResult[] = NAV.map((item) => ({
 const QUICK_ACTIONS: SearchResult[] = [
   {
     type: 'action',
+    id: 'draft-reply-ai',
+    label: '✦ Draft reply with AI',
+    sublabel: 'Open the top lead and stream a draft reply with the Copilot',
+    route: '/app/queue?draft=1',
+  },
+  {
+    type: 'action',
     id: 'new-content-piece',
     label: 'New content piece',
     sublabel: 'Create and open in Content Studio',

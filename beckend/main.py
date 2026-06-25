@@ -31,6 +31,7 @@ import psycopg2.pool
 from google import genai
 from google.genai import types as genai_types
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -181,14 +182,12 @@ class Settings(BaseSettings):
     powerbi_report_id: str = ""
     powerbi_tenant_id: str = ""
 
-    # ── P2 Ambient Copilot (Claude reasoning core — additive alongside Gemini) ──
-    # anthropic_api_key:        the Anthropic API key powering the cockpit Copilot
-    #   (drafts via claude-opus-4-8, nudges/summaries via claude-haiku-4-5). Empty
-    #   => the Copilot endpoints fail closed (503) and the cockpit shows it offline.
-    #   The Gemini formation cron (_call_llm) is UNTOUCHED — this is a new seam.
-    # copilot_timeout_seconds:  hard per-call deadline for Claude requests.
-    anthropic_api_key:       str = ""
-    copilot_timeout_seconds: int = 60
+    # ── P2 Ambient Copilot ────────────────────────────────────────────────────────
+    # The Copilot uses the EXISTING Gemini seam (_call_llm / gemini-2.5-flash) —
+    # no new API key needed. The stream endpoint calls _call_llm for the draft and
+    # yields word-by-word over SSE. A DEMO_MOCK=1 env var routes to pre-baked
+    # Hebrew drafts so the demo works even against a sparse database.
+    copilot_demo_mock: bool = False   # set COPILOT_DEMO_MOCK=1 in Vercel for offline demo
 
     model_config = {"env_file": ".env"}
 
@@ -538,13 +537,8 @@ def get_db_conn():
 # bridge. See docs/NEXUS_V1_INTEGRATION_MAP.md for the full hook contract.
 nexus_db.configure(get_db_conn)
 
-# Hand the Anthropic key to the P2 Copilot reasoning core. Empty key => the
-# Copilot stays inert (endpoints 503) without crashing import — same fail-closed
-# posture as every other optional integration. Additive to Gemini, not a swap.
-nexus_copilot.configure(
-    api_key=settings.anthropic_api_key,
-    timeout=settings.copilot_timeout_seconds,
-)
+# P2 Copilot uses the existing Gemini seam — no separate configure step needed.
+# nexus.copilot is a pure prompt/context helper; the LLM call happens in main.py.
 
 
 # ─── Schema Cache ─────────────────────────────────────────────────────────────
@@ -1952,23 +1946,40 @@ def cockpit_thread(person_id: str, user: dict = Depends(require_cockpit_user)):
         return {"status": "error", "detail": "Could not load conversation."}
 
 
-# ── P2 WS2 — Copilot Reasoning Core (Claude) ─────────────────────────────────
-# The cockpit's drafting brain. Two endpoints over nexus.copilot: a context
-# envelope (Person-360 + WS1 thread, for inspection / WS4 wiring) and an SSE
-# stream that drafts Erez's next reply token-by-token. Human-in-the-loop always:
-# the Copilot drafts, Erez reviews and sends. Fail-closed: no key => 503.
+# ── P2 WS2 + WS4 — Copilot Reasoning Core (Gemini) ──────────────────────────
+# Drafting brain for the cockpit. The context endpoint returns the Person-360 +
+# thread so WS4 can inspect it. The stream endpoint calls the existing Gemini
+# seam (_call_llm), then yields the full text word-by-word at a natural cadence
+# so the UI renders a realistic typing animation. Human-in-the-loop always: the
+# Copilot drafts, Erez reviews and sends via the Action Loop.
+#
+# DEMO_MOCK path: COPILOT_DEMO_MOCK=1 bypasses the Gemini call and streams a
+# pre-baked high-quality Hebrew draft — useful for an offline or cold-DB demo.
+
+_COPILOT_WORD_DELAY_MS = 38   # ms between words (~26 wpm — deliberate typing pace)
 
 class CopilotStreamBody(BaseModel):
     person_id: str
-    intent: Optional[str] = None   # operator steer; empty => draft the natural next reply
+    intent: Optional[str] = None   # operator steer; empty → draft the natural next reply
+
+
+def _sse_word_stream(text: str):
+    """Yield word-by-word SSE events at a typing cadence, then a final 'done'."""
+    import time
+    words = text.split()
+    for i, word in enumerate(words):
+        chunk = word + (" " if i < len(words) - 1 else "")
+        yield f"data: {json.dumps({'type': 'delta', 'text': chunk}, ensure_ascii=False)}\n\n"
+        time.sleep(_COPILOT_WORD_DELAY_MS / 1000)
+    yield f"data: {json.dumps({'type': 'done', 'text': text}, ensure_ascii=False)}\n\n"
 
 
 @app.get("/api/cockpit/copilot/context")
 def cockpit_copilot_context(person_id: str, user: dict = Depends(require_cockpit_user)):
     """
-    The context envelope the Copilot reasons over: the Person-360 + the WS1
-    WhatsApp thread, plus the assembled prompt envelope (handy for WS4 + debugging)
-    and whether the Claude key is configured. Read-only; never calls the model.
+    Read-only context envelope: Person-360 + WS1 thread + assembled prompt text.
+    Used by the WS4 draft composer to show the Copilot what it's grounded in.
+    Never calls the model.
     """
     try:
         with get_db_conn() as conn:
@@ -1984,7 +1995,6 @@ def cockpit_copilot_context(person_id: str, user: dict = Depends(require_cockpit
 
     return {
         "status": "success",
-        "available": nexus_copilot.is_available(),
         "person": person,
         "thread": thread,
         "envelope": nexus_copilot.build_context_envelope(person, thread),
@@ -1995,16 +2005,14 @@ def cockpit_copilot_context(person_id: str, user: dict = Depends(require_cockpit
 def cockpit_copilot_stream(body: CopilotStreamBody,
                            user: dict = Depends(require_cockpit_user)):
     """
-    Stream a reply draft as Server-Sent Events. Each token arrives as
-    `data: {"type":"delta","text":"…"}`; the stream closes with
-    `data: {"type":"done","text":"<full draft>"}` (or `{"type":"error",...}`).
-    The full draft is the channel WS4's composer prefills onto the Action Loop's
-    `message` field — the Copilot never sends. 503 when no Claude key is set.
+    Stream a reply draft as Server-Sent Events (text/event-stream).
+    Events: `data: {"type":"delta","text":"…"}` per word,
+            `data: {"type":"done","text":"<full>"}` on completion,
+            `data: {"type":"error","detail":"…"}` on failure.
+    Powered by Gemini (gemini-2.5-flash) via the existing _call_llm seam.
+    COPILOT_DEMO_MOCK=1 routes to nexus_copilot.demo_draft_for() instead.
+    The Copilot never sends — the draft is reviewed by Erez before dispatch.
     """
-    if not nexus_copilot.is_available():
-        raise HTTPException(status_code=503, detail="Copilot is not configured.")
-
-    # Gather context up front (DB connection closes before the long-lived stream).
     try:
         with get_db_conn() as conn:
             person = _db_person360(conn, body.person_id)
@@ -2018,16 +2026,17 @@ def cockpit_copilot_stream(body: CopilotStreamBody,
         raise HTTPException(status_code=500, detail="Could not load Copilot context.")
 
     def _event_source():
-        collected: list[str] = []
         try:
-            for chunk in nexus_copilot.stream_reply_draft(person, thread, body.intent):
-                collected.append(chunk)
-                yield f"data: {json.dumps({'type': 'delta', 'text': chunk}, ensure_ascii=False)}\n\n"
-            full = "".join(collected)
-            yield f"data: {json.dumps({'type': 'done', 'text': full}, ensure_ascii=False)}\n\n"
+            if settings.copilot_demo_mock:
+                # Demo-safe path: high-quality pre-baked Hebrew draft, no API call.
+                full_text = nexus_copilot.demo_draft_for(person)
+            else:
+                prompt = nexus_copilot.build_draft_prompt(person, thread, body.intent)
+                full_text = _call_llm(prompt)
+            yield from _sse_word_stream(full_text)
         except Exception as e:
             logger.error(f"[cockpit/copilot/stream] draft failed for {body.person_id}: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'detail': 'Draft failed.'}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'detail': 'Draft failed — try again.'}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         _event_source(),

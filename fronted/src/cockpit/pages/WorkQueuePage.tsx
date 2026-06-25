@@ -10,6 +10,7 @@ import type { IconName } from '../components/Icon'
 import { useAuth } from '../auth/AuthProvider'
 import { CHANNEL_LABELS, relativeTime } from '../lib/pipeline'
 import { postQueueAction, type QueueActionType, type QueueItem } from '../lib/workqueue'
+import { streamDraft } from '../lib/api'
 import { useQueueData } from '../lib/useQueueData'
 import { useNotifications } from '../lib/useNotifications'
 
@@ -72,6 +73,8 @@ export function WorkQueuePage() {
   const token = session?.access_token ?? null
   const [searchParams] = useSearchParams()
   const focusId = searchParams.get('focus') ?? undefined
+  // ?draft=1 — auto-trigger AI drafting on the top lead (from ⌘K "Draft reply" action)
+  const autoDraft = searchParams.get('draft') === '1'
 
   // ── Notifications ─────────────────────────────────────────────────────────
   const { notify } = useNotifications()
@@ -135,6 +138,7 @@ export function WorkQueuePage() {
         initialItems={state.items}
         liveItems={state.items}
         initialSelectedId={focusId}
+        autoDraft={autoDraft}
         sample={state.sample}
         commit={commit}
         suppressRef={suppressRef}
@@ -158,6 +162,7 @@ function Board({
   initialItems,
   liveItems,
   initialSelectedId,
+  autoDraft = false,
   sample,
   commit,
   suppressRef,
@@ -168,6 +173,8 @@ function Board({
   liveItems: QueueItem[]
   /** From ?focus= URL param — pre-selects a lead navigated to from ⌘K search. */
   initialSelectedId?: string
+  /** Auto-trigger AI drafting on mount (from ⌘K "Draft reply" action via ?draft=1). */
+  autoDraft?: boolean
   sample: boolean
   commit: (id: string, type: ActionType, message?: string) => Promise<void>
   suppressRef: { current: boolean }
@@ -183,9 +190,11 @@ function Board({
   const [toast, setToast] = useState<Toast | null>(null)
   const [composing, setComposing] = useState(false)
   const [draft, setDraft] = useState('')
+  const [drafting, setDrafting] = useState(false)   // true while AI is streaming a draft
 
   const pendingRef = useRef<Pending | null>(null)
   const toastHideRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const draftAbortRef = useRef<AbortController | null>(null)
   // Track the last live signature we applied so we don't re-apply the same data.
   const liveSigRef = useRef(liveItems.map((i) => i.id).join(','))
 
@@ -291,9 +300,12 @@ function Board({
     [items, flushPending, runCommit],
   )
 
-  // Send composer — open (prefilled), edit, send. Resets when the lead changes.
+  // Reset composer + abort any in-flight AI draft when the selected lead changes.
   useEffect(() => {
+    draftAbortRef.current?.abort()
+    draftAbortRef.current = null
     setComposing(false)
+    setDrafting(false)
   }, [selectedId])
 
   const openComposer = useCallback(() => {
@@ -301,6 +313,39 @@ function Board({
     setDraft(draftFor(selected))
     setComposing(true)
   }, [selected])
+
+  const openDraftWithAI = useCallback(() => {
+    if (!selected || !token) return
+    // Cancel any in-flight draft first
+    draftAbortRef.current?.abort()
+    const abort = new AbortController()
+    draftAbortRef.current = abort
+    setDraft('')
+    setComposing(true)
+    setDrafting(true)
+    void streamDraft(
+      token,
+      selected.person_id,
+      undefined,
+      (chunk) => setDraft((prev) => prev + chunk),
+      (full) => { setDraft(full); setDrafting(false) },
+      () => { setDrafting(false) },
+      abort.signal,
+    )
+  }, [selected, token])
+
+  // Auto-draft: when ?draft=1 is in the URL (from ⌘K), fire once on mount for
+  // the top lead — the demo narrative starts with the Copilot already drafting.
+  const autoDraftFiredRef = useRef(false)
+  useEffect(() => {
+    if (!autoDraft || autoDraftFiredRef.current) return
+    if (!selected || selected.channel !== 'whatsapp' || !token) return
+    autoDraftFiredRef.current = true
+    // Small delay so the UI settles before the stream starts
+    const t = setTimeout(openDraftWithAI, 400)
+    return () => clearTimeout(t)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoDraft, selected?.id, token])
 
   const sendComposed = useCallback(() => {
     const text = draft.trim()
@@ -462,33 +507,52 @@ function Board({
                 {selected.reason}
               </div>
 
-              {/* Action Bar — or the inline Send composer when drafting. */}
+              {/* Action Bar — or the inline Send composer when composing. */}
               {composing ? (
                 <div className="mt-4 rounded-control border border-line bg-bg/70 p-2.5 backdrop-blur-xl [box-shadow:var(--shadow-card)]">
+                  {/* Header row: status indicator while AI is streaming */}
+                  {drafting && (
+                    <div className="mb-2 flex items-center gap-1.5">
+                      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-glow" aria-hidden />
+                      <span className="font-mono text-[10px] text-glow">Copilot drafting…</span>
+                    </div>
+                  )}
                   <textarea
                     value={draft}
-                    onChange={(e) => setDraft(e.target.value)}
+                    readOnly={drafting}
+                    onChange={drafting ? undefined : (e) => setDraft(e.target.value)}
                     onKeyDown={(e) => {
                       e.stopPropagation()
                       if (e.key === 'Escape') {
                         e.preventDefault()
+                        draftAbortRef.current?.abort()
+                        setDrafting(false)
                         setComposing(false)
-                      } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                      } else if (!drafting && e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
                         e.preventDefault()
                         sendComposed()
                       }
                     }}
                     rows={3}
-                    autoFocus
-                    placeholder={`Message ${selected.name} on WhatsApp…`}
-                    className="w-full resize-none bg-transparent text-sm leading-relaxed text-ink outline-none placeholder:text-faint"
+                    autoFocus={!drafting}
+                    placeholder={drafting ? '' : `Message ${selected.name} on WhatsApp…`}
+                    dir="auto"
+                    className={`w-full resize-none bg-transparent text-sm leading-relaxed text-ink outline-none placeholder:text-faint ${
+                      drafting ? 'cursor-default opacity-90' : ''
+                    }`}
                   />
                   <div className="mt-2 flex items-center justify-between gap-2">
-                    <span className="font-mono text-[10px] text-faint">⌘↵ send · esc cancel · via WhatsApp</span>
+                    <span className="font-mono text-[10px] text-faint">
+                      {drafting ? 'Reviewing…' : '⌘↵ send · esc cancel · via WhatsApp'}
+                    </span>
                     <div className="flex items-center gap-2">
                       <button
                         type="button"
-                        onClick={() => setComposing(false)}
+                        onClick={() => {
+                          draftAbortRef.current?.abort()
+                          setDrafting(false)
+                          setComposing(false)
+                        }}
                         className="rounded-control px-3 py-1.5 text-xs text-muted transition-colors hover:bg-raised hover:text-ink"
                       >
                         Cancel
@@ -496,9 +560,9 @@ function Board({
                       <motion.button
                         type="button"
                         onClick={sendComposed}
-                        disabled={!draft.trim()}
-                        whileHover={reduce || !draft.trim() ? undefined : { scale: 1.03 }}
-                        whileTap={reduce || !draft.trim() ? undefined : { scale: 0.97 }}
+                        disabled={!draft.trim() || drafting}
+                        whileHover={reduce || !draft.trim() || drafting ? undefined : { scale: 1.03 }}
+                        whileTap={reduce || !draft.trim() || drafting ? undefined : { scale: 0.97 }}
                         className="inline-flex items-center gap-1.5 rounded-control bg-accent px-3.5 py-1.5 text-xs font-medium text-ink transition-opacity [box-shadow:var(--shadow-glow)] disabled:opacity-40 disabled:[box-shadow:none]"
                       >
                         <Icon name="send" size={13} /> Send
@@ -518,6 +582,19 @@ function Board({
                   >
                     <Icon name="send" size={14} /> Send message
                   </motion.button>
+                  {/* P2 WS4 — "Draft with AI" — only for WhatsApp leads */}
+                  {selected.channel === 'whatsapp' && token && (
+                    <motion.button
+                      type="button"
+                      onClick={openDraftWithAI}
+                      whileHover={reduce ? undefined : { scale: 1.03 }}
+                      whileTap={reduce ? undefined : { scale: 0.97 }}
+                      aria-label="Draft reply with AI Copilot"
+                      className="inline-flex shrink-0 items-center gap-1.5 rounded-control border border-glow/40 bg-glow/10 px-3.5 py-2 text-xs font-medium text-glow transition-colors hover:bg-glow/20"
+                    >
+                      <span aria-hidden className="text-[10px]">✦</span> Draft with AI
+                    </motion.button>
+                  )}
                   <div className="ml-auto flex items-center gap-2">
                     <ActionButton icon="check" label="Done" tone="success" onClick={() => act(selected.id, 'done')} />
                     <ActionButton icon="clock" label="Snooze" tone="warn" onClick={() => act(selected.id, 'snooze')} />
