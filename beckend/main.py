@@ -2089,6 +2089,83 @@ def _content_row(r) -> dict:
     }
 
 
+@app.get("/api/cockpit/search")
+def cockpit_search(q: str = "", user: dict = Depends(require_cockpit_user)):
+    """
+    Unified search across People (open opportunities) and Content pieces.
+    Pages are static and filtered client-side; only server-side data lives here.
+
+    Returns up to 8 people matches and 5 content matches, ordered by recency.
+    Minimum 2 characters required — returns empty results otherwise to avoid
+    scanning the full table on every keystroke.
+    """
+    q = q.strip()
+    if len(q) < 2:
+        return {"results": []}
+
+    _CHANNEL: dict[str, str] = {
+        "whatsapp": "WhatsApp", "telegram": "Telegram",
+        "instagram": "Instagram", "web": "Web",
+    }
+    _STAGE: dict[str, str] = {
+        "captured": "captured", "qualified": "qualified",
+        "price_offered": "price offered", "booked": "booked",
+    }
+
+    results = []
+    pattern = f"%{q}%"
+
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                # ── People: search display_name across open opportunities ──────────
+                cur.execute(
+                    "SELECT DISTINCT ON (p.id) "
+                    "       o.id, p.display_name, o.source_channel, o.stage "
+                    "FROM person p "
+                    "JOIN opportunities o ON o.person_id = p.id AND o.closed_at IS NULL "
+                    "  AND (o.snoozed_until IS NULL OR o.snoozed_until <= NOW()) "
+                    "WHERE p.display_name ILIKE %s "
+                    "ORDER BY p.id, o.created_at DESC "
+                    "LIMIT 8",
+                    (pattern,),
+                )
+                for row in cur.fetchall():
+                    opp_id, display_name, channel, stage = row
+                    ch = _CHANNEL.get(channel or "", channel or "")
+                    st = _STAGE.get(stage or "", stage or "")
+                    results.append({
+                        "type": "person",
+                        "id": str(opp_id),
+                        "label": display_name or "Unknown",
+                        "sublabel": f"{ch} · {st}",
+                        "route": f"/app/queue?focus={opp_id}",
+                    })
+
+                # ── Content: search by title ──────────────────────────────────────
+                cur.execute(
+                    "SELECT id, title, status FROM content_pieces "
+                    "WHERE title ILIKE %s "
+                    "ORDER BY updated_at DESC LIMIT 5",
+                    (pattern,),
+                )
+                for row in cur.fetchall():
+                    piece_id, title, status = row
+                    results.append({
+                        "type": "content",
+                        "id": str(piece_id),
+                        "label": title or "Untitled piece",
+                        "sublabel": status or "idea",
+                        "route": f"/app/content?piece={piece_id}",
+                    })
+
+    except Exception as e:
+        logger.warning("[search] query failed: %s", e)
+        return {"results": []}
+
+    return {"results": results}
+
+
 @app.get("/api/cockpit/content")
 def cockpit_content_list(user: dict = Depends(require_cockpit_user)):
     """All content pieces, newest-touched first — for the Studio rail + canvas."""

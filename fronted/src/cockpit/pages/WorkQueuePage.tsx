@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, KeyboardEvent, MouseEvent } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { SurfaceLoading, SurfaceEmpty, SurfaceError } from '../components/SurfaceStates'
 import { HotLeadToast } from '../components/HotLeadToast'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
@@ -68,6 +69,8 @@ function draftFor(item: QueueItem): string {
 export function WorkQueuePage() {
   const { session, devBypass } = useAuth()
   const token = session?.access_token ?? null
+  const [searchParams] = useSearchParams()
+  const focusId = searchParams.get('focus') ?? undefined
 
   // ── Notifications ─────────────────────────────────────────────────────────
   const { notify } = useNotifications()
@@ -130,6 +133,7 @@ export function WorkQueuePage() {
       <Board
         initialItems={state.items}
         liveItems={state.items}
+        initialSelectedId={focusId}
         sample={state.sample}
         commit={commit}
         suppressRef={suppressRef}
@@ -150,19 +154,24 @@ type Pending = {
 function Board({
   initialItems,
   liveItems,
+  initialSelectedId,
   sample,
   commit,
   suppressRef,
 }: {
   initialItems: QueueItem[]
   liveItems: QueueItem[]
+  /** From ?focus= URL param — pre-selects a lead navigated to from ⌘K search. */
+  initialSelectedId?: string
   sample: boolean
   commit: (id: string, type: ActionType, message?: string) => Promise<void>
   suppressRef: { current: boolean }
 }) {
   const reduce = useReducedMotion()
   const [items, setItems] = useState<QueueItem[]>(initialItems)
-  const [selectedId, setSelectedId] = useState<string | null>(initialItems[0]?.id ?? null)
+  const [selectedId, setSelectedId] = useState<string | null>(
+    initialSelectedId ?? initialItems[0]?.id ?? null,
+  )
   const [exitDir, setExitDir] = useState<ExitDir>('right')
   const [toast, setToast] = useState<Toast | null>(null)
   const [composing, setComposing] = useState(false)

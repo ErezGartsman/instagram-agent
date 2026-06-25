@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Icon } from '../components/Icon'
 import { SurfaceLoading, SurfaceError } from '../components/SurfaceStates'
 import { useAuth } from '../auth/AuthProvider'
@@ -42,6 +43,8 @@ const toDraft = (p: ContentPiece): Draft => ({
 export function ContentStudioPage() {
   const { session, devBypass } = useAuth()
   const token = session?.access_token
+  const [searchParams] = useSearchParams()
+  const pieceId = searchParams.get('piece')
   const [phase, setPhase] = useState<Phase>('loading')
   const [retryNonce, setRetryNonce] = useState(0)
   const retry = useCallback(() => {
@@ -72,7 +75,7 @@ export function ContentStudioPage() {
     fetchContent(token, controller.signal)
       .then((list) => {
         setItems(list)
-        setSelectedId((id) => id ?? list[0]?.id ?? null)
+        setSelectedId((id) => id ?? pieceId ?? list[0]?.id ?? null)
         setPhase('ready')
       })
       .catch((err: unknown) => {
