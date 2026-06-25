@@ -1,26 +1,27 @@
 import { useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
-import { ChevronDown, CircleUser, LogOut } from 'lucide-react'
+import { ChevronDown, LogOut } from 'lucide-react'
 import { useAuth } from '../auth/AuthProvider'
 
-// High-quality Unsplash portrait — placeholder identity until real avatars land.
-const AVATAR_SRC =
-  'https://images.unsplash.com/photo-1633332755192-727a05c4013d?w=160&h=160&fit=crop&crop=faces&auto=format&q=80'
-
 /**
- * The account control on the Topbar's far right: a premium avatar with a neon
- * hover-glow that opens a glassmorphic dropdown (identity · Settings · Sign out).
- * Closes on outside-click and Escape; the panel respects the motion budget.
+ * The account control on the Topbar's far right. Avatar priority:
+ *   1. Google profile picture (avatarUrl from user_metadata)
+ *   2. Gold initials disc — premium fallback for email/password users
+ *      and Google URLs that fail to load.
+ * Closes on outside-click and Escape; respects the motion budget.
  */
 export function AvatarMenu() {
-  const { profile, user, signOut } = useAuth()
+  const { profile, user, avatarUrl, displayName, signOut } = useAuth()
   const reduce = useReducedMotion()
   const [open, setOpen] = useState(false)
   const [imgOk, setImgOk] = useState(true)
   const ref = useRef<HTMLDivElement>(null)
 
-  const email = profile?.email ?? user?.email ?? 'Signed in'
-  const name = email.includes('@') ? email.split('@')[0] : email
+  const email = profile?.email ?? user?.email ?? ''
+  const initial = displayName.charAt(0).toUpperCase()
+
+  // Reset image error state whenever the URL changes (e.g. after re-login).
+  useEffect(() => { setImgOk(true) }, [avatarUrl])
 
   useEffect(() => {
     if (!open) return
@@ -38,17 +39,23 @@ export function AvatarMenu() {
     }
   }, [open])
 
-  const avatarImg = (size: number) =>
-    imgOk ? (
+  /** Renders the avatar image or the gold initials disc fallback. */
+  const AvatarFace = () =>
+    imgOk && avatarUrl ? (
       <img
-        src={AVATAR_SRC}
+        src={avatarUrl}
         alt=""
         referrerPolicy="no-referrer"
         onError={() => setImgOk(false)}
         className="h-full w-full object-cover"
       />
     ) : (
-      <CircleUser size={size} className="text-muted" aria-hidden />
+      <span
+        aria-hidden
+        className="grid h-full w-full place-items-center rounded-full bg-accent font-mono text-[11px] font-semibold text-bg"
+      >
+        {initial}
+      </span>
     )
 
   return (
@@ -70,7 +77,7 @@ export function AvatarMenu() {
               : 'ring-line group-hover:ring-glow group-hover:[box-shadow:var(--shadow-glow)]'
           }`}
         >
-          {avatarImg(18)}
+          <AvatarFace />
         </span>
         <ChevronDown
           size={14}
@@ -93,10 +100,10 @@ export function AvatarMenu() {
             {/* Identity header */}
             <div className="flex items-center gap-3 border-b border-line px-4 py-3">
               <span className="grid h-9 w-9 shrink-0 place-items-center overflow-hidden rounded-full ring-1 ring-line">
-                {avatarImg(20)}
+                <AvatarFace />
               </span>
               <div className="min-w-0">
-                <p className="truncate text-sm font-medium capitalize text-ink">{name}</p>
+                <p className="truncate text-sm font-medium text-ink">{displayName}</p>
                 <p className="truncate text-xs text-faint">{email}</p>
               </div>
             </div>

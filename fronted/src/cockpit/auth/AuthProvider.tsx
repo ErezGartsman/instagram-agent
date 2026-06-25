@@ -42,6 +42,10 @@ type AuthValue = {
   /** True when the dev-only auth bypass is active (never in production). */
   devBypass: boolean
   recheck: () => void
+  /** Google avatar URL from user_metadata. Null for email/password users — use displayName initial instead. */
+  avatarUrl: string | null
+  /** Human-readable name derived from user_metadata.full_name → email prefix → 'Operator'. */
+  displayName: string
   signInWithPassword: (email: string, password: string) => Promise<{ error: string | null }>
   signInWithGoogle: () => Promise<{ error: string | null }>
   signOut: () => Promise<void>
@@ -121,14 +125,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const recheck = useCallback(() => setRecheckNonce((n) => n + 1), [])
 
   const value = useMemo<AuthValue>(
-    () => ({
+    () => {
+      const u = session?.user ?? null
+      const meta = u?.user_metadata ?? {}
+      const avatarUrl: string | null =
+        (meta.avatar_url as string | undefined) ??
+        (meta.picture   as string | undefined) ??
+        null
+      const displayName: string =
+        (meta.full_name as string | undefined) ??
+        (meta.name      as string | undefined) ??
+        u?.email?.split('@')[0] ??
+        'Operator'
+
+      return ({
       session,
-      user: session?.user ?? null,
+      user: u,
       loading,
       access,
       profile,
       devBypass: DEV_BYPASS,
       recheck,
+      avatarUrl,
+      displayName,
       signInWithPassword: async (email, password) => {
         const { error } = await supabase.auth.signInWithPassword({ email, password })
         return { error: error?.message ?? null }
@@ -143,7 +162,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signOut: async () => {
         await supabase.auth.signOut()
       },
-    }),
+    })},
     [session, loading, access, profile, recheck],
   )
 
