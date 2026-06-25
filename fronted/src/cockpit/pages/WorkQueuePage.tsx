@@ -12,6 +12,13 @@ import { CHANNEL_LABELS, relativeTime } from '../lib/pipeline'
 import { postQueueAction, type QueueActionType, type QueueItem } from '../lib/workqueue'
 import { streamDraft } from '../lib/api'
 import { useQueueData } from '../lib/useQueueData'
+
+// Dev-bypass demo draft — dead-code-eliminated in production builds.
+// Streams locally when devBypass=true so the fake 'dev-bypass' token never
+// reaches the backend (which correctly rejects it with 401).
+const DEV_BYPASS_DRAFT: string = import.meta.env.DEV
+  ? 'היי מאיה, ארז כאן. קראתי את מה שכתבת ואני מבין — זה לא מקום פשוט להיות בו. יש לי מקום השבוע לשיחה ראשונה, אם בא לך. הנה הלינק לתיאום: '
+  : ''
 import { useNotifications } from '../lib/useNotifications'
 
 type State =
@@ -315,14 +322,37 @@ function Board({
   }, [selected])
 
   const openDraftWithAI = useCallback(() => {
-    if (!selected || !token) return
-    // Cancel any in-flight draft first
+    if (!selected) return
     draftAbortRef.current?.abort()
     const abort = new AbortController()
     draftAbortRef.current = abort
     setDraft('')
     setComposing(true)
     setDrafting(true)
+
+    if (devBypass) {
+      // Dev bypass: the mock token ('dev-bypass') is not a real JWT and would
+      // correctly 401 on the backend. Simulate word-by-word streaming locally
+      // with the pre-baked Hebrew demo draft (same cadence as the real endpoint).
+      let cancelled = false
+      abort.signal.addEventListener('abort', () => { cancelled = true })
+      const words = DEV_BYPASS_DRAFT.split(' ')
+      let i = 0
+      const tick = () => {
+        if (cancelled) return
+        if (i < words.length) {
+          const chunk = (i > 0 ? ' ' : '') + words[i++]
+          setDraft((prev) => prev + chunk)
+          setTimeout(tick, 38)
+        } else {
+          setDrafting(false)
+        }
+      }
+      setTimeout(tick, 180)
+      return
+    }
+
+    if (!token) { setDrafting(false); setComposing(false); return }
     void streamDraft(
       token,
       selected.person_id,
@@ -332,14 +362,15 @@ function Board({
       () => { setDrafting(false) },
       abort.signal,
     )
-  }, [selected, token])
+  }, [selected, devBypass, token])
 
   // Auto-draft: when ?draft=1 is in the URL (from ⌘K), fire once on mount for
   // the top lead — the demo narrative starts with the Copilot already drafting.
   const autoDraftFiredRef = useRef(false)
   useEffect(() => {
     if (!autoDraft || autoDraftFiredRef.current) return
-    if (!selected || selected.channel !== 'whatsapp' || !token) return
+    if (!selected || selected.channel !== 'whatsapp') return
+    if (!token && !devBypass) return
     autoDraftFiredRef.current = true
     // Small delay so the UI settles before the stream starts
     const t = setTimeout(openDraftWithAI, 400)
