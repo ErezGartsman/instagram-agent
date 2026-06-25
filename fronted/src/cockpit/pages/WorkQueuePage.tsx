@@ -1,19 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { SurfaceLoading, SurfaceEmpty, SurfaceError } from '../components/SurfaceStates'
 import type { CSSProperties, KeyboardEvent, MouseEvent } from 'react'
+import { SurfaceLoading, SurfaceEmpty, SurfaceError } from '../components/SurfaceStates'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { Icon } from '../components/Icon'
 import type { IconName } from '../components/Icon'
 import { useAuth } from '../auth/AuthProvider'
 import { CHANNEL_LABELS, relativeTime } from '../lib/pipeline'
-import {
-  fetchQueue,
-  postQueueAction,
-  rankQueue,
-  SAMPLE_QUEUE,
-  type QueueActionType,
-  type QueueItem,
-} from '../lib/workqueue'
+import { postQueueAction, type QueueActionType, type QueueItem } from '../lib/workqueue'
+import { useQueueData } from '../lib/useQueueData'
 
 type State =
   | { kind: 'loading' }
@@ -71,36 +65,15 @@ function draftFor(item: QueueItem): string {
  */
 export function WorkQueuePage() {
   const { session, devBypass } = useAuth()
-  const [state, setState] = useState<State>({ kind: 'loading' })
-  const [retryNonce, setRetryNonce] = useState(0)
-  const retry = useCallback(() => {
-    setState({ kind: 'loading' })
-    setRetryNonce((n) => n + 1)
-  }, [])
+  const token = session?.access_token ?? null
 
-  useEffect(() => {
-    if (devBypass) {
-      setState({ kind: 'ready', items: SAMPLE_QUEUE, sample: true })
-      return
-    }
-    const token = session?.access_token
-    if (!token) {
-      setState({ kind: 'loading' })
-      return
-    }
-    const controller = new AbortController()
-    setState({ kind: 'loading' })
-    fetchQueue(token, controller.signal)
-      .then((items) => setState({ kind: 'ready', items: rankQueue(items), sample: false }))
-      .catch((err: unknown) => {
-        if ((err as { name?: string } | null)?.name !== 'AbortError') setState({ kind: 'error' })
-      })
-    return () => controller.abort()
-  }, [session?.access_token, devBypass, retryNonce])
+  // suppressRef: Board sets true while an optimistic action is in flight;
+  // the hook reads it before every background setState. Stable ref — no renders.
+  const suppressRef = useRef(false)
+  const { state, refetch } = useQueueData(token, devBypass, suppressRef)
 
-  // The single seam to the backend. Resolves on success; throws on failure so the
-  // Board rolls the card back. Dev-bypass never calls the API (local UI work).
-  const token = session?.access_token
+  // The single seam to the backend. Resolves on success; throws on failure so
+  // the Board rolls the card back. Dev-bypass never calls the API.
   const commit = useCallback(
     async (id: string, type: ActionType, message?: string) => {
       if (devBypass || !token) {
@@ -118,7 +91,7 @@ export function WorkQueuePage() {
     <SurfaceError
       title="Couldn't load the queue"
       body="The work queue couldn't be reached. Check your connection and try again."
-      onRetry={retry}
+      onRetry={refetch}
       className="h-full"
     />
   )
@@ -132,7 +105,15 @@ export function WorkQueuePage() {
     />
   )
 
-  return <Board initialItems={state.items} sample={state.sample} commit={commit} />
+  return (
+    <Board
+      initialItems={state.items}
+      liveItems={state.items}
+      sample={state.sample}
+      commit={commit}
+      suppressRef={suppressRef}
+    />
+  )
 }
 
 type Toast = { item: QueueItem; index: number; type: ActionType; kind: 'undo' | 'error' }
@@ -146,12 +127,16 @@ type Pending = {
 
 function Board({
   initialItems,
+  liveItems,
   sample,
   commit,
+  suppressRef,
 }: {
   initialItems: QueueItem[]
+  liveItems: QueueItem[]
   sample: boolean
   commit: (id: string, type: ActionType, message?: string) => Promise<void>
+  suppressRef: { current: boolean }
 }) {
   const reduce = useReducedMotion()
   const [items, setItems] = useState<QueueItem[]>(initialItems)
@@ -163,6 +148,19 @@ function Board({
 
   const pendingRef = useRef<Pending | null>(null)
   const toastHideRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Track the last live signature we applied so we don't re-apply the same data.
+  const liveSigRef = useRef(liveItems.map((i) => i.id).join(','))
+
+  // Live-sync: apply server updates from background polls when safe.
+  // Skips if an action is in flight (suppressRef.current) or data is unchanged.
+  useEffect(() => {
+    if (suppressRef.current) return
+    const sig = liveItems.map((i) => i.id).join(',')
+    if (sig === liveSigRef.current) return
+    liveSigRef.current = sig
+    setItems(liveItems)
+    setSelectedId((prev) => liveItems.find((i) => i.id === prev)?.id ?? liveItems[0]?.id ?? null)
+  }, [liveItems, suppressRef])
 
   const selected = useMemo(
     () => items.find((i) => i.id === selectedId) ?? items[0],
@@ -198,8 +196,9 @@ function Board({
     if (!p) return
     clearTimeout(p.timer)
     pendingRef.current = null
+    suppressRef.current = false   // action flushed — polling safe to resume
     runCommit(p)
-  }, [runCommit])
+  }, [runCommit, suppressRef])
 
   useEffect(
     () => () => {
@@ -244,10 +243,12 @@ function Board({
       const timer = setTimeout(() => {
         const p = pendingRef.current
         pendingRef.current = null
+        suppressRef.current = false  // undo window closed — polling safe to resume
         setToast((t) => (t && t.kind === 'undo' && t.item.id === id ? null : t))
         if (p) runCommit(p)
       }, UNDO_MS)
       pendingRef.current = { item, index: idx, type, message, timer }
+      suppressRef.current = true   // action in flight — suppress background polls
     },
     [items, flushPending, runCommit],
   )
@@ -275,11 +276,12 @@ function Board({
     if (!p) return
     clearTimeout(p.timer)
     pendingRef.current = null
+    suppressRef.current = false  // undone — polling safe to resume
     setItems((prev) => insertAt(prev, p.index, p.item))
     setSelectedId(p.item.id)
     console.log(`[action] ⤺ undo ${p.type} → ${p.item.id} (canceled before commit)`)
     setToast(null)
-  }, [])
+  }, [suppressRef])
 
   const onKeyDown = (e: KeyboardEvent<HTMLElement>) => {
     if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')) {
