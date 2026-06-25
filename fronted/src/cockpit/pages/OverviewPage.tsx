@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import type { CSSProperties } from 'react'
 import { motion, useReducedMotion } from 'framer-motion'
@@ -35,11 +35,13 @@ export function OverviewPage() {
   const { session, devBypass, displayName } = useAuth()
   const [state, setState] = useState<State>({ kind: 'loading' })
   const [retryNonce, setRetryNonce] = useState(0)
+  const sigRef = useRef('')
   const retry = useCallback(() => {
     setState({ kind: 'loading' })
     setRetryNonce((n) => n + 1)
   }, [])
 
+  // Initial load (shows loading state, error on failure).
   useEffect(() => {
     if (devBypass) {
       const ranked = rankQueue(SAMPLE_QUEUE)
@@ -65,9 +67,11 @@ export function OverviewPage() {
     ])
       .then(([stages, items]) => {
         const ranked = rankQueue(items)
+        const kpis = deriveKpis(stages)
+        sigRef.current = `${kpis.map((k) => k.value).join(',')}|${ranked[0]?.id ?? ''}:${ranked.length}`
         setState({
           kind: 'ready',
-          kpis: deriveKpis(stages),
+          kpis,
           top: ranked[0] ?? null,
           pending: ranked.length,
           sample: false,
@@ -78,6 +82,50 @@ export function OverviewPage() {
       })
     return () => controller.abort()
   }, [session?.access_token, devBypass, retryNonce])
+
+  // Background fetch — silent; never shows loading, never flashes error.
+  // Signature-diff guard: skips setState when nothing changed.
+  const bgFetch = useCallback(async () => {
+    const token = session?.access_token
+    if (!token || devBypass) return
+    try {
+      const [stages, items] = await Promise.all([
+        fetchPipeline(token),
+        fetchQueue(token),
+      ])
+      const ranked = rankQueue(items)
+      const kpis = deriveKpis(stages)
+      const newSig = `${kpis.map((k) => k.value).join(',')}|${ranked[0]?.id ?? ''}:${ranked.length}`
+      if (newSig === sigRef.current) return
+      sigRef.current = newSig
+      setState({ kind: 'ready', kpis, top: ranked[0] ?? null, pending: ranked.length, sample: false })
+    } catch {
+      // Transient poll failures are silent — don't flash an error state.
+    }
+  }, [session?.access_token, devBypass])
+
+  // 30s polling
+  useEffect(() => {
+    const id = setInterval(() => void bgFetch(), 30_000)
+    return () => clearInterval(id)
+  }, [bgFetch])
+
+  // Aggressive focus + visibility refetch (debounced 500ms)
+  useEffect(() => {
+    let debounce: ReturnType<typeof setTimeout> | null = null
+    const trigger = () => {
+      if (debounce) clearTimeout(debounce)
+      debounce = setTimeout(() => void bgFetch(), 500)
+    }
+    const onVisibility = () => { if (document.visibilityState === 'visible') trigger() }
+    window.addEventListener('focus', trigger)
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      window.removeEventListener('focus', trigger)
+      document.removeEventListener('visibilitychange', onVisibility)
+      if (debounce) clearTimeout(debounce)
+    }
+  }, [bgFetch])
 
   return (
     <div className="mx-auto max-w-[1100px]">
