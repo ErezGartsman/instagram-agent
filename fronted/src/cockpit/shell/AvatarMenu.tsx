@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
-import { ChevronDown, CircleUser, LogOut, Settings } from 'lucide-react'
+import { ChevronDown, CircleUser, LogOut } from 'lucide-react'
 import { useAuth } from '../auth/AuthProvider'
 
 // High-quality Unsplash portrait — placeholder identity until real avatars land.
@@ -103,15 +103,6 @@ export function AvatarMenu() {
 
             {/* Items */}
             <div className="p-1.5">
-              <button
-                role="menuitem"
-                type="button"
-                onClick={() => setOpen(false)}
-                className="flex w-full items-center gap-3 rounded-control px-3 py-2 text-sm text-muted transition-colors hover:bg-raised hover:text-ink"
-              >
-                <Settings size={16} strokeWidth={1.8} aria-hidden />
-                Settings
-              </button>
               <button
                 role="menuitem"
                 type="button"
