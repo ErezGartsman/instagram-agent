@@ -56,6 +56,10 @@ export function ContentStudioPage() {
   // ?new=1 auto-trigger — fires once after content loads when opened from ⌘K.
   // Stored in a ref so it doesn't cause a re-render and only fires once per open.
   const onNewRef = useRef<(() => Promise<void>) | null>(null)
+  // busy/justSaved must be declared before the useEffect that closes over `busy`
+  // to avoid a TDZ ReferenceError in the production bundle.
+  const [busy, setBusy] = useState(false)
+  const [justSaved, setJustSaved] = useState(false)
   useEffect(() => {
     if (!triggerNew || hasTriggeredNewRef.current || phase !== 'ready' || busy) return
     hasTriggeredNewRef.current = true
@@ -66,8 +70,6 @@ export function ContentStudioPage() {
   const [items, setItems] = useState<ContentPiece[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [draft, setDraft] = useState<Draft | null>(null)
-  const [busy, setBusy] = useState(false)
-  const [justSaved, setJustSaved] = useState(false)
 
   useEffect(() => {
     if (devBypass) {

@@ -4,6 +4,7 @@ import { useSearchParams } from 'react-router-dom'
 import { SurfaceLoading, SurfaceEmpty, SurfaceError } from '../components/SurfaceStates'
 import { HotLeadToast } from '../components/HotLeadToast'
 import { WhatsAppThread } from '../components/WhatsAppThread'
+import { CopilotNudge } from '../components/CopilotNudge'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { Icon } from '../components/Icon'
 import type { IconName } from '../components/Icon'
@@ -129,7 +130,7 @@ export function WorkQueuePage() {
       flavor="win"
       title="Queue clear"
       body="No one is waiting on a next move right now."
-      copilotSlot={null}
+      copilotSlot={<CopilotNudge />}
       className="h-full"
     />
   )
