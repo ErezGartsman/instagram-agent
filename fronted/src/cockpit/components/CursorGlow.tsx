@@ -38,7 +38,7 @@ export function CursorGlow() {
       className="pointer-events-none fixed left-0 top-0 z-[9999] h-0 w-0"
       aria-hidden
     >
-      {/* Outer halo — wide, near-invisible electric-blue bleed */}
+      {/* Outer halo — wide, near-invisible warm amber bleed */}
       <div
         style={{
           position: 'absolute',
@@ -48,10 +48,10 @@ export function CursorGlow() {
           marginTop: -350,
           borderRadius: '50%',
           background:
-            'radial-gradient(circle, transparent 20%, rgba(59,130,246,0.03) 50%, transparent 70%)',
+            'radial-gradient(circle, transparent 20%, rgba(184,134,11,0.03) 50%, transparent 70%)',
         }}
       />
-      {/* Inner orb — violet-centered, the primary interactive glow */}
+      {/* Inner orb — dark gold centered, the primary interactive glow */}
       <div
         style={{
           position: 'absolute',
@@ -61,7 +61,7 @@ export function CursorGlow() {
           marginTop: -210,
           borderRadius: '50%',
           background:
-            'radial-gradient(circle, rgba(124,58,237,0.08) 0%, rgba(59,130,246,0.04) 45%, transparent 70%)',
+            'radial-gradient(circle, rgba(184,134,11,0.07) 0%, rgba(212,168,67,0.03) 45%, transparent 70%)',
         }}
       />
     </div>

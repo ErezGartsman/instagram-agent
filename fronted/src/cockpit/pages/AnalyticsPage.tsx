@@ -11,8 +11,8 @@ type State =
   | { kind: 'error' }
   | { kind: 'ready'; data: AnalyticsData; sample: boolean }
 
-const BRONZE = '#c9aa71'
-const SAGE = '#8a9a82'
+const BRONZE = '#d4a843'   // Warm Luxury — amber-gold (--color-glow)
+const SAGE   = '#8fbc8f'   // Warm Luxury — sage green (--color-sage)
 const REDUCED =
   typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
 
@@ -104,14 +104,14 @@ function Bento({ data }: { data: AnalyticsData }) {
               <Tooltip
                 cursor={{ stroke: 'rgba(242,235,224,0.15)' }}
                 contentStyle={{
-                  background: '#1a1512',
-                  border: '0.5px solid rgba(242,235,224,0.14)',
+                  background: '#0e0b08',
+                  border: '0.5px solid rgba(255,235,180,0.08)',
                   borderRadius: 8,
                   fontFamily: 'JetBrains Mono, monospace',
                   fontSize: 11,
-                  color: '#f2ebe0',
+                  color: '#ffffff',
                 }}
-                labelStyle={{ color: '#6f6357' }}
+                labelStyle={{ color: '#52525b' }}
                 formatter={(v) => [compact(Number(v)), 'followers']}
               />
             </AreaChart>
