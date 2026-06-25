@@ -24,7 +24,11 @@ export const NAV_SECTIONS: NavSection[] = [
         ? [{ to: '/app/queue', label: 'Work queue', icon: ListChecks }]
         : []),
       { to: '/app/pipeline', label: 'Pipeline', icon: Columns3 },
-      { to: '/app/inbox', label: 'Inbox', icon: Inbox },
+      // Inbox hidden until P2 builds the full WhatsApp thread view (B2 decision).
+      // Route /app/inbox stays registered; VITE_FEATURE_INBOX=1 to preview locally.
+      ...(FEATURES.inbox
+        ? [{ to: '/app/inbox', label: 'Inbox', icon: Inbox }]
+        : []),
     ],
   },
   {
