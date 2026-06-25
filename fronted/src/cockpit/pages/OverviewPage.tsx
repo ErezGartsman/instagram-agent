@@ -120,14 +120,14 @@ function NextMove({ top, pending }: { top: QueueItem; pending: number }) {
   return (
     <MotionLink
       to={to}
-      whileHover={reduce ? undefined : { y: -3, boxShadow: '0 0 36px rgba(124,58,237,0.28), inset 0 1px 0 rgba(255,255,255,0.12)' }}
+      whileHover={reduce ? undefined : { y: -3, boxShadow: '0 0 36px rgba(184,134,11,0.24), inset 0 1px 0 rgba(255,235,180,0.10)' }}
       transition={{ duration: 0.18, ease: 'easeOut' }}
       className="group block rounded-card border border-line bg-surface p-5 backdrop-blur-xl transition-colors hover:bg-raised [box-shadow:var(--shadow-card)]"
     >
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <span className="rounded bg-[rgba(124,58,237,0.20)] border border-[rgba(167,139,250,0.25)] px-1.5 py-px font-mono text-[10px] uppercase tracking-wider text-glow">
+            <span className="rounded bg-[rgba(184,134,11,0.15)] border border-[rgba(212,168,67,0.30)] px-1.5 py-px font-mono text-[10px] uppercase tracking-wider text-glow">
               Next
             </span>
             <span className="truncate text-sm font-medium text-ink">{top.name}</span>
@@ -139,7 +139,7 @@ function NextMove({ top, pending }: { top: QueueItem; pending: number }) {
           </div>
         </div>
         <div className="flex shrink-0 flex-col items-end gap-2.5">
-          <span className="font-mono text-sm tabular-nums text-glow [text-shadow:0_0_8px_rgba(167,139,250,0.6)]">
+          <span className="font-mono text-sm tabular-nums text-glow [text-shadow:0_0_8px_rgba(212,168,67,0.7)]">
             {top.confidence}%
           </span>
           <span className="flex items-center gap-1 text-xs text-muted transition-colors group-hover:text-ink">
@@ -151,7 +151,7 @@ function NextMove({ top, pending }: { top: QueueItem; pending: number }) {
       {/* Neon confidence bar */}
       <span className="mt-4 block h-[3px] w-full overflow-hidden rounded-full bg-white/[0.08]">
         <span
-          className="cq-grow block h-full rounded-full bg-gradient-to-r from-[#7c3aed] to-[#a78bfa] [box-shadow:0_0_8px_rgba(124,58,237,0.70)]"
+          className="cq-grow block h-full rounded-full bg-gradient-to-r from-[#b8860b] to-[#d4a843] [box-shadow:0_0_8px_rgba(184,134,11,0.75)]"
           style={{ '--w': `${top.confidence}%` } as CSSProperties}
         />
       </span>

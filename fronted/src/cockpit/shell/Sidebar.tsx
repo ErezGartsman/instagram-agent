@@ -52,7 +52,7 @@ export function Sidebar() {
           collapsed ? 'justify-center px-0' : 'px-5'
         }`}
       >
-        <span className="grid h-7 w-7 shrink-0 place-items-center rounded-control bg-accent text-bg [box-shadow:0_0_16px_rgba(124,58,237,0.5)]">
+        <span className="grid h-7 w-7 shrink-0 place-items-center rounded-control bg-accent text-bg [box-shadow:0_0_16px_rgba(184,134,11,0.45)]">
           <Hexagon size={15} strokeWidth={2} aria-hidden />
         </span>
         <motion.div
@@ -94,7 +94,7 @@ export function Sidebar() {
                     collapsed ? 'justify-center px-0' : 'px-3'
                   } ${
                     isActive
-                      ? 'bg-raised font-semibold text-ink [box-shadow:inset_0_0_16px_rgba(124,58,237,0.12)]'
+                      ? 'bg-raised font-semibold text-ink [box-shadow:inset_0_0_16px_rgba(184,134,11,0.10)]'
                       : 'text-muted hover:bg-surface hover:text-ink'
                   }`
                 }

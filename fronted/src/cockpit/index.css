@@ -3,12 +3,12 @@
    Pivoted 2026-06-22 from Graphite Atelier (warm obsidian) on Erez's directive.
 
    Three-layer depth system:
-   1. Void + ambient dual-glow — violet crown (top) + electric-blue depth (bottom-right),
+   1. Void + ambient dual-glow — dark gold crown (top) + warm amber depth (bottom-right),
       pure CSS radial gradients on .cockpit-root, no images.
-   2. Glass panels — backdrop-blur-xl + rgba(255,255,255,0.08) surfaces. Section-level
+   2. Glass panels — backdrop-blur-xl + rgba(255,235,180,0.05) champagne surfaces. Section-level
       containers only (Sidebar, Topbar, StatCard, feature cards). List rows stay flat rgba
       for GPU safety.
-   3. Neon signatures — violet (#7c3aed) fills; #a78bfa bright-violet for glow text + pip.
+   3. Warm signatures — dark gold (#b8860b) fills; #d4a843 amber-gold for glow text + pip.
 
    Typography: Inter (machine UI) · JetBrains Mono (data/numerals).
    Fraunces (serif) is reserved EXCLUSIVELY for the Overview "Good afternoon." greeting —
