@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
-import { ChevronDown, LogOut } from 'lucide-react'
+import { Bell, ChevronDown, LogOut } from 'lucide-react'
 import { useAuth } from '../auth/AuthProvider'
+import { useNotifications } from '../lib/useNotifications'
 
 /**
  * The account control on the Topbar's far right. Avatar priority:
@@ -12,6 +13,7 @@ import { useAuth } from '../auth/AuthProvider'
  */
 export function AvatarMenu() {
   const { profile, user, avatarUrl, displayName, signOut } = useAuth()
+  const { pref: notifPref, enable: enableNotif, disable: disableNotif } = useNotifications()
   const reduce = useReducedMotion()
   const [open, setOpen] = useState(false)
   const [imgOk, setImgOk] = useState(true)
@@ -110,6 +112,34 @@ export function AvatarMenu() {
 
             {/* Items */}
             <div className="p-1.5">
+              {/* Hot-lead alert toggle — temporary home until WS5 Settings route */}
+              {notifPref !== 'unavailable' && (
+                <button
+                  role="menuitem"
+                  type="button"
+                  disabled={notifPref === 'denied'}
+                  onClick={() => {
+                    if (notifPref === 'on') disableNotif()
+                    else void enableNotif()
+                  }}
+                  title={notifPref === 'denied' ? 'Notifications blocked in browser settings' : undefined}
+                  className="flex w-full items-center justify-between gap-3 rounded-control px-3 py-2 text-sm text-muted transition-colors hover:bg-raised hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <span className="flex items-center gap-3">
+                    <Bell size={16} strokeWidth={1.8} aria-hidden />
+                    Hot lead alerts
+                  </span>
+                  <span
+                    className={`rounded-full px-2 py-0.5 font-mono text-[10px] leading-none ${
+                      notifPref === 'on'
+                        ? 'bg-[rgba(127,169,127,0.15)] text-success'
+                        : 'text-faint'
+                    }`}
+                  >
+                    {notifPref === 'on' ? 'on' : notifPref === 'denied' ? 'blocked' : 'off'}
+                  </span>
+                </button>
+              )}
               <button
                 role="menuitem"
                 type="button"
