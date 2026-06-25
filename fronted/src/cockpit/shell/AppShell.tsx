@@ -5,6 +5,7 @@ import { Sidebar } from './Sidebar'
 import { Topbar } from './Topbar'
 import { CursorGlow } from '../components/CursorGlow'
 import { CommandPalette } from '../components/CommandPalette'
+import { NexusAIPanel } from '../components/NexusAIPanel'
 
 /** The authenticated frame: cursor orb + fixed left nav + top bar + animated page well. */
 export function AppShell() {
@@ -47,6 +48,8 @@ export function AppShell() {
         </main>
       </div>
       <CommandPalette open={paletteOpen} onClose={closePalette} />
+      {/* Global AI assistant — fixed right-edge tab, visible on every page */}
+      <NexusAIPanel />
     </div>
   )
 }
