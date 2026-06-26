@@ -3,7 +3,6 @@ import { Outlet, useLocation } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import { Sidebar } from './Sidebar'
 import { Topbar } from './Topbar'
-import { CursorGlow } from '../components/CursorGlow'
 import { CommandPalette } from '../components/CommandPalette'
 import { NexusAIPanel } from '../components/NexusAIPanel'
 
@@ -28,8 +27,7 @@ export function AppShell() {
 
   return (
     <div className="flex h-screen w-full overflow-hidden">
-      <CursorGlow />
-      <Sidebar />
+<Sidebar />
       <div className="flex min-w-0 flex-1 flex-col">
         <Topbar onOpenPalette={openPalette} />
         <main className="flex-1 overflow-y-auto px-10 py-10">

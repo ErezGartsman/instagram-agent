@@ -5,6 +5,8 @@ import { SurfaceLoading, SurfaceEmpty, SurfaceError } from '../components/Surfac
 import { HotLeadToast } from '../components/HotLeadToast'
 import { WhatsAppThread } from '../components/WhatsAppThread'
 import { CopilotNudge } from '../components/CopilotNudge'
+import { AgentPip } from '../components/AgentPip'
+import { AgentActivityFeed } from '../components/AgentActivityFeed'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { Icon } from '../components/Icon'
 import type { IconName } from '../components/Icon'
@@ -13,6 +15,7 @@ import { CHANNEL_LABELS, relativeTime } from '../lib/pipeline'
 import { postQueueAction, type QueueActionType, type QueueItem } from '../lib/workqueue'
 import { streamDraft } from '../lib/api'
 import { useQueueData } from '../lib/useQueueData'
+import { useAgentRuns } from '../lib/useAgentRuns'
 
 // Dev-bypass demo draft — dead-code-eliminated in production builds.
 // Streams locally when devBypass=true so the fake 'dev-bypass' token never
@@ -21,11 +24,6 @@ const DEV_BYPASS_DRAFT: string = import.meta.env.DEV
   ? 'היי מאיה, ארז כאן. קראתי את מה שכתבת ואני מבין — זה לא מקום פשוט להיות בו. יש לי מקום השבוע לשיחה ראשונה, אם בא לך. הנה הלינק לתיאום: '
   : ''
 import { useNotifications } from '../lib/useNotifications'
-
-type State =
-  | { kind: 'loading' }
-  | { kind: 'error' }
-  | { kind: 'ready'; items: QueueItem[]; sample: boolean }
 
 // ── The Action Loop ──────────────────────────────────────────────────────────
 // Four moves on a lead, each with its own emotional read encoded in the exit
@@ -199,12 +197,23 @@ function Board({
   const [composing, setComposing] = useState(false)
   const [draft, setDraft] = useState('')
   const [drafting, setDrafting] = useState(false)   // true while AI is streaming a draft
+  const [centerTab, setCenterTab] = useState<'conversation' | 'agent'>('conversation')
 
   const pendingRef = useRef<Pending | null>(null)
   const toastHideRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const draftAbortRef = useRef<AbortController | null>(null)
   // Track the last live signature we applied so we don't re-apply the same data.
   const liveSigRef = useRef(liveItems.map((i) => i.id).join(','))
+
+  // Agent runs for the selected person — Realtime-subscribed via Supabase.
+  const selectedPersonId = useMemo(
+    () => items.find((i) => i.id === selectedId)?.person_id ?? null,
+    [items, selectedId],
+  )
+  const { runs: agentRuns, loading: agentRunsLoading } = useAgentRuns(
+    devBypass ? null : selectedPersonId,
+    token,
+  )
 
   // Live-sync: apply server updates from background polls when safe.
   // Skips if an action is in flight (suppressRef.current) or data is unchanged.
@@ -308,12 +317,13 @@ function Board({
     [items, flushPending, runCommit],
   )
 
-  // Reset composer + abort any in-flight AI draft when the selected lead changes.
+  // Reset composer, tab, and any in-flight AI draft when the selected lead changes.
   useEffect(() => {
     draftAbortRef.current?.abort()
     draftAbortRef.current = null
     setComposing(false)
     setDrafting(false)
+    setCenterTab('conversation')
   }, [selectedId])
 
   const openComposer = useCallback(() => {
@@ -455,6 +465,7 @@ function Board({
                     reduce={!!reduce}
                     onSelect={() => setSelectedId(item.id)}
                     onAct={act}
+                    agentRuns={item.id === selected.id ? agentRuns : []}
                   />
                 ))}
               </AnimatePresence>
@@ -469,7 +480,7 @@ function Board({
 
           {/* ── Center: the spotlight — activity + the Action Bar ────────────────── */}
           <section className="flex min-w-0 flex-1 flex-col">
-            <div key={selected.id} className="cq-rise border-b border-line px-6 py-4">
+            <div key={selected.id} className="cq-rise border-b border-line px-6 py-3">
               <div className="text-base font-medium text-ink">{selected.name}</div>
               <div className="mt-1 flex items-center gap-2">
                 <span className="h-1.5 w-1.5 rounded-full bg-sage" aria-hidden />
@@ -478,10 +489,43 @@ function Board({
                   {selected.handle ? ` · ${selected.handle}` : ''}
                 </span>
               </div>
+              {/* Tab bar — Conversation / Agent Log */}
+              <div className="mt-3 flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => setCenterTab('conversation')}
+                  className={`rounded-control px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.1em] transition-colors ${
+                    centerTab === 'conversation'
+                      ? 'bg-accent/15 text-accent'
+                      : 'text-faint hover:text-muted'
+                  }`}
+                >
+                  Conversation
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCenterTab('agent')}
+                  className={`flex items-center gap-1.5 rounded-control px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.1em] transition-colors ${
+                    centerTab === 'agent'
+                      ? 'bg-accent/15 text-accent'
+                      : 'text-faint hover:text-muted'
+                  }`}
+                >
+                  <span aria-hidden className="text-[8px]">✦</span>
+                  Agent log
+                  {agentRuns.length > 0 && (
+                    <span className="rounded-full bg-accent/20 px-1 font-mono text-[9px] tabular-nums text-accent">
+                      {agentRuns.length}
+                    </span>
+                  )}
+                </button>
+              </div>
             </div>
 
-            <div key={`${selected.id}:body`} className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
-              {selected.channel === 'whatsapp' ? (
+            <div key={`${selected.id}:${centerTab}`} className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
+              {centerTab === 'agent' ? (
+                <AgentActivityFeed runs={agentRuns} loading={agentRunsLoading} />
+              ) : selected.channel === 'whatsapp' ? (
                 <WhatsAppThread
                   personId={selected.person_id}
                   token={token}
@@ -736,6 +780,7 @@ function QueueRow({
   reduce,
   onSelect,
   onAct,
+  agentRuns,
 }: {
   item: QueueItem
   isSelected: boolean
@@ -743,6 +788,7 @@ function QueueRow({
   reduce: boolean
   onSelect: () => void
   onAct: (id: string, type: ActionType) => void
+  agentRuns: import('../lib/useAgentRuns').AgentRun[]
 }) {
   const variants = {
     initial: reduce ? { opacity: 0 } : { opacity: 0, height: 0 },
@@ -797,6 +843,7 @@ function QueueRow({
               Next
             </span>
           )}
+          <AgentPip runs={agentRuns} />
         </span>
         <span className="mt-0.5 line-clamp-1 text-xs text-muted">{item.teaser}</span>
       </span>

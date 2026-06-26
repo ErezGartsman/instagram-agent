@@ -126,6 +126,64 @@ export async function streamDraft(
   }
 }
 
+// ── Agent runs ────────────────────────────────────────────────────────────────
+
+export type AgentRunStatus = 'pending' | 'running' | 'success' | 'skipped' | 'failed'
+
+export interface AgentAction {
+  action_type: string
+  payload: Record<string, unknown>
+  result: Record<string, unknown>
+  at: string | null
+}
+
+export interface AgentRun {
+  id: string
+  agent_type: string
+  status: AgentRunStatus
+  triggered_by: string
+  output: Record<string, unknown>
+  error: string | null
+  started_at: string | null
+  completed_at: string | null
+  actions: AgentAction[]
+}
+
+/** Fetch agent run history for a person (newest-first, up to 20 runs). */
+export async function fetchAgentRuns(
+  token: string,
+  personId: string,
+): Promise<AgentRun[]> {
+  try {
+    const res = await fetch(
+      `${API_BASE}/api/cockpit/agents/runs/${encodeURIComponent(personId)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    )
+    if (!res.ok) return []
+    const data = await res.json() as { runs?: AgentRun[] }
+    return data.runs ?? []
+  } catch {
+    return []
+  }
+}
+
+/** Fetch all currently running/pending agent runs across all persons. */
+export async function fetchActiveAgents(
+  token: string,
+): Promise<{ id: string; person_id: string; agent_type: string; status: AgentRunStatus; person_name: string }[]> {
+  try {
+    const res = await fetch(
+      `${API_BASE}/api/cockpit/agents/active`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    )
+    if (!res.ok) return []
+    const data = await res.json() as { runs?: { id: string; person_id: string; agent_type: string; status: AgentRunStatus; person_name: string }[] }
+    return data.runs ?? []
+  } catch {
+    return []
+  }
+}
+
 // ── Command Palette search ────────────────────────────────────────────────────
 
 /** Unified cockpit search — people (open opps) + content pieces.

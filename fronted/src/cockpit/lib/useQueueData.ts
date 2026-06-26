@@ -12,7 +12,7 @@ export const HOT_LEAD_THRESHOLD = 70
 // Cheap string identity for a queue snapshot. If this is unchanged we skip
 // setState entirely — zero re-renders on the common "nothing happened" poll.
 function queueSig(items: QueueItem[]): string {
-  return items.map((i) => `${i.id}:${i.stage ?? ''}:${i.confidence}`).join('|')
+  return items.map((i) => `${i.id}:${i.confidence}`).join('|')
 }
 
 // ── Types ──────────────────────────────────────────────────────────────────
