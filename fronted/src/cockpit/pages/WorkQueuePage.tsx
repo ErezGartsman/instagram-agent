@@ -524,7 +524,12 @@ function Board({
 
             <div key={`${selected.id}:${centerTab}`} className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
               {centerTab === 'agent' ? (
-                <AgentActivityFeed runs={agentRuns} loading={agentRunsLoading} />
+                <AgentActivityFeed
+                  runs={agentRuns}
+                  loading={agentRunsLoading}
+                  personId={selected.person_id}
+                  token={token}
+                />
               ) : selected.channel === 'whatsapp' ? (
                 <WhatsAppThread
                   personId={selected.person_id}
