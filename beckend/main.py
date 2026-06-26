@@ -2294,6 +2294,44 @@ def cockpit_agents_active(user: dict = Depends(require_cockpit_user)):
         return {"status": "error", "detail": "Could not load active agents."}
 
 
+class AgentTriggerBody(BaseModel):
+    person_id: str
+    agent_type: str = "qualification"
+
+
+@app.post("/api/cockpit/agents/trigger")
+def cockpit_agents_trigger(
+    body: AgentTriggerBody,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(require_cockpit_user),
+):
+    """
+    Manually fire an agent for a person without touching the opportunity.
+
+    The lead stays in the Work Queue; the AgentPip and Agent Log tab update
+    live via Supabase Realtime as the run progresses. Designed for observation
+    and debugging — the lead is never removed from the screen. Returns
+    immediately (the agent runs in a BackgroundTask).
+    """
+    if body.agent_type != "qualification":
+        raise HTTPException(status_code=400, detail=f"Unknown agent type {body.agent_type!r}.")
+
+    by = user.get("email") or user.get("sub") or "operator"
+    background_tasks.add_task(
+        run_agent,
+        agent_type="qualification",
+        person_id=body.person_id,
+        triggered_by="manual",
+        agent_fn=qualification_agent,
+        input_snapshot={"triggered_by_user": by},
+    )
+    logger.info(
+        "[cockpit/agents/trigger] qualification agent queued for person=%s by=%s",
+        body.person_id, by,
+    )
+    return {"status": "accepted", "person_id": body.person_id, "agent_type": body.agent_type}
+
+
 @app.get("/api/cockpit/analytics")
 def cockpit_analytics(user: dict = Depends(require_cockpit_user)):
     """
