@@ -184,6 +184,29 @@ export async function fetchActiveAgents(
   }
 }
 
+/** Manually trigger an agent for a person without touching the opportunity.
+ *  The lead stays in the Work Queue; the Agent Log tab updates live via Realtime. */
+export async function triggerAgent(
+  token: string,
+  personId: string,
+  agentType: string = 'qualification',
+): Promise<{ ok: boolean; detail?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/api/cockpit/agents/trigger`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ person_id: personId, agent_type: agentType }),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({})) as { detail?: string }
+      return { ok: false, detail: data.detail ?? `HTTP ${res.status}` }
+    }
+    return { ok: true }
+  } catch {
+    return { ok: false, detail: 'Network error' }
+  }
+}
+
 // ── Command Palette search ────────────────────────────────────────────────────
 
 /** Unified cockpit search — people (open opps) + content pieces.
