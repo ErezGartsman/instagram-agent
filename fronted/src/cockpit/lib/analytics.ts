@@ -41,7 +41,7 @@ export function compact(n: number): string {
   return `${v.toFixed(d)}k`
 }
 
-export type Kpi = { label: string; value: string; note?: string }
+export type Kpi = { label: string; value: string; note?: string; href?: string }
 
 /**
  * Executive KPIs derived from the live pipeline board — real counts only (used
@@ -53,10 +53,10 @@ export function deriveKpis(stages: Stage[]): Kpi[] {
   const booked = count('booked')
   const qualifiedPlus = count('qualified') + count('captured') + count('briefed') + booked
   return [
-    { label: 'Open opportunities', value: String(total), note: 'across all stages' },
-    { label: 'Engaged', value: String(count('engaged')), note: 'top of funnel' },
-    { label: 'Qualified+', value: String(qualifiedPlus), note: 'qualified → booked' },
-    { label: 'Booked', value: String(booked), note: 'north-star metric' },
+    { label: 'Open opportunities', value: String(total), note: 'across all stages', href: '/app/queue' },
+    { label: 'Engaged', value: String(count('engaged')), note: 'top of funnel', href: '/app/pipeline' },
+    { label: 'Qualified+', value: String(qualifiedPlus), note: 'qualified → booked', href: '/app/pipeline' },
+    { label: 'Booked', value: String(booked), note: 'north-star metric', href: '/app/pipeline' },
   ]
 }
 

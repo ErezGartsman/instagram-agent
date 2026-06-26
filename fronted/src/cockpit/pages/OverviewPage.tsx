@@ -3,7 +3,6 @@ import { Link } from 'react-router-dom'
 import type { CSSProperties } from 'react'
 import { motion, useReducedMotion } from 'framer-motion'
 import { Icon } from '../components/Icon'
-import type { IconName } from '../components/Icon'
 import { StatCard } from '../components/StatCard'
 import { SurfaceLoading, SurfaceEmpty, SurfaceError } from '../components/SurfaceStates'
 import { useAuth } from '../auth/AuthProvider'
@@ -166,11 +165,7 @@ export function OverviewPage() {
             />
           )}
 
-          <div className="mt-9 flex flex-wrap gap-3">
-            <QuickJump to="/app/pipeline" icon="columns" label="Pipeline" />
-            {FEATURES.content && <QuickJump to="/app/content" icon="sparkle" label="Content Studio" />}
-            {FEATURES.analytics && <QuickJump to="/app/analytics" icon="chart" label="Analytics" />}
-          </div>
+
         </>
       )}
     </div>
@@ -228,19 +223,4 @@ function NextMove({ top, pending }: { top: QueueItem; pending: number }) {
   )
 }
 
-function QuickJump({ to, icon, label }: { to: string; icon: IconName; label: string }) {
-  const reduce = useReducedMotion()
-  return (
-    <MotionLink
-      to={to}
-      whileHover={reduce ? undefined : { scale: 1.04, y: -1 }}
-      whileTap={reduce ? undefined : { scale: 0.97 }}
-      transition={{ duration: 0.14, ease: 'easeOut' }}
-      className="inline-flex items-center gap-2 rounded-control border border-line px-3.5 py-2 text-sm text-muted transition-colors hover:bg-raised hover:text-ink"
-    >
-      <Icon name={icon} size={15} />
-      {label}
-    </MotionLink>
-  )
-}
 

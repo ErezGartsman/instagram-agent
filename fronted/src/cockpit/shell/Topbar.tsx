@@ -38,13 +38,10 @@ function SearchHint({ onOpen }: { onOpen?: () => void }) {
       type="button"
       onClick={onOpen}
       aria-label="Open command palette (⌘K)"
-      className="flex items-center gap-2.5 rounded-control border border-line bg-bg/60 px-4 py-2 text-sm text-faint backdrop-blur-xl transition-colors duration-200 hover:border-[rgba(184,134,11,0.22)] hover:text-muted"
+      className="flex w-[480px] items-center gap-2.5 rounded-control border border-line bg-bg/60 px-4 py-2 text-sm text-faint backdrop-blur-xl transition-colors duration-200 hover:border-[rgba(184,134,11,0.22)] hover:text-muted"
     >
       <Search size={14} strokeWidth={1.8} aria-hidden className="shrink-0" />
       <span>Search</span>
-      <kbd className="ml-1 rounded border border-line px-1.5 py-px font-mono text-[10px] leading-none text-faint">
-        ⌘K
-      </kbd>
     </button>
   )
 }

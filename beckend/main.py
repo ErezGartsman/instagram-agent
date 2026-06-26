@@ -30,7 +30,7 @@ import psycopg2
 import psycopg2.pool
 from google import genai
 from google.genai import types as genai_types
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -47,6 +47,10 @@ from nexus import identity as nexus_identity
 from nexus import interactions as nexus_interactions
 from nexus import memory as nexus_memory
 from nexus import work_queue as nexus_work_queue
+from nexus import whatsapp as nexus_whatsapp
+from nexus.agents.base import run_agent
+from nexus.agents.qualification import qualification_agent
+import scheduler as nexus_scheduler
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -1535,8 +1539,10 @@ async def lifespan(app: FastAPI):
     connection pool (returns all connections to Supabase cleanly).
     """
     logger.info("DataLens backend ready (Supabase / PostgreSQL mode).")
+    nexus_scheduler.start()
     yield
     # ── Shutdown ──────────────────────────────────────────────────────────────
+    nexus_scheduler.stop()
     _llm_executor.shutdown(wait=False)
     global _pool
     if _pool and not _pool.closed:
@@ -2113,6 +2119,7 @@ def _dispatch_outreach(conn, person_id: str, opportunity_id: str,
 
 @app.post("/api/cockpit/queue/{opportunity_id}/action")
 def cockpit_queue_action(opportunity_id: str, body: QueueActionBody,
+                         background_tasks: BackgroundTasks,
                          user: dict = Depends(require_cockpit_user)):
     """
     Apply one Work Queue move to an opportunity:
@@ -2171,6 +2178,20 @@ def cockpit_queue_action(opportunity_id: str, body: QueueActionBody,
                     conn, opportunity_id, "lost", reason=body.reason, by=by)
                 closed, stage = True, "lost"
             conn.commit()
+
+        # Fire the qualification agent in the background for non-dismissed
+        # 'engaged' leads — it will auto-advance if goal+tension are now present,
+        # or send a WA info request if they're still missing (with 48h dedup).
+        if not closed and stage == "engaged":
+            background_tasks.add_task(
+                run_agent,
+                agent_type="qualification",
+                person_id=person_id,
+                triggered_by="action_loop",
+                agent_fn=qualification_agent,
+                input_snapshot={"opportunity_id": opportunity_id, "action": action},
+            )
+
         return {"status": "success", "id": opportunity_id, "type": action,
                 "stage": stage, "closed": closed,
                 "snoozed_until": snoozed_until.isoformat() if snoozed_until else None}
@@ -2179,6 +2200,98 @@ def cockpit_queue_action(opportunity_id: str, body: QueueActionBody,
     except Exception as e:
         logger.error(f"[cockpit/queue/action] {action} on {opportunity_id} failed: {e}")
         raise HTTPException(status_code=500, detail="Could not apply the action.")
+
+
+@app.get("/api/cockpit/agents/runs/{person_id}")
+def cockpit_agent_runs(person_id: str, user: dict = Depends(require_cockpit_user)):
+    """
+    Agent run history for a specific person — powers the cockpit AgentActivityFeed
+    and AgentPip status indicator. Returns runs newest-first with their actions.
+    """
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, agent_type, status, triggered_by, "
+                    "       output, error, started_at, completed_at "
+                    "FROM agent_runs "
+                    "WHERE person_id = %s "
+                    "ORDER BY started_at DESC "
+                    "LIMIT 20",
+                    (person_id,),
+                )
+                run_rows = cur.fetchall()
+                run_ids = [str(r[0]) for r in run_rows]
+                actions_by_run: dict[str, list] = {rid: [] for rid in run_ids}
+                if run_ids:
+                    cur.execute(
+                        "SELECT agent_run_id, action_type, payload, result, at "
+                        "FROM agent_actions "
+                        "WHERE agent_run_id = ANY(%s) "
+                        "ORDER BY at ASC",
+                        (run_ids,),
+                    )
+                    for run_id, action_type, payload, result, at in cur.fetchall():
+                        actions_by_run.setdefault(str(run_id), []).append({
+                            "action_type": action_type,
+                            "payload": payload if isinstance(payload, dict) else {},
+                            "result": result if isinstance(result, dict) else {},
+                            "at": at.isoformat() if at else None,
+                        })
+        runs = []
+        for (run_id, agent_type, status, triggered_by,
+             output, error, started_at, completed_at) in run_rows:
+            rid = str(run_id)
+            runs.append({
+                "id": rid,
+                "agent_type": agent_type,
+                "status": status,
+                "triggered_by": triggered_by,
+                "output": output if isinstance(output, dict) else {},
+                "error": error,
+                "started_at": started_at.isoformat() if started_at else None,
+                "completed_at": completed_at.isoformat() if completed_at else None,
+                "actions": actions_by_run.get(rid, []),
+            })
+        return {"status": "success", "runs": runs}
+    except Exception as e:
+        logger.error(f"[cockpit/agents/runs] query failed for {person_id}: {e}")
+        return {"status": "error", "detail": "Could not load agent runs."}
+
+
+@app.get("/api/cockpit/agents/active")
+def cockpit_agents_active(user: dict = Depends(require_cockpit_user)):
+    """
+    All currently running/pending agent runs across all persons — powers the
+    Topbar AgentSystemStatus chip. Returns a lightweight list (no actions).
+    """
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT ar.id, ar.person_id, ar.agent_type, ar.status, "
+                    "       ar.started_at, p.display_name "
+                    "FROM agent_runs ar "
+                    "JOIN person p ON p.id = ar.person_id "
+                    "WHERE ar.status IN ('pending', 'running') "
+                    "ORDER BY ar.started_at DESC",
+                )
+                rows = cur.fetchall()
+        runs = [
+            {
+                "id": str(r[0]),
+                "person_id": str(r[1]),
+                "agent_type": r[2],
+                "status": r[3],
+                "started_at": r[4].isoformat() if r[4] else None,
+                "person_name": r[5] or "Lead",
+            }
+            for r in rows
+        ]
+        return {"status": "success", "runs": runs, "count": len(runs)}
+    except Exception as e:
+        logger.error(f"[cockpit/agents/active] query failed: {e}")
+        return {"status": "error", "detail": "Could not load active agents."}
 
 
 @app.get("/api/cockpit/analytics")
@@ -5706,6 +5819,12 @@ class KapsoChannel(WhatsAppChannel):
 
 
 _KAPSO_CHANNEL = KapsoChannel()
+
+# Wire the WA send bridge so nexus agents can dispatch WhatsApp messages without
+# importing main (which would be circular). Mirrors the nexus.db.configure pattern.
+nexus_whatsapp.configure(
+    lambda recipient, text: _KAPSO_CHANNEL.send_text(recipient, text)
+)
 
 
 # ── Inbound dedup (Meta redelivers; schema-level idempotency is the real guard) ─

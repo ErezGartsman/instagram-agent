@@ -29,7 +29,7 @@ function devSession(): Session {
   return {
     access_token: 'dev-bypass',
     token_type: 'bearer',
-    user: { id: 'dev-user', email: DEV_EMAIL, role: 'authenticated' },
+    user: { id: 'dev-user', email: DEV_EMAIL, role: 'authenticated', user_metadata: { full_name: 'Erez' } },
   } as unknown as Session
 }
 

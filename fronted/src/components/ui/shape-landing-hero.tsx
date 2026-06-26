@@ -1,5 +1,4 @@
 import { motion, useReducedMotion } from "framer-motion";
-import { Circle } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // Adapted from the provided shape-landing-hero, recolored from the original
@@ -56,11 +55,9 @@ function ElegantShape({
 }
 
 export function HeroGeometric({
-  badge = "Nexus OS",
   title1 = "Where the logic",
   title2 = "meets the magic",
 }: {
-  badge?: string;
   title1?: string;
   title2?: string;
 }) {
@@ -92,10 +89,13 @@ export function HeroGeometric({
             variants={fadeUpVariants}
             initial="hidden"
             animate="visible"
-            className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[#f2ebe0]/[0.04] border border-[#f2ebe0]/[0.10] mb-8 md:mb-12"
+            className="mb-10 md:mb-14"
           >
-            <Circle className="h-2 w-2 fill-[#c9aa71] text-[#c9aa71]" />
-            <span className="text-sm text-[#a99c8c] tracking-wide">{badge}</span>
+            <span
+              className="bg-gradient-to-r from-[#c9aa71]/70 via-[#e8cf9c]/90 to-[#c9aa71]/60 bg-clip-text text-transparent font-sans text-lg font-light uppercase tracking-[0.55em]"
+            >
+              Nexus
+            </span>
           </motion.div>
 
           <motion.div custom={1} variants={fadeUpVariants} initial="hidden" animate="visible">
@@ -120,10 +120,9 @@ export function HeroGeometric({
           <motion.div custom={3} variants={fadeUpVariants} initial="hidden" animate="visible">
             <a
               href="/app"
-              className="inline-flex items-center gap-2 rounded-full border border-[#c9aa71]/40 bg-[#c9aa71]/10 px-5 py-2.5 text-sm text-[#e8cf9c] transition-colors hover:bg-[#c9aa71]/20"
+              className="inline-flex items-center gap-2 rounded-full border border-[#c9aa71]/40 bg-[#c9aa71]/10 px-5 py-2.5 text-sm text-[#e8cf9c] no-underline transition-colors hover:bg-[#c9aa71]/20"
             >
-              Enter the cockpit
-              <span aria-hidden>→</span>
+              Sign In
             </a>
           </motion.div>
         </div>

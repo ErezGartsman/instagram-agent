@@ -89,7 +89,7 @@ export default function HeroSection_05() {
               <div key={1} className="bg-foreground/10 rounded-[14px] border p-0.5">
                 <Button asChild size="lg" className="rounded-xl px-5 text-base">
                   <a href="/">
-                    <span className="text-nowrap">Enter the cockpit</span>
+                    <span className="text-nowrap no-underline">Sign In</span>
                   </a>
                 </Button>
               </div>

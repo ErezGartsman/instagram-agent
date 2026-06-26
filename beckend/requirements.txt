@@ -31,6 +31,10 @@ anthropic>=0.49.0
 # images (used to format Calendly booking times in Israel time for WhatsApp).
 tzdata>=2024.1
 
+# Background scheduler — 6-hour cron sweep for the autonomous agent runtime.
+# BackgroundScheduler runs in-process; no separate worker needed for Phase 1.
+apscheduler>=3.10.0
+
 # Testing (CI only — not needed in production image)
 pytest>=8.0.0
 httpx>=0.27.0          # required by FastAPI TestClient

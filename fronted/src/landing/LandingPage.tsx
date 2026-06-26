@@ -13,7 +13,7 @@ import { HeroGeometric } from '@/components/ui/shape-landing-hero'
 export function LandingPage() {
   return (
     <div className="landing-root bg-[#100c0a]">
-      <HeroGeometric badge="Nexus OS" title1="Where the logic" title2="meets the magic" />
+      <HeroGeometric title1="Where the logic" title2="meets the magic" />
     </div>
   )
 }
