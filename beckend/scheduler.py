@@ -46,6 +46,22 @@ def _on_job_event(event) -> None:
         logger.debug("[scheduler] job %s executed successfully", event.job_id)
 
 
+def _refresh_funnel_metrics() -> None:
+    """
+    Refresh the funnel_metrics materialized view. Runs nightly at 03:00 Asia/Jerusalem.
+    Cheap on a small dataset; safe to re-run any time.
+    """
+    logger.info("[scheduler] refreshing funnel_metrics")
+    try:
+        with nexus_db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY funnel_metrics")
+            conn.commit()
+        logger.info("[scheduler] funnel_metrics refreshed")
+    except Exception as exc:
+        logger.error("[scheduler] funnel_metrics refresh failed: %s", exc)
+
+
 def _sweep_qualification() -> None:
     """
     Find all open 'engaged' opportunities older than MIN_ENGAGED_HOURS that have
@@ -107,8 +123,16 @@ def start() -> None:
         id="qualification_sweep",
         replace_existing=True,
     )
+    _scheduler.add_job(
+        _refresh_funnel_metrics,
+        trigger="cron",
+        hour=3,
+        minute=0,
+        id="funnel_metrics_refresh",
+        replace_existing=True,
+    )
     _scheduler.start()
-    logger.info("[scheduler] started — qualification sweep every 6 hours")
+    logger.info("[scheduler] started — qualification sweep every 6h, funnel_metrics refresh nightly at 03:00")
 
 
 def stop() -> None:
