@@ -1786,7 +1786,7 @@ def cockpit_queue(user: dict = Depends(require_cockpit_user)):
                 if person_ids:
                     cur.execute(
                         "SELECT person_id, kind, occurred_at FROM interactions "
-                        "WHERE person_id = ANY(%s) ORDER BY occurred_at DESC",
+                        "WHERE person_id = ANY(%s::uuid[]) ORDER BY occurred_at DESC",
                         (person_ids,),
                     )
                     for pid, kind, occurred_at in cur.fetchall():
