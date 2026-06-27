@@ -469,22 +469,21 @@ function Bento({ data }: { data: AnalyticsData }) {
         </div>
       </Tile>
 
-      {/* Top posts — fix: show caption snippet instead of raw shortcode */}
+      {/* Top posts */}
       <Tile i={4} span={2} className="min-h-[200px]">
         <Label>Top posts · by likes</Label>
         <div className="mt-3 flex flex-col gap-2.5">
-          {community.top_posts.slice(0, 5).map((p) => (
+          {community.top_posts.slice(0, 5).map((p, i) => (
             <a key={p.shortcode} href={`https://instagram.com/p/${p.shortcode}`}
               target="_blank" rel="noreferrer"
-              className="flex items-center justify-between gap-3 text-sm text-muted transition-colors hover:text-ink">
-              <span className="truncate text-xs text-muted">
-                {p.caption
-                  ? p.caption.slice(0, 55) + (p.caption.length > 55 ? '…' : '')
-                  : `/${p.shortcode}`}
+              className="flex items-center gap-3 text-sm text-muted transition-colors hover:text-ink">
+              <span className="w-5 shrink-0 font-mono text-[10px] tabular-nums text-faint">#{i + 1}</span>
+              <span className="flex-1 truncate font-mono text-[11px] text-muted">
+                {p.shortcode}
               </span>
               <span className="flex shrink-0 items-center gap-3 font-mono text-[11px] tabular-nums">
-                <span className="text-accent">{compact(p.likes)}</span>
-                <span className="text-faint">{compact(p.comments)}</span>
+                <span className="text-accent">{compact(p.likes)} ♥</span>
+                <span className="text-faint">{compact(p.comments)} ✦</span>
               </span>
             </a>
           ))}

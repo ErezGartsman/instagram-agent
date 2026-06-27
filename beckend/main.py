@@ -2365,12 +2365,11 @@ def cockpit_analytics(user: dict = Depends(require_cockpit_user)):
                     "FROM followers WHERE followed_at IS NOT NULL GROUP BY 1 ORDER BY 1"
                 )
                 weekly = cur.fetchall()
-                # Top posts by likes (with caption if available).
+                # Top posts by likes (shortcode + counts only — no caption column assumed).
                 cur.execute(
                     "WITH lk AS (SELECT post_shortcode, COUNT(*) c FROM likers GROUP BY 1), "
                     "     cm AS (SELECT post_shortcode, COUNT(*) c FROM comments GROUP BY 1) "
-                    "SELECT p.post_shortcode, COALESCE(lk.c, 0), COALESCE(cm.c, 0), "
-                    "       COALESCE(p.caption, p.post_text, NULL) "
+                    "SELECT p.post_shortcode, COALESCE(lk.c, 0), COALESCE(cm.c, 0) "
                     "FROM posts p "
                     "LEFT JOIN lk ON lk.post_shortcode = p.post_shortcode "
                     "LEFT JOIN cm ON cm.post_shortcode = p.post_shortcode "
@@ -2401,9 +2400,8 @@ def cockpit_analytics(user: dict = Depends(require_cockpit_user)):
                 "posts": posts,
                 "growth": growth,
                 "top_posts": [
-                    {"shortcode": sc, "likes": lk, "comments": cm,
-                     "caption": cap[:120] if cap else None}
-                    for (sc, lk, cm, cap) in top
+                    {"shortcode": sc, "likes": lk, "comments": cm}
+                    for (sc, lk, cm) in top
                 ],
             },
             "pipeline": [

@@ -6,7 +6,7 @@ import type { Stage } from './pipeline'
 // chart by hand in the Graphite Atelier language.
 
 export type GrowthPoint = { week: string; followers: number }
-export type TopPost = { shortcode: string; likes: number; comments: number; caption?: string | null }
+export type TopPost = { shortcode: string; likes: number; comments: number }
 export type PipelineStage = { stage: string; count: number }
 
 export type AnalyticsData = {
