@@ -2457,14 +2457,50 @@ def cockpit_analytics_funnel(
                         (days,),
                     )
                 else:
+                    # All-time: query interactions directly (same logic as funnel_metrics
+                    # materialized view) so we always get live data without waiting for
+                    # the nightly REFRESH. The mat-view is empty until first refresh runs.
                     cur.execute(
-                        "SELECT from_stage, to_stage, transition_count, unique_leads, "
-                        "       total_entered_from_stage, conversion_pct, "
-                        "       avg_hours_in_stage, median_hours_in_stage, last_transition_at "
-                        "FROM funnel_metrics "
-                        "ORDER BY from_stage, to_stage"
+                        "WITH entries AS ("
+                        "  SELECT payload->>'to' AS stage,"
+                        "         COUNT(DISTINCT person_id) AS entered_count"
+                        "  FROM interactions"
+                        "  WHERE kind='stage_change' AND payload->>'to' IS NOT NULL"
+                        "  GROUP BY payload->>'to'"
+                        "), "
+                        "transitions AS ("
+                        "  SELECT t.payload->>'from' AS from_stage,"
+                        "         t.payload->>'to'   AS to_stage,"
+                        "         COUNT(*)            AS transition_count,"
+                        "         COUNT(DISTINCT t.person_id) AS unique_leads,"
+                        "         AVG(EXTRACT(EPOCH FROM (t.occurred_at - entry.occurred_at)) / 3600.0)::NUMERIC(8,1) AS avg_hours_in_stage,"
+                        "         PERCENTILE_CONT(0.5) WITHIN GROUP ("
+                        "           ORDER BY EXTRACT(EPOCH FROM (t.occurred_at - entry.occurred_at)) / 3600.0"
+                        "         )::NUMERIC(8,1) AS median_hours_in_stage,"
+                        "         MAX(t.occurred_at) AS last_transition_at"
+                        "  FROM interactions t"
+                        "  LEFT JOIN LATERAL ("
+                        "    SELECT occurred_at FROM interactions"
+                        "    WHERE person_id = t.person_id AND kind='stage_change'"
+                        "      AND payload->>'to' = t.payload->>'from'"
+                        "      AND occurred_at < t.occurred_at"
+                        "    ORDER BY occurred_at DESC LIMIT 1"
+                        "  ) entry ON TRUE"
+                        "  WHERE t.kind='stage_change'"
+                        "    AND t.payload->>'from' IS NOT NULL"
+                        "    AND t.payload->>'to'   IS NOT NULL"
+                        "  GROUP BY t.payload->>'from', t.payload->>'to'"
+                        ") "
+                        "SELECT tr.from_stage, tr.to_stage, tr.transition_count, tr.unique_leads,"
+                        "       e.entered_count,"
+                        "       ROUND(tr.unique_leads::NUMERIC / NULLIF(e.entered_count,0) * 100, 1),"
+                        "       tr.avg_hours_in_stage, tr.median_hours_in_stage, tr.last_transition_at"
+                        " FROM transitions tr"
+                        " LEFT JOIN entries e ON e.stage = tr.from_stage"
+                        " ORDER BY tr.from_stage, tr.to_stage"
                     )
                 pair_rows = cur.fetchall()
+                logger.info(f"[cockpit/analytics/funnel] pair_rows={len(pair_rows)} days={days}")
 
                 # Per-stage entry counts from interactions (excludes initial 'engaged')
                 cur.execute(
@@ -2487,6 +2523,7 @@ def cockpit_analytics_funnel(
                 else:
                     cur.execute("SELECT COUNT(DISTINCT person_id) FROM opportunities")
                 engaged_total = cur.fetchone()[0]
+                logger.info(f"[cockpit/analytics/funnel] entry_rows={entry_rows} engaged_total={engaged_total}")
 
                 # Current open counts per stage
                 cur.execute(
