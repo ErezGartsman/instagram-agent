@@ -2414,6 +2414,128 @@ def cockpit_analytics(user: dict = Depends(require_cockpit_user)):
         return {"status": "error", "detail": "Could not load analytics."}
 
 
+@app.get("/api/cockpit/analytics/funnel")
+def cockpit_analytics_funnel(user: dict = Depends(require_cockpit_user)):
+    """
+    Conversion rates and velocity from the funnel_metrics materialized view.
+
+    Returns two shapes:
+      pairs  — every (from_stage, to_stage) combination with conversion_pct,
+               avg/median hours_in_stage, and transition counts.
+      stages — aggregated per-stage entry counts for the stepped funnel chart.
+    """
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                # Full pair data from the materialized view
+                cur.execute(
+                    "SELECT from_stage, to_stage, transition_count, unique_leads, "
+                    "       total_entered_from_stage, conversion_pct, "
+                    "       avg_hours_in_stage, median_hours_in_stage, last_transition_at "
+                    "FROM funnel_metrics "
+                    "ORDER BY from_stage, to_stage"
+                )
+                pair_rows = cur.fetchall()
+
+                # Per-stage entry counts (how many leads ever entered each stage)
+                cur.execute(
+                    "SELECT payload->>'to' AS stage, COUNT(DISTINCT person_id) AS entered "
+                    "FROM interactions "
+                    "WHERE kind = 'stage_change' AND payload->>'to' IS NOT NULL "
+                    "GROUP BY payload->>'to'"
+                )
+                entry_rows = cur.fetchall()
+
+                # Current open counts per stage (live snapshot)
+                cur.execute(
+                    "SELECT stage, COUNT(*) FROM opportunities "
+                    "WHERE closed_at IS NULL GROUP BY stage"
+                )
+                open_rows = cur.fetchall()
+
+        pairs = [
+            {
+                "from_stage":              r[0],
+                "to_stage":                r[1],
+                "transition_count":        r[2],
+                "unique_leads":            r[3],
+                "total_entered_from_stage": r[4],
+                "conversion_pct":          float(r[5]) if r[5] is not None else None,
+                "avg_hours_in_stage":      float(r[6]) if r[6] is not None else None,
+                "median_hours_in_stage":   float(r[7]) if r[7] is not None else None,
+                "last_transition_at":      r[8].isoformat() if r[8] else None,
+            }
+            for r in pair_rows
+        ]
+        entries    = {r[0]: r[1] for r in entry_rows}
+        open_counts = {r[0]: r[1] for r in open_rows}
+
+        # Build the ordered stage summary the frontend uses for the stepped funnel
+        stages = [
+            {
+                "stage":        s,
+                "ever_entered": entries.get(s, 0),
+                "open_now":     open_counts.get(s, 0),
+            }
+            for s in nexus_interactions.PIPELINE_STAGES
+        ]
+
+        return {"status": "success", "pairs": pairs, "stages": stages}
+    except Exception as e:
+        logger.error(f"[cockpit/analytics/funnel] query failed: {e}")
+        return {"status": "error", "detail": "Could not load funnel data."}
+
+
+@app.get("/api/cockpit/analytics/sla")
+def cockpit_analytics_sla(user: dict = Depends(require_cockpit_user)):
+    """
+    Per-lead SLA status from the lead_sla_status view.
+    Returns every open opportunity sorted by breach severity then hours_in_stage desc.
+    Includes a summary: counts of ok / warn / breach leads.
+    """
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT opportunity_id, person_id, person_name, stage, "
+                    "       stage_entered_at, hours_in_stage, "
+                    "       target_hours, warn_hours, sla_status "
+                    "FROM lead_sla_status "
+                    "ORDER BY "
+                    "  CASE sla_status WHEN 'breach' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END, "
+                    "  hours_in_stage DESC NULLS LAST"
+                )
+                rows = cur.fetchall()
+
+        leads = [
+            {
+                "opportunity_id": str(r[0]),
+                "person_id":      str(r[1]),
+                "person_name":    r[2] or "Lead",
+                "stage":          r[3],
+                "stage_entered_at": r[4].isoformat() if r[4] else None,
+                "hours_in_stage": float(r[5]) if r[5] is not None else None,
+                "target_hours":   r[6],
+                "warn_hours":     r[7],
+                "sla_status":     r[8] or "unknown",
+            }
+            for r in rows
+        ]
+
+        summary = {
+            "breach":  sum(1 for l in leads if l["sla_status"] == "breach"),
+            "warn":    sum(1 for l in leads if l["sla_status"] == "warn"),
+            "ok":      sum(1 for l in leads if l["sla_status"] == "ok"),
+            "unknown": sum(1 for l in leads if l["sla_status"] == "unknown"),
+            "total":   len(leads),
+        }
+
+        return {"status": "success", "leads": leads, "summary": summary}
+    except Exception as e:
+        logger.error(f"[cockpit/analytics/sla] query failed: {e}")
+        return {"status": "error", "detail": "Could not load SLA data."}
+
+
 # ── Content Studio (Sprint 5, the Studio pillar) — the cockpit's first write
 #    surface. CRUD over content_pieces, all Supabase-JWT gated. ───────────────
 _CONTENT_STATUSES = {"idea", "drafting", "published"}

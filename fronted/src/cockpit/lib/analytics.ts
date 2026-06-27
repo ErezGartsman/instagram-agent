@@ -60,7 +60,79 @@ export function deriveKpis(stages: Stage[]): Kpi[] {
   ]
 }
 
-// Dev-bypass sample so the Bento is populated during local UI work. Guarded by
+// ── Funnel analytics ──────────────────────────────────────────────────────────
+
+export type FunnelPair = {
+  from_stage: string
+  to_stage: string
+  transition_count: number
+  unique_leads: number
+  total_entered_from_stage: number
+  conversion_pct: number | null
+  avg_hours_in_stage: number | null
+  median_hours_in_stage: number | null
+  last_transition_at: string | null
+}
+
+export type FunnelStage = {
+  stage: string
+  ever_entered: number
+  open_now: number
+}
+
+export type FunnelData = {
+  pairs: FunnelPair[]
+  stages: FunnelStage[]
+}
+
+export type SlaStatus = 'ok' | 'warn' | 'breach' | 'unknown'
+
+export type SlaLead = {
+  opportunity_id: string
+  person_id: string
+  person_name: string
+  stage: string
+  stage_entered_at: string | null
+  hours_in_stage: number | null
+  target_hours: number | null
+  warn_hours: number | null
+  sla_status: SlaStatus
+}
+
+export type SlaData = {
+  leads: SlaLead[]
+  summary: { breach: number; warn: number; ok: number; unknown: number; total: number }
+}
+
+export async function fetchFunnel(token: string, signal?: AbortSignal): Promise<FunnelData> {
+  const res = await fetch(`${API_BASE}/api/cockpit/analytics/funnel`, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal,
+  })
+  if (!res.ok) throw new Error(`funnel ${res.status}`)
+  return (await res.json()) as FunnelData
+}
+
+export async function fetchSla(token: string, signal?: AbortSignal): Promise<SlaData> {
+  const res = await fetch(`${API_BASE}/api/cockpit/analytics/sla`, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal,
+  })
+  if (!res.ok) throw new Error(`sla ${res.status}`)
+  return (await res.json()) as SlaData
+}
+
+/** Format hours into a readable string: 2h, 1d 6h, 3d */
+export function fmtHours(h: number | null): string {
+  if (h === null) return '—'
+  if (h < 1) return '<1h'
+  if (h < 24) return `${Math.round(h)}h`
+  const d = Math.floor(h / 24)
+  const rem = Math.round(h % 24)
+  return rem > 0 ? `${d}d ${rem}h` : `${d}d`
+}
+
+// ── Dev-bypass sample so the Bento is populated during local UI work. Guarded by
 // import.meta.env.DEV → dead-code-eliminated from production builds.
 const sampleGrowth: GrowthPoint[] = import.meta.env.DEV
   ? [62, 65, 64, 70, 72, 78, 80, 88, 92, 101, 108, 120].map((followers, i) => ({
