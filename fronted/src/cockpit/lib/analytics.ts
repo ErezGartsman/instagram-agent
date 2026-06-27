@@ -30,7 +30,12 @@ export async function fetchAnalytics(token: string, signal?: AbortSignal): Promi
     signal,
   })
   if (!res.ok) throw new Error(`analytics ${res.status}`)
-  return (await res.json()) as AnalyticsData
+  const data = await res.json() as { status?: string; community?: unknown } & Partial<AnalyticsData>
+  // Backend returns HTTP 200 with {"status":"error"} on DB failures — treat as an error.
+  if (data.status === 'error' || !data.community) {
+    throw new Error('analytics returned error payload')
+  }
+  return data as AnalyticsData
 }
 
 /** Compact number for KPI tiles: 709 · 11k · 75.2k · 268k. */
