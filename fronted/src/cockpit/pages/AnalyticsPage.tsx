@@ -4,6 +4,7 @@ import { ResponsiveContainer, AreaChart, Area, Tooltip, YAxis } from 'recharts'
 import { PageHeader } from '../components/PageHeader'
 import { Icon } from '../components/Icon'
 import { SurfaceLoading, SurfaceError } from '../components/SurfaceStates'
+import { ContextTarget } from '../components/GlowingAiAssistant'
 import { useAuth } from '../auth/AuthProvider'
 import { STAGE_LABELS } from '../lib/pipeline'
 import { triggerAgent } from '../lib/api'
@@ -159,99 +160,121 @@ function FunnelTab({ token, days }: { token: string | null; days: Days }) {
 
   const maxEntered = Math.max(...pipelineStages.map(s => s.ever_entered), 1)
 
+  // ── SVG horizontal stream funnel ──────────────────────────────────────────
+  const W = 1000, H = 190, CY = H / 2, MAX_H = H * 0.42
+
+  const fPts = pipelineStages.map((s, i) => ({
+    x: Math.round((i / (pipelineStages.length - 1)) * W),
+    h: Math.max((s.ever_entered / maxEntered) * MAX_H, MAX_H * 0.055),
+    s,
+  }))
+
+  // Build a smooth SVG stream path at a given vertical scale factor
+  const buildStream = (scale: number): string => {
+    const ph = fPts.map(p => ({ ...p, h: p.h * scale }))
+    // Top edge — left to right
+    const top = ph.reduce((acc, pt, i) => {
+      if (i === 0) return `M${pt.x},${CY - pt.h}`
+      const prev = ph[i - 1]
+      const cpx  = (prev.x + pt.x) / 2
+      return `${acc} C${cpx},${CY - prev.h} ${cpx},${CY - pt.h} ${pt.x},${CY - pt.h}`
+    }, '')
+    // Bottom edge — right to left
+    const rev = [...ph].reverse()
+    const bot = rev.reduce((acc, pt, i) => {
+      if (i === 0) return `L${pt.x},${CY + pt.h}`
+      const prev = rev[i - 1]
+      const cpx  = (prev.x + pt.x) / 2
+      return `${acc} C${cpx},${CY + prev.h} ${cpx},${CY + pt.h} ${pt.x},${CY + pt.h}`
+    }, '')
+    return `${top} ${bot}Z`
+  }
+
   return (
     <div className="flex flex-col gap-6">
-      {/* ── TRUE FUNNEL — trapezoid bands via clip-path ─────────────────────── */}
+      {/* ── Horizontal stream funnel ─────────────────────────────────────────── */}
       <div className="rounded-card border border-line bg-surface p-5 [box-shadow:var(--shadow-card)]">
-        <div className="mb-6 font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
-          Pipeline funnel · all-time conversion
+        <div className="mb-5 font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
+          Pipeline funnel · all-time flow
         </div>
 
-        <div className="flex flex-col items-center">
+        {/* SVG stream */}
+        <div className="relative w-full overflow-hidden rounded-control" style={{ height: H }}>
+          <svg
+            viewBox={`0 0 ${W} ${H}`}
+            preserveAspectRatio="none"
+            width="100%"
+            height={H}
+            className="absolute inset-0"
+          >
+            <defs>
+              <linearGradient id="sf-grad" x1="0%" x2="100%">
+                <stop offset="0%"   stopColor="var(--color-accent)" stopOpacity="0.95" />
+                <stop offset="100%" stopColor="var(--color-glow)"   stopOpacity="0.75" />
+              </linearGradient>
+            </defs>
+            {/* Three layered paths — outer body + mid glow + inner core */}
+            <path d={buildStream(1.00)} fill="url(#sf-grad)" opacity="0.88" />
+            <path d={buildStream(0.68)} fill="url(#sf-grad)" opacity="0.42" />
+            <path d={buildStream(0.36)} fill="url(#sf-grad)" opacity="0.22" />
+
+            {/* Stage boundary vertical dividers */}
+            {fPts.slice(1).map(pt => (
+              <line key={pt.s.stage}
+                x1={pt.x} y1={0} x2={pt.x} y2={H}
+                stroke="rgba(255,255,255,0.10)" strokeWidth="1.5" />
+            ))}
+
+            {/* Count badges (dark pill at each stage control point) */}
+            {fPts.map(pt => {
+              const pct  = Math.round((pt.s.ever_entered / maxEntered) * 100)
+              const bx   = Math.max(pt.x, 28)   // clamp so left badge is visible
+              const bxR  = Math.min(bx, W - 28)
+              return (
+                <g key={pt.s.stage}>
+                  <rect x={bxR - 26} y={CY - 14} width="52" height="28" rx="14"
+                    fill="rgba(0,0,0,0.72)" />
+                  <text x={bxR} y={CY - 1} textAnchor="middle"
+                    fill="white" fontSize="13" fontFamily="monospace" fontWeight="700">
+                    {pt.s.ever_entered}
+                  </text>
+                  <text x={bxR} y={CY + 12} textAnchor="middle"
+                    fill="rgba(255,255,255,0.50)" fontSize="8" fontFamily="monospace">
+                    {pct}%
+                  </text>
+                </g>
+              )
+            })}
+          </svg>
+        </div>
+
+        {/* Stage labels row */}
+        <div className="mt-3 flex">
           {pipelineStages.map((s, i) => {
-            const wPct     = maxEntered > 0 ? Math.max((s.ever_entered / maxEntered) * 100, 12) : 12
-            const next     = pipelineStages[i + 1]
-            const nextWPct = next && maxEntered > 0
-              ? Math.max((next.ever_entered / maxEntered) * 100, 12)
-              : wPct   // last stage: rectangle, no taper
-
-            const isLast = i === pipelineStages.length - 1
-
-            // Polygon corners — centered trapezoid
-            const tL = (100 - wPct)     / 2
-            const tR = (100 + wPct)     / 2
-            const bL = (100 - nextWPct) / 2
-            const bR = (100 + nextWPct) / 2
-            const polygon = isLast
-              ? `polygon(${tL}% 0%, ${tR}% 0%, ${tR}% 100%, ${tL}% 100%)`
-              : `polygon(${tL}% 0%, ${tR}% 0%, ${bR}% 100%, ${bL}% 100%)`
-
-            // Opacity dims subtly as we go deeper in the funnel
-            const alpha = Math.max(0.55, 1 - i * 0.1)
             const convPct = s.conversion_pct
             const convCls = convPct === null ? 'text-faint'
               : convPct >= 60 ? 'text-success'
               : convPct >= 30 ? 'text-warn'
               : 'text-danger'
-
             return (
-              <div key={s.stage} className="w-full flex flex-col items-center">
-                {/* Band */}
-                <div className="relative w-full" style={{ height: '52px' }}>
-                  {/* Filled trapezoid */}
-                  <div className="absolute inset-0" style={{ clipPath: polygon }}>
-                    <div
-                      className="w-full h-full"
-                      style={{
-                        background: `linear-gradient(90deg, var(--color-accent) 0%, var(--color-glow) 100%)`,
-                        opacity: alpha,
-                      }}
-                    />
-                  </div>
-                  {/* Shine on top edge */}
-                  <div
-                    className="absolute top-0 h-px"
-                    style={{
-                      left:  `${tL}%`,
-                      width: `${wPct}%`,
-                      background: 'linear-gradient(90deg, transparent, rgba(255,255,255,0.25), transparent)',
-                    }}
-                  />
-                  {/* Labels — positioned inside the visible fill */}
-                  <div
-                    className="absolute inset-y-0 flex items-center"
-                    style={{ left: `${tL}%`, width: `${wPct}%`, padding: '0 14px' }}
-                  >
-                    <span className="font-mono text-[10px] uppercase tracking-wider text-ink/80 drop-shadow-sm">
-                      {s.label}
-                    </span>
-                    <div className="flex-1" />
-                    <span className="font-mono text-base font-bold tabular-nums text-ink drop-shadow-sm">
-                      {s.ever_entered}
-                    </span>
-                    <span className="ml-2.5 font-mono text-[9px] text-ink/50">
-                      {s.open_now > 0 ? `${s.open_now} open` : ''}
-                    </span>
-                  </div>
-                </div>
-
-                {/* Connector: conversion % to next stage */}
-                {!isLast && (
-                  <div className={`flex items-center gap-1.5 h-7 font-mono text-[11px] ${convCls}`}>
-                    <span className="text-faint text-[9px]">▾</span>
-                    {convPct !== null
-                      ? <span>{convPct}% advance to {pipelineStages[i + 1].label}</span>
-                      : <span className="text-faint">—</span>
-                    }
-                  </div>
+              <div key={s.stage} className="flex flex-1 flex-col items-center gap-0.5">
+                <span className="font-mono text-[9px] uppercase tracking-[0.12em] text-muted">
+                  {s.label}
+                </span>
+                <span className="font-mono text-[9px] text-faint">
+                  {s.open_now > 0 ? `${s.open_now} open` : ''}
+                </span>
+                {i < pipelineStages.length - 1 && (
+                  <span className={`mt-0.5 font-mono text-[9px] tabular-nums ${convCls}`}>
+                    {convPct !== null ? `${convPct}%→` : '—'}
+                  </span>
                 )}
               </div>
             )
           })}
         </div>
-
-        <p className="mt-5 font-mono text-[9px] text-faint">
-          Width = proportion of all-time leads entering each stage
+        <p className="mt-3 font-mono text-[9px] text-faint">
+          Stream width = proportion of all-time leads · % = conversion to next stage
         </p>
       </div>
 
@@ -292,7 +315,7 @@ function FunnelTab({ token, days }: { token: string | null; days: Days }) {
         </div>
         {days !== null && (
           <p className="mt-3 font-mono text-[9px] text-faint">
-            Velocity shown for All time view only — date filter returns counts only
+            Velocity data only available on All time view
           </p>
         )}
       </div>
@@ -317,9 +340,9 @@ function FunnelTab({ token, days }: { token: string | null; days: Days }) {
                     <td className="py-2 pr-4 font-mono text-muted">{STAGE_LABELS[p.to_stage]   ?? p.to_stage}</td>
                     <td className="py-2 pr-4 font-mono tabular-nums text-ink">{p.unique_leads}</td>
                     <td className={`py-2 pr-4 font-mono tabular-nums ${
-                      p.conversion_pct === null      ? 'text-faint' :
-                      p.conversion_pct >= 60         ? 'text-success' :
-                      p.conversion_pct >= 30         ? 'text-warn' : 'text-danger'
+                      p.conversion_pct === null ? 'text-faint' :
+                      p.conversion_pct >= 60    ? 'text-success' :
+                      p.conversion_pct >= 30    ? 'text-warn'    : 'text-danger'
                     }`}>{p.conversion_pct !== null ? `${p.conversion_pct}%` : '—'}</td>
                     <td className="py-2 pr-4 font-mono tabular-nums text-muted">{fmtHours(p.avg_hours_in_stage)}</td>
                     <td className="py-2 font-mono tabular-nums text-muted">{fmtHours(p.median_hours_in_stage)}</td>
@@ -488,22 +511,27 @@ function LeadsTab({ token }: { token: string | null }) {
                         {chip.label}
                       </span>
                     </td>
-                    <td className="px-4 py-3 text-right">
-                      {canRun && token && (
-                        <button
-                          type="button"
-                          disabled={isFiring}
-                          onClick={() => handleRunAgent(lead)}
-                          title="Trigger qualification agent"
-                          className="inline-flex items-center gap-1 rounded-control border border-accent/30 bg-accent/10 px-2 py-1 font-mono text-[9px] text-accent transition-colors hover:bg-accent/20 disabled:opacity-40"
-                        >
-                          <span aria-hidden className="text-[7px]">✦</span>
-                          {isFiring    ? 'Running…'
-                           : result === 'ok'  ? '✓ Fired'
-                           : result === 'err' ? '✗ Error'
-                           : 'Run agent'}
-                        </button>
-                      )}
+                    <td className="px-4 py-3">
+                      <div className="flex items-center justify-end gap-2">
+                        <ContextTarget
+                          label={`${lead.sla_status === 'breach' ? 'SLA Breach' : lead.sla_status === 'warn' ? 'SLA At Risk' : 'Lead'} · ${lead.person_name}`}
+                        />
+                        {canRun && token && (
+                          <button
+                            type="button"
+                            disabled={isFiring}
+                            onClick={() => handleRunAgent(lead)}
+                            title="Trigger qualification agent"
+                            className="inline-flex items-center gap-1 rounded-control border border-accent/30 bg-accent/10 px-2 py-1 font-mono text-[9px] text-accent transition-colors hover:bg-accent/20 disabled:opacity-40"
+                          >
+                            <span aria-hidden className="text-[7px]">✦</span>
+                            {isFiring         ? 'Running…'
+                             : result === 'ok'  ? '✓ Fired'
+                             : result === 'err' ? '✗ Error'
+                             : 'Run agent'}
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 )
@@ -533,7 +561,10 @@ function Bento({ data }: { data: AnalyticsData }) {
 
       {/* Growth chart — fix: auto-scaled Y-axis so sparse data isn't flat */}
       <Tile i={3} span={2} className="min-h-[200px]">
-        <Label>Follower growth · weekly tracked</Label>
+        <div className="flex items-center gap-1.5">
+          <Label>Follower growth · weekly tracked</Label>
+          <ContextTarget label="Follower Growth Chart" />
+        </div>
         <div className="mt-2 flex-1">
           <ResponsiveContainer width="100%" height="100%">
             <AreaChart data={community.growth} margin={{ top: 6, right: 2, bottom: 0, left: 2 }}>
@@ -558,18 +589,19 @@ function Bento({ data }: { data: AnalyticsData }) {
         <Label>Top posts · by likes</Label>
         <div className="mt-3 flex flex-col gap-2.5">
           {community.top_posts.slice(0, 5).map((p, i) => (
-            <a key={p.shortcode} href={`https://instagram.com/p/${p.shortcode}`}
-              target="_blank" rel="noreferrer"
-              className="flex items-center gap-3 text-sm text-muted transition-colors hover:text-ink">
-              <span className="w-5 shrink-0 font-mono text-[10px] tabular-nums text-faint">#{i + 1}</span>
-              <span className="flex-1 truncate font-mono text-[11px] text-muted">
-                {p.shortcode}
-              </span>
-              <span className="flex shrink-0 items-center gap-3 font-mono text-[11px] tabular-nums">
-                <span className="text-accent">{compact(p.likes)} ♥</span>
-                <span className="text-faint">{compact(p.comments)} ✦</span>
-              </span>
-            </a>
+            <div key={p.shortcode} className="flex items-center gap-2">
+              <a href={`https://instagram.com/p/${p.shortcode}`}
+                target="_blank" rel="noreferrer"
+                className="flex flex-1 items-center gap-3 text-sm text-muted transition-colors hover:text-ink">
+                <span className="w-5 shrink-0 font-mono text-[10px] tabular-nums text-faint">#{i + 1}</span>
+                <span className="flex-1 truncate font-mono text-[11px] text-muted">{p.shortcode}</span>
+                <span className="flex shrink-0 items-center gap-3 font-mono text-[11px] tabular-nums">
+                  <span className="text-accent">{compact(p.likes)} ♥</span>
+                  <span className="text-faint">{compact(p.comments)} ✦</span>
+                </span>
+              </a>
+              <ContextTarget label={`Top Post #${i + 1} · ${p.shortcode}`} className="shrink-0" />
+            </div>
           ))}
         </div>
       </Tile>
