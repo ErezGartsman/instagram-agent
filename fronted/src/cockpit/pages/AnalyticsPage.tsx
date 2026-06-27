@@ -4,15 +4,14 @@ import { ResponsiveContainer, AreaChart, Area, Tooltip, YAxis } from 'recharts'
 import { PageHeader } from '../components/PageHeader'
 import { Icon } from '../components/Icon'
 import { SurfaceLoading, SurfaceError } from '../components/SurfaceStates'
-import { ContextTarget } from '../components/GlowingAiAssistant'
+import { ContextTarget, pushAiContext } from '../components/GlowingAiAssistant'
 import { useAuth } from '../auth/AuthProvider'
 import { STAGE_LABELS } from '../lib/pipeline'
-import { triggerAgent } from '../lib/api'
 import {
   compact, fmtHours,
   fetchAnalytics, fetchFunnel, fetchSla,
   SAMPLE_ANALYTICS,
-  type AnalyticsData, type FunnelData, type SlaData, type SlaLead, type SlaStatus,
+  type AnalyticsData, type FunnelData, type SlaData, type SlaStatus,
 } from '../lib/analytics'
 
 const BRONZE  = '#d4a843'
@@ -371,8 +370,6 @@ function LeadsTab({ token }: { token: string | null }) {
   const [nonce,   setNonce]   = useState(0)
   const [search,  setSearch]  = useState('')
   const [filter,  setFilter]  = useState<SlaStatus | 'all'>('all')
-  const [firing,  setFiring]  = useState<Record<string, boolean>>({})
-  const [fired,   setFired]   = useState<Record<string, 'ok' | 'err'>>({})
   const navigate = useNavigate()
   const retry    = useCallback(() => { setState({ kind: 'loading' }); setNonce(n => n + 1) }, [])
 
@@ -385,15 +382,6 @@ function LeadsTab({ token }: { token: string | null }) {
       .catch((err: unknown) => { if ((err as { name?: string })?.name !== 'AbortError') setState({ kind: 'error' }) })
     return () => ctrl.abort()
   }, [token, nonce])
-
-  const handleRunAgent = useCallback(async (lead: SlaLead) => {
-    if (!token || firing[lead.opportunity_id]) return
-    setFiring(prev => ({ ...prev, [lead.opportunity_id]: true }))
-    const { ok } = await triggerAgent(token, lead.person_id)
-    setFired(prev => ({ ...prev, [lead.opportunity_id]: ok ? 'ok' : 'err' }))
-    setFiring(prev => ({ ...prev, [lead.opportunity_id]: false }))
-    setTimeout(() => setFired(prev => { const n = { ...prev }; delete n[lead.opportunity_id]; return n }), 3000)
-  }, [token, firing])
 
   const visibleLeads = useMemo(() => {
     if (state.kind !== 'ready') return []
@@ -483,13 +471,10 @@ function LeadsTab({ token }: { token: string | null }) {
             <tbody>
               {visibleLeads.map(lead => {
                 const chip = SLA_CHIP[lead.sla_status]
-                const isFiring = firing[lead.opportunity_id]
-                const result   = fired[lead.opportunity_id]
-                const canRun   = lead.sla_status === 'breach' || lead.sla_status === 'warn'
                 return (
                   <tr
                     key={lead.opportunity_id}
-                    className="border-b border-line/50 transition-colors last:border-0 hover:bg-raised"
+                    className="group border-b border-line/50 transition-colors last:border-0 hover:bg-raised"
                   >
                     <td
                       className="cursor-pointer px-4 py-3 font-medium text-ink"
@@ -511,27 +496,19 @@ function LeadsTab({ token }: { token: string | null }) {
                         {chip.label}
                       </span>
                     </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center justify-end gap-2">
-                        <ContextTarget
-                          label={`${lead.sla_status === 'breach' ? 'SLA Breach' : lead.sla_status === 'warn' ? 'SLA At Risk' : 'Lead'} · ${lead.person_name}`}
-                        />
-                        {canRun && token && (
-                          <button
-                            type="button"
-                            disabled={isFiring}
-                            onClick={() => handleRunAgent(lead)}
-                            title="Trigger qualification agent"
-                            className="inline-flex items-center gap-1 rounded-control border border-accent/30 bg-accent/10 px-2 py-1 font-mono text-[9px] text-accent transition-colors hover:bg-accent/20 disabled:opacity-40"
-                          >
-                            <span aria-hidden className="text-[7px]">✦</span>
-                            {isFiring         ? 'Running…'
-                             : result === 'ok'  ? '✓ Fired'
-                             : result === 'err' ? '✗ Error'
-                             : 'Run agent'}
-                          </button>
+                    <td className="px-4 py-3 text-right">
+                      <button
+                        type="button"
+                        onClick={() => pushAiContext(
+                          `${lead.sla_status === 'breach' ? 'SLA Breach'
+                            : lead.sla_status === 'warn'   ? 'SLA At Risk'
+                            : 'Lead'} · ${lead.person_name}`
                         )}
-                      </div>
+                        className="inline-flex items-center gap-1.5 rounded-control border border-glow/25 px-3 py-1.5 font-mono text-[10px] text-glow opacity-0 transition-all duration-150 group-hover:opacity-100 hover:bg-glow/10"
+                        style={{ background: 'color-mix(in srgb, var(--color-glow) 5%, transparent)' }}
+                      >
+                        <span className="text-[8px]">✦</span> Ask AI
+                      </button>
                     </td>
                   </tr>
                 )
