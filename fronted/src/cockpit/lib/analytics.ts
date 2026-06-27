@@ -6,7 +6,7 @@ import type { Stage } from './pipeline'
 // chart by hand in the Graphite Atelier language.
 
 export type GrowthPoint = { week: string; followers: number }
-export type TopPost = { shortcode: string; likes: number; comments: number }
+export type TopPost = { shortcode: string; likes: number; comments: number; caption?: string | null }
 export type PipelineStage = { stage: string; count: number }
 
 export type AnalyticsData = {
@@ -104,11 +104,15 @@ export type SlaData = {
   summary: { breach: number; warn: number; ok: number; unknown: number; total: number }
 }
 
-export async function fetchFunnel(token: string, signal?: AbortSignal): Promise<FunnelData> {
-  const res = await fetch(`${API_BASE}/api/cockpit/analytics/funnel`, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal,
-  })
+export async function fetchFunnel(
+  token: string,
+  days: number | null,
+  signal?: AbortSignal,
+): Promise<FunnelData> {
+  const url = days
+    ? `${API_BASE}/api/cockpit/analytics/funnel?days=${days}`
+    : `${API_BASE}/api/cockpit/analytics/funnel`
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, signal })
   if (!res.ok) throw new Error(`funnel ${res.status}`)
   return (await res.json()) as FunnelData
 }

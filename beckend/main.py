@@ -2365,11 +2365,12 @@ def cockpit_analytics(user: dict = Depends(require_cockpit_user)):
                     "FROM followers WHERE followed_at IS NOT NULL GROUP BY 1 ORDER BY 1"
                 )
                 weekly = cur.fetchall()
-                # Top posts by likes (with their comment counts).
+                # Top posts by likes (with caption if available).
                 cur.execute(
                     "WITH lk AS (SELECT post_shortcode, COUNT(*) c FROM likers GROUP BY 1), "
                     "     cm AS (SELECT post_shortcode, COUNT(*) c FROM comments GROUP BY 1) "
-                    "SELECT p.post_shortcode, COALESCE(lk.c, 0), COALESCE(cm.c, 0) "
+                    "SELECT p.post_shortcode, COALESCE(lk.c, 0), COALESCE(cm.c, 0), "
+                    "       COALESCE(p.caption, p.post_text, NULL) "
                     "FROM posts p "
                     "LEFT JOIN lk ON lk.post_shortcode = p.post_shortcode "
                     "LEFT JOIN cm ON cm.post_shortcode = p.post_shortcode "
@@ -2400,7 +2401,9 @@ def cockpit_analytics(user: dict = Depends(require_cockpit_user)):
                 "posts": posts,
                 "growth": growth,
                 "top_posts": [
-                    {"shortcode": sc, "likes": lk, "comments": cm} for (sc, lk, cm) in top
+                    {"shortcode": sc, "likes": lk, "comments": cm,
+                     "caption": cap[:120] if cap else None}
+                    for (sc, lk, cm, cap) in top
                 ],
             },
             "pipeline": [
@@ -2415,38 +2418,78 @@ def cockpit_analytics(user: dict = Depends(require_cockpit_user)):
 
 
 @app.get("/api/cockpit/analytics/funnel")
-def cockpit_analytics_funnel(user: dict = Depends(require_cockpit_user)):
+def cockpit_analytics_funnel(
+    user: dict = Depends(require_cockpit_user),
+    days: Optional[int] = None,   # 7 | 30 | 90 | None = all-time
+):
     """
-    Conversion rates and velocity from the funnel_metrics materialized view.
+    Conversion rates and velocity. Optional ?days=N limits to the last N days.
 
-    Returns two shapes:
-      pairs  — every (from_stage, to_stage) combination with conversion_pct,
-               avg/median hours_in_stage, and transition counts.
-      stages — aggregated per-stage entry counts for the stepped funnel chart.
+    Fix: 'engaged' ever_entered uses total opportunity count (leads are created as
+    'engaged' by default — no stage_change interaction is logged for the initial state).
+    For all other stages, interaction-based entry counts are accurate.
     """
+    since_clause = "AND occurred_at >= NOW() - (%s * interval '1 day')" if days else ""
+    since_args   = (days,) if days else ()
     try:
         with get_db_conn() as conn:
             with conn.cursor() as cur:
-                # Full pair data from the materialized view
-                cur.execute(
-                    "SELECT from_stage, to_stage, transition_count, unique_leads, "
-                    "       total_entered_from_stage, conversion_pct, "
-                    "       avg_hours_in_stage, median_hours_in_stage, last_transition_at "
-                    "FROM funnel_metrics "
-                    "ORDER BY from_stage, to_stage"
-                )
+                # Pair data — filter by date window when days is set
+                if days:
+                    cur.execute(
+                        "SELECT from_stage, to_stage, "
+                        "       COUNT(*) AS transition_count, "
+                        "       COUNT(DISTINCT person_id) AS unique_leads, "
+                        "       NULL::numeric AS total_entered_from_stage, "
+                        "       NULL::numeric AS conversion_pct, "
+                        "       AVG(EXTRACT(EPOCH FROM (occurred_at - LAG(occurred_at) OVER "
+                        "           (PARTITION BY person_id ORDER BY occurred_at))) / 3600)::numeric(8,1) "
+                        "           AS avg_hours_in_stage, "
+                        "       NULL::numeric AS median_hours_in_stage, "
+                        "       MAX(occurred_at) AS last_transition_at "
+                        "FROM (SELECT person_id, occurred_at, "
+                        "             payload->>'from' AS from_stage, "
+                        "             payload->>'to'   AS to_stage "
+                        "      FROM interactions "
+                        "      WHERE kind = 'stage_change' "
+                        "        AND occurred_at >= NOW() - (%s * interval '1 day')) sub "
+                        "GROUP BY from_stage, to_stage "
+                        "ORDER BY from_stage, to_stage",
+                        (days,),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT from_stage, to_stage, transition_count, unique_leads, "
+                        "       total_entered_from_stage, conversion_pct, "
+                        "       avg_hours_in_stage, median_hours_in_stage, last_transition_at "
+                        "FROM funnel_metrics "
+                        "ORDER BY from_stage, to_stage"
+                    )
                 pair_rows = cur.fetchall()
 
-                # Per-stage entry counts (how many leads ever entered each stage)
+                # Per-stage entry counts from interactions (excludes initial 'engaged')
                 cur.execute(
                     "SELECT payload->>'to' AS stage, COUNT(DISTINCT person_id) AS entered "
                     "FROM interactions "
-                    "WHERE kind = 'stage_change' AND payload->>'to' IS NOT NULL "
-                    "GROUP BY payload->>'to'"
+                    f"WHERE kind = 'stage_change' AND payload->>'to' IS NOT NULL {since_clause}"
+                    "GROUP BY payload->>'to'",
+                    since_args,
                 )
                 entry_rows = cur.fetchall()
 
-                # Current open counts per stage (live snapshot)
+                # 'engaged' special case: total all-time opportunity count is the true entry
+                # (opportunities are created at 'engaged' — no stage_change recorded for it).
+                if days:
+                    cur.execute(
+                        "SELECT COUNT(DISTINCT person_id) FROM opportunities "
+                        "WHERE created_at >= NOW() - (%s * interval '1 day')",
+                        (days,),
+                    )
+                else:
+                    cur.execute("SELECT COUNT(DISTINCT person_id) FROM opportunities")
+                engaged_total = cur.fetchone()[0]
+
+                # Current open counts per stage
                 cur.execute(
                     "SELECT stage, COUNT(*) FROM opportunities "
                     "WHERE closed_at IS NULL GROUP BY stage"
@@ -2455,22 +2498,23 @@ def cockpit_analytics_funnel(user: dict = Depends(require_cockpit_user)):
 
         pairs = [
             {
-                "from_stage":              r[0],
-                "to_stage":                r[1],
-                "transition_count":        r[2],
-                "unique_leads":            r[3],
+                "from_stage":               r[0],
+                "to_stage":                 r[1],
+                "transition_count":         r[2],
+                "unique_leads":             r[3],
                 "total_entered_from_stage": r[4],
-                "conversion_pct":          float(r[5]) if r[5] is not None else None,
-                "avg_hours_in_stage":      float(r[6]) if r[6] is not None else None,
-                "median_hours_in_stage":   float(r[7]) if r[7] is not None else None,
-                "last_transition_at":      r[8].isoformat() if r[8] else None,
+                "conversion_pct":           float(r[5]) if r[5] is not None else None,
+                "avg_hours_in_stage":       float(r[6]) if r[6] is not None else None,
+                "median_hours_in_stage":    float(r[7]) if r[7] is not None else None,
+                "last_transition_at":       r[8].isoformat() if r[8] else None,
             }
             for r in pair_rows
         ]
-        entries    = {r[0]: r[1] for r in entry_rows}
+        entries     = {r[0]: r[1] for r in entry_rows}
         open_counts = {r[0]: r[1] for r in open_rows}
+        # Inject the corrected 'engaged' total
+        entries["engaged"] = engaged_total
 
-        # Build the ordered stage summary the frontend uses for the stepped funnel
         stages = [
             {
                 "stage":        s,
@@ -2480,7 +2524,7 @@ def cockpit_analytics_funnel(user: dict = Depends(require_cockpit_user)):
             for s in nexus_interactions.PIPELINE_STAGES
         ]
 
-        return {"status": "success", "pairs": pairs, "stages": stages}
+        return {"status": "success", "pairs": pairs, "stages": stages, "days": days}
     except Exception as e:
         logger.error(f"[cockpit/analytics/funnel] query failed: {e}")
         return {"status": "error", "detail": "Could not load funnel data."}
@@ -2489,39 +2533,40 @@ def cockpit_analytics_funnel(user: dict = Depends(require_cockpit_user)):
 @app.get("/api/cockpit/analytics/sla")
 def cockpit_analytics_sla(user: dict = Depends(require_cockpit_user)):
     """
-    Per-lead SLA status from the lead_sla_status view.
-    Returns every open opportunity sorted by breach severity then hours_in_stage desc.
-    Includes a summary: counts of ok / warn / breach leads.
+    Per-lead SLA status.
+    Fix: person_name falls back to wa_ref_code when display_name is NULL.
     """
     try:
         with get_db_conn() as conn:
             with conn.cursor() as cur:
+                # Join against person to get wa_ref_code fallback for unnamed leads
                 cur.execute(
-                    "SELECT opportunity_id, person_id, person_name, stage, "
-                    "       stage_entered_at, hours_in_stage, "
-                    "       target_hours, warn_hours, sla_status "
-                    "FROM lead_sla_status "
+                    "SELECT s.opportunity_id, s.person_id, "
+                    "       COALESCE(s.person_name, 'Lead ' || p.wa_ref_code, 'Lead') AS person_name, "
+                    "       s.stage, s.stage_entered_at, s.hours_in_stage, "
+                    "       s.target_hours, s.warn_hours, s.sla_status "
+                    "FROM lead_sla_status s "
+                    "JOIN person p ON p.id = s.person_id "
                     "ORDER BY "
-                    "  CASE sla_status WHEN 'breach' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END, "
-                    "  hours_in_stage DESC NULLS LAST"
+                    "  CASE s.sla_status WHEN 'breach' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END, "
+                    "  s.hours_in_stage DESC NULLS LAST"
                 )
                 rows = cur.fetchall()
 
         leads = [
             {
-                "opportunity_id": str(r[0]),
-                "person_id":      str(r[1]),
-                "person_name":    r[2] or "Lead",
-                "stage":          r[3],
+                "opportunity_id":  str(r[0]),
+                "person_id":       str(r[1]),
+                "person_name":     r[2],
+                "stage":           r[3],
                 "stage_entered_at": r[4].isoformat() if r[4] else None,
-                "hours_in_stage": float(r[5]) if r[5] is not None else None,
-                "target_hours":   r[6],
-                "warn_hours":     r[7],
-                "sla_status":     r[8] or "unknown",
+                "hours_in_stage":  float(r[5]) if r[5] is not None else None,
+                "target_hours":    r[6],
+                "warn_hours":      r[7],
+                "sla_status":      r[8] or "unknown",
             }
             for r in rows
         ]
-
         summary = {
             "breach":  sum(1 for l in leads if l["sla_status"] == "breach"),
             "warn":    sum(1 for l in leads if l["sla_status"] == "warn"),
@@ -2529,7 +2574,6 @@ def cockpit_analytics_sla(user: dict = Depends(require_cockpit_user)):
             "unknown": sum(1 for l in leads if l["sla_status"] == "unknown"),
             "total":   len(leads),
         }
-
         return {"status": "success", "leads": leads, "summary": summary}
     except Exception as e:
         logger.error(f"[cockpit/analytics/sla] query failed: {e}")
