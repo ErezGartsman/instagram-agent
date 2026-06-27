@@ -119,7 +119,9 @@ export async function fetchFunnel(
     : `${API_BASE}/api/cockpit/analytics/funnel`
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, signal })
   if (!res.ok) throw new Error(`funnel ${res.status}`)
-  return (await res.json()) as FunnelData
+  const data = await res.json() as { status?: string } & Partial<FunnelData>
+  if (data.status === 'error' || !data.pairs) throw new Error('funnel returned error payload')
+  return data as FunnelData
 }
 
 export async function fetchSla(token: string, signal?: AbortSignal): Promise<SlaData> {

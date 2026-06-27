@@ -137,7 +137,8 @@ function FunnelTab({ token, days }: { token: string | null; days: Days }) {
   if (state.kind === 'loading') return <SurfaceLoading variant="bento" />
   if (state.kind === 'error')   return <SurfaceError title="Couldn't load funnel" body="Check your connection and try again." onRetry={retry} />
 
-  const { stages, pairs } = state.data
+  const stages = state.data.stages ?? []
+  const pairs  = state.data.pairs  ?? []
 
   const pipelineStages = PIPELINE.map((stage) => {
     const s         = stages.find(x => x.stage === stage)

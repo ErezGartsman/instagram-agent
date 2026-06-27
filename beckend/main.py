@@ -2434,25 +2434,26 @@ def cockpit_analytics_funnel(
             with conn.cursor() as cur:
                 # Pair data — filter by date window when days is set
                 if days:
+                    # Simple count-only query for date-filtered view.
+                    # Velocity (avg hours) requires nested window+aggregate which PostgreSQL
+                    # disallows at the same query level — return NULL for those columns.
                     cur.execute(
-                        "SELECT from_stage, to_stage, "
-                        "       COUNT(*) AS transition_count, "
+                        "SELECT payload->>'from' AS from_stage, "
+                        "       payload->>'to'   AS to_stage, "
+                        "       COUNT(*)         AS transition_count, "
                         "       COUNT(DISTINCT person_id) AS unique_leads, "
-                        "       NULL::numeric AS total_entered_from_stage, "
-                        "       NULL::numeric AS conversion_pct, "
-                        "       AVG(EXTRACT(EPOCH FROM (occurred_at - LAG(occurred_at) OVER "
-                        "           (PARTITION BY person_id ORDER BY occurred_at))) / 3600)::numeric(8,1) "
-                        "           AS avg_hours_in_stage, "
-                        "       NULL::numeric AS median_hours_in_stage, "
+                        "       NULL::numeric    AS total_entered_from_stage, "
+                        "       NULL::numeric    AS conversion_pct, "
+                        "       NULL::numeric    AS avg_hours_in_stage, "
+                        "       NULL::numeric    AS median_hours_in_stage, "
                         "       MAX(occurred_at) AS last_transition_at "
-                        "FROM (SELECT person_id, occurred_at, "
-                        "             payload->>'from' AS from_stage, "
-                        "             payload->>'to'   AS to_stage "
-                        "      FROM interactions "
-                        "      WHERE kind = 'stage_change' "
-                        "        AND occurred_at >= NOW() - (%s * interval '1 day')) sub "
-                        "GROUP BY from_stage, to_stage "
-                        "ORDER BY from_stage, to_stage",
+                        "FROM interactions "
+                        "WHERE kind = 'stage_change' "
+                        "  AND payload->>'from' IS NOT NULL "
+                        "  AND payload->>'to'   IS NOT NULL "
+                        "  AND occurred_at >= NOW() - (%s * interval '1 day') "
+                        "GROUP BY payload->>'from', payload->>'to' "
+                        "ORDER BY payload->>'from', payload->>'to'",
                         (days,),
                     )
                 else:
