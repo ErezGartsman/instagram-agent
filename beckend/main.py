@@ -2548,8 +2548,17 @@ def cockpit_analytics_funnel(
         ]
         entries     = {r[0]: r[1] for r in entry_rows}
         open_counts = {r[0]: r[1] for r in open_rows}
-        # Inject the corrected 'engaged' total
+        # 'engaged' has no stage_change INTO it (leads start there), so the CTE
+        # can't compute entered_count or conversion_pct for engaged→* pairs.
+        # Patch both using engaged_total from the opportunities count.
         entries["engaged"] = engaged_total
+        if engaged_total:
+            for p in pairs:
+                if p["from_stage"] == "engaged" and p["conversion_pct"] is None:
+                    p["total_entered_from_stage"] = int(engaged_total)
+                    p["conversion_pct"] = round(
+                        float(p["unique_leads"]) / float(engaged_total) * 100, 1
+                    )
 
         stages = [
             {

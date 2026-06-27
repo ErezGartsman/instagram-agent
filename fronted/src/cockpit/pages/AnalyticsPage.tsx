@@ -143,7 +143,9 @@ function FunnelTab({ token, days }: { token: string | null; days: Days }) {
   const pipelineStages = PIPELINE.map((stage) => {
     const s         = stages.find(x => x.stage === stage)
     const nextStage = PIPELINE[PIPELINE.indexOf(stage) + 1]
+    // Use the adjacent-stage pair for the connector conversion label
     const pair      = nextStage ? pairs.find(p => p.from_stage === stage && p.to_stage === nextStage) : null
+    // Use ANY pair from this stage for velocity (picks the first / highest-traffic one)
     const velPair   = pairs.find(p => p.from_stage === stage)
     return {
       stage,
@@ -155,67 +157,147 @@ function FunnelTab({ token, days }: { token: string | null; days: Days }) {
     }
   })
 
-  // Fix: use ever_entered as the basis (which now correctly includes 'engaged' total)
   const maxEntered = Math.max(...pipelineStages.map(s => s.ever_entered), 1)
 
   return (
     <div className="flex flex-col gap-6">
-      {/* Stepped funnel */}
+      {/* ── TRUE FUNNEL — trapezoid bands via clip-path ─────────────────────── */}
       <div className="rounded-card border border-line bg-surface p-5 [box-shadow:var(--shadow-card)]">
-        <div className="mb-4 font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
-          Pipeline funnel · conversion rates
+        <div className="mb-6 font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
+          Pipeline funnel · all-time conversion
         </div>
-        <div className="flex flex-col gap-3">
+
+        <div className="flex flex-col items-center">
           {pipelineStages.map((s, i) => {
-            const barPct = maxEntered > 0 ? (s.ever_entered / maxEntered) * 100 : 0
-            const convColor = s.conversion_pct === null ? 'text-faint'
-              : s.conversion_pct >= 60 ? 'text-success'
-              : s.conversion_pct >= 30 ? 'text-warn'
+            const wPct     = maxEntered > 0 ? Math.max((s.ever_entered / maxEntered) * 100, 12) : 12
+            const next     = pipelineStages[i + 1]
+            const nextWPct = next && maxEntered > 0
+              ? Math.max((next.ever_entered / maxEntered) * 100, 12)
+              : wPct   // last stage: rectangle, no taper
+
+            const isLast = i === pipelineStages.length - 1
+
+            // Polygon corners — centered trapezoid
+            const tL = (100 - wPct)     / 2
+            const tR = (100 + wPct)     / 2
+            const bL = (100 - nextWPct) / 2
+            const bR = (100 + nextWPct) / 2
+            const polygon = isLast
+              ? `polygon(${tL}% 0%, ${tR}% 0%, ${tR}% 100%, ${tL}% 100%)`
+              : `polygon(${tL}% 0%, ${tR}% 0%, ${bR}% 100%, ${bL}% 100%)`
+
+            // Opacity dims subtly as we go deeper in the funnel
+            const alpha = Math.max(0.55, 1 - i * 0.1)
+            const convPct = s.conversion_pct
+            const convCls = convPct === null ? 'text-faint'
+              : convPct >= 60 ? 'text-success'
+              : convPct >= 30 ? 'text-warn'
               : 'text-danger'
+
             return (
-              <div key={s.stage} className="flex items-center gap-3">
-                <span className="w-20 shrink-0 font-mono text-[10px] text-muted">{s.label}</span>
-                <div className="relative h-3 flex-1 overflow-hidden rounded-full bg-raised">
+              <div key={s.stage} className="w-full flex flex-col items-center">
+                {/* Band */}
+                <div className="relative w-full" style={{ height: '52px' }}>
+                  {/* Filled trapezoid */}
+                  <div className="absolute inset-0" style={{ clipPath: polygon }}>
+                    <div
+                      className="w-full h-full"
+                      style={{
+                        background: `linear-gradient(90deg, var(--color-accent) 0%, var(--color-glow) 100%)`,
+                        opacity: alpha,
+                      }}
+                    />
+                  </div>
+                  {/* Shine on top edge */}
                   <div
-                    className="absolute inset-y-0 left-0 rounded-full transition-[width] duration-700"
+                    className="absolute top-0 h-px"
                     style={{
-                      width: `${Math.max(barPct, barPct > 0 ? 1 : 0)}%`,
-                      background: i === PIPELINE.length - 1
-                        ? BRONZE
-                        : `linear-gradient(90deg, ${BRONZE}, ${BRONZE}88)`,
+                      left:  `${tL}%`,
+                      width: `${wPct}%`,
+                      background: 'linear-gradient(90deg, transparent, rgba(255,255,255,0.25), transparent)',
                     }}
                   />
+                  {/* Labels — positioned inside the visible fill */}
+                  <div
+                    className="absolute inset-y-0 flex items-center"
+                    style={{ left: `${tL}%`, width: `${wPct}%`, padding: '0 14px' }}
+                  >
+                    <span className="font-mono text-[10px] uppercase tracking-wider text-ink/80 drop-shadow-sm">
+                      {s.label}
+                    </span>
+                    <div className="flex-1" />
+                    <span className="font-mono text-base font-bold tabular-nums text-ink drop-shadow-sm">
+                      {s.ever_entered}
+                    </span>
+                    <span className="ml-2.5 font-mono text-[9px] text-ink/50">
+                      {s.open_now > 0 ? `${s.open_now} open` : ''}
+                    </span>
+                  </div>
                 </div>
-                <span className="w-8 shrink-0 text-right font-mono text-xs tabular-nums text-ink">
-                  {s.ever_entered}
-                </span>
-                <span className={`w-12 shrink-0 text-right font-mono text-[10px] tabular-nums ${convColor}`}>
-                  {s.conversion_pct !== null ? `${s.conversion_pct}%→` : '—'}
-                </span>
+
+                {/* Connector: conversion % to next stage */}
+                {!isLast && (
+                  <div className={`flex items-center gap-1.5 h-7 font-mono text-[11px] ${convCls}`}>
+                    <span className="text-faint text-[9px]">▾</span>
+                    {convPct !== null
+                      ? <span>{convPct}% advance to {pipelineStages[i + 1].label}</span>
+                      : <span className="text-faint">—</span>
+                    }
+                  </div>
+                )}
               </div>
             )
           })}
         </div>
-        <p className="mt-3 font-mono text-[9px] text-faint">
-          Bar = proportion of all-time leads · % = conversion to next stage
+
+        <p className="mt-5 font-mono text-[9px] text-faint">
+          Width = proportion of all-time leads entering each stage
         </p>
       </div>
 
-      {/* Velocity cards */}
+      {/* ── Velocity grid ─────────────────────────────────────────────────────── */}
       <div className="rounded-card border border-line bg-surface p-5 [box-shadow:var(--shadow-card)]">
-        <div className="mb-4 font-mono text-[10px] uppercase tracking-[0.13em] text-faint">Stage velocity · avg time before advancing</div>
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-          {pipelineStages.map(s => (
-            <div key={s.stage} className="rounded-control border border-line bg-raised p-3">
-              <div className="font-mono text-[9px] uppercase tracking-wider text-faint">{s.label}</div>
-              <div className="mt-1.5 font-mono text-lg tabular-nums text-ink">{fmtHours(s.avg_hours)}</div>
-              <div className="mt-0.5 font-mono text-[9px] text-faint">avg to advance</div>
-            </div>
-          ))}
+        <div className="mb-4 font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
+          Stage velocity · avg time before advancing
         </div>
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+          {pipelineStages.map((s, i) => {
+            const isEntry    = i === 0
+            const isTerminal = i === pipelineStages.length - 1
+            const hasData    = s.avg_hours !== null
+            return (
+              <div key={s.stage} className="rounded-control border border-line bg-raised p-3">
+                <div className="font-mono text-[9px] uppercase tracking-wider text-faint">{s.label}</div>
+                {isEntry ? (
+                  <>
+                    <div className="mt-1.5 font-mono text-sm text-faint">entry</div>
+                    <div className="mt-0.5 font-mono text-[9px] text-faint">first contact</div>
+                  </>
+                ) : isTerminal && !hasData ? (
+                  <>
+                    <div className="mt-1.5 font-mono text-sm text-faint">—</div>
+                    <div className="mt-0.5 font-mono text-[9px] text-faint">terminal stage</div>
+                  </>
+                ) : (
+                  <>
+                    <div className={`mt-1.5 font-mono text-lg tabular-nums ${hasData ? 'text-ink' : 'text-faint'}`}>
+                      {fmtHours(s.avg_hours)}
+                    </div>
+                    <div className="mt-0.5 font-mono text-[9px] text-faint">avg to advance</div>
+                  </>
+                )}
+              </div>
+            )
+          })}
+        </div>
+        {days !== null && (
+          <p className="mt-3 font-mono text-[9px] text-faint">
+            Velocity shown for All time view only — date filter returns counts only
+          </p>
+        )}
       </div>
 
-      {/* Transition detail table */}
+      {/* ── Transition detail table ──────────────────────────────────────────── */}
       {pairs.length > 0 && (
         <div className="rounded-card border border-line bg-surface p-5 [box-shadow:var(--shadow-card)]">
           <div className="mb-3 font-mono text-[10px] uppercase tracking-[0.13em] text-faint">All transitions</div>
@@ -231,15 +313,16 @@ function FunnelTab({ token, days }: { token: string | null; days: Days }) {
               <tbody>
                 {pairs.map((p, i) => (
                   <tr key={i} className="border-b border-line/50 last:border-0">
-                    <td className="py-1.5 pr-4 font-mono text-muted">{STAGE_LABELS[p.from_stage] ?? p.from_stage}</td>
-                    <td className="py-1.5 pr-4 font-mono text-muted">{STAGE_LABELS[p.to_stage]   ?? p.to_stage}</td>
-                    <td className="py-1.5 pr-4 font-mono tabular-nums text-ink">{p.unique_leads}</td>
-                    <td className={`py-1.5 pr-4 font-mono tabular-nums ${
-                      p.conversion_pct !== null && p.conversion_pct >= 60 ? 'text-success' :
-                      p.conversion_pct !== null && p.conversion_pct >= 30 ? 'text-warn' : 'text-danger'
+                    <td className="py-2 pr-4 font-mono text-muted">{STAGE_LABELS[p.from_stage] ?? p.from_stage}</td>
+                    <td className="py-2 pr-4 font-mono text-muted">{STAGE_LABELS[p.to_stage]   ?? p.to_stage}</td>
+                    <td className="py-2 pr-4 font-mono tabular-nums text-ink">{p.unique_leads}</td>
+                    <td className={`py-2 pr-4 font-mono tabular-nums ${
+                      p.conversion_pct === null      ? 'text-faint' :
+                      p.conversion_pct >= 60         ? 'text-success' :
+                      p.conversion_pct >= 30         ? 'text-warn' : 'text-danger'
                     }`}>{p.conversion_pct !== null ? `${p.conversion_pct}%` : '—'}</td>
-                    <td className="py-1.5 pr-4 font-mono tabular-nums text-muted">{fmtHours(p.avg_hours_in_stage)}</td>
-                    <td className="py-1.5 font-mono tabular-nums text-muted">{fmtHours(p.median_hours_in_stage)}</td>
+                    <td className="py-2 pr-4 font-mono tabular-nums text-muted">{fmtHours(p.avg_hours_in_stage)}</td>
+                    <td className="py-2 font-mono tabular-nums text-muted">{fmtHours(p.median_hours_in_stage)}</td>
                   </tr>
                 ))}
               </tbody>
