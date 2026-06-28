@@ -794,12 +794,19 @@ export function GlowingAiAssistant() {
   // Action chip handler — WhatsApp draft gets special treatment; others pre-fill textarea
   const handleAction = useCallback((action: string, contextData?: ContextData) => {
     // ── WhatsApp draft: NEVER fall through to the generic NLP chat ────────────
-    // person_id is passed directly from the chip's owning message ctx_data.
     if (WA_DRAFT_ACTIONS.has(action)) {
       const cd = contextData as Record<string, unknown> | null
+
+      // Debug trace — remove after confirming the fix
+      console.log('[Nexus] WA draft chip clicked')
+      console.log('[Nexus] contextData full:', JSON.stringify(contextData))
+      console.log('[Nexus] person_id value:', cd?.person_id, '| type:', typeof cd?.person_id)
+
       const personId = typeof cd?.person_id === 'string' && cd.person_id.length > 0
         ? cd.person_id
         : undefined
+
+      console.log('[Nexus] resolved personId:', personId)
 
       if (personId) {
         void handleWaDraft(personId)
@@ -810,7 +817,7 @@ export function GlowingAiAssistant() {
         }])
         scrollToBottom()
       }
-      return  // always return — never reaches handleSend
+      return
     }
 
     // All other chips: pre-fill the textarea

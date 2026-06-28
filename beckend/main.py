@@ -2809,11 +2809,16 @@ def cockpit_ai_chat(
                                 }
                         else:
                             # ── Person-specific SLA lookup ───────────────────
+                            # Select s.person_id directly — it is always present in
+                            # the view (= o.person_id).  The previous second-query
+                            # approach used an INNER JOIN on person_identity which
+                            # silently returned 0 rows when the lead had no WA
+                            # identity record, causing person_id = None.
                             frag_l = frag.lower()
                             cur.execute(
-                                "SELECT COALESCE(s.person_name,'Lead '||p.wa_ref_code,'Lead') AS name,"
+                                "SELECT COALESCE(s.person_name,'Lead '||p.wa_ref_code,'Lead'),"
                                 "       s.stage, s.hours_in_stage, s.target_hours, "
-                                "       s.warn_hours, s.sla_status "
+                                "       s.warn_hours, s.sla_status, s.person_id "
                                 "FROM lead_sla_status s "
                                 "JOIN person p ON p.id = s.person_id "
                                 "WHERE lower(COALESCE(s.person_name,'')) LIKE %s "
@@ -2831,35 +2836,31 @@ def cockpit_ai_chat(
                                 )
                                 if primary_intent == "general":
                                     primary_intent = f"sla_lead_{row[5]}"
-                                    # Fetch WA phone for the draft-WhatsApp action
-                                    wa_phone = None
-                                    pi_cur = conn.cursor()
-                                    pi_cur.execute(
-                                        "SELECT pi.external_id, s2.person_id "
-                                        "FROM lead_sla_status s2 "
-                                        "JOIN person_identity pi ON pi.person_id = s2.person_id "
-                                        "  AND pi.channel = 'whatsapp' "
-                                        "JOIN person p2 ON p2.id = s2.person_id "
-                                        "WHERE (lower(COALESCE(s2.person_name,'')) LIKE %s "
-                                        "    OR lower(COALESCE(p2.wa_ref_code,'')) LIKE %s) "
-                                        "LIMIT 1",
-                                        (f"%{frag_l}%", f"%{frag_l}%"),
+                                    # row[6] = person_id UUID — always populated.
+                                    # WA phone is a separate optional lookup.
+                                    person_uuid = row[6]
+                                    cur.execute(
+                                        "SELECT external_id FROM person_identity "
+                                        "WHERE person_id = %s AND channel = 'whatsapp' LIMIT 1",
+                                        (person_uuid,),
                                     )
-                                    pi_row = pi_cur.fetchone()
-                                    pi_cur.close()
-                                    if pi_row:
-                                        wa_phone = pi_row[0]
-                                        lead_person_id = str(pi_row[1])
-                                    else:
-                                        lead_person_id = None
+                                    ph_row = cur.fetchone()
+                                    wa_phone = ph_row[0] if ph_row else None
+                                    lead_pid  = str(person_uuid) if person_uuid else None
+                                    logger.info(
+                                        f"[cockpit/ai/chat] SLA lead person_id={lead_pid!r} "
+                                        f"wa_phone={'yes' if wa_phone else 'none'}"
+                                    )
                                     ctx_data = {
-                                        "type": "sla_lead",
-                                        "name": row[0], "stage": row[1],
+                                        "type":           "sla_lead",
+                                        "name":           row[0],
+                                        "stage":          row[1],
                                         "hours_in_stage": float(row[2]) if row[2] is not None else 0,
-                                        "target_hours": row[3], "warn_hours": row[4],
-                                        "sla_status": row[5],
-                                        "person_id": lead_person_id,
-                                        "wa_phone":  wa_phone,
+                                        "target_hours":   row[3],
+                                        "warn_hours":     row[4],
+                                        "sla_status":     row[5],
+                                        "person_id":      lead_pid,
+                                        "wa_phone":       wa_phone,
                                     }
                             else:
                                 context_blocks.append(
