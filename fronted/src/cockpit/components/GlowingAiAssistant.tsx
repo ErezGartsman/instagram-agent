@@ -26,13 +26,14 @@ const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 type ContextData = Record<string, unknown> | null
 
 type Message = {
-  role:         'user' | 'assistant'
-  content:      string
-  chips?:       string[]     // context chips attached at send time
-  file?:        string       // filename if the message is a file attachment
-  intent?:      string       // backend-signalled widget type
+  role:          'user' | 'assistant'
+  content:       string
+  chips?:        string[]     // context chips attached at send time
+  file?:         string       // filename if the message is a file attachment
+  intent?:       string       // backend-signalled widget type
   context_data?: ContextData  // structured DB data for the widget
-  actions?:     string[]     // suggested follow-up chips
+  actions?:      string[]     // suggested follow-up chips
+  waDraft?:      WaDraftState // present on WhatsApp draft cards
 }
 
 // ── Context bridge (window-event based, zero prop drilling) ────────────────────
@@ -312,6 +313,84 @@ function WidgetRenderer({ intent, data }: { intent?: string; data: ContextData }
   return null
 }
 
+// ── WhatsApp draft card — shown as a special assistant bubble ─────────────────
+type WaDraftState = { status: 'loading' } | { status: 'ready'; draft: string; wa_phone: string; name: string } | { status: 'error'; msg: string }
+
+function WhatsAppDraftCard({ state }: { state: WaDraftState }) {
+  const [editedDraft, setEditedDraft] = useState(
+    state.status === 'ready' ? state.draft : ''
+  )
+  // Sync if state changes from loading → ready
+  useEffect(() => {
+    if (state.status === 'ready') setEditedDraft(state.draft)
+  }, [state])
+
+  if (state.status === 'loading') {
+    return (
+      <div className="mt-2.5 rounded-control border border-line p-3 flex items-center gap-2"
+        style={{ background: 'color-mix(in srgb, var(--color-bg) 80%, transparent)' }}>
+        {[0,1,2].map(i => (
+          <div key={i} className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted"
+            style={{ animationDelay: `${i * 0.15}s` }} />
+        ))}
+        <span className="font-mono text-[9px] text-faint">Generating draft with Copilot…</span>
+      </div>
+    )
+  }
+  if (state.status === 'error') {
+    return (
+      <div className="mt-2.5 rounded-control border border-danger/25 p-3"
+        style={{ background: 'color-mix(in srgb, var(--color-danger) 6%, transparent)' }}>
+        <span className="font-mono text-[9px] text-danger">{state.msg}</span>
+      </div>
+    )
+  }
+  const { wa_phone, name } = state
+  const waUrl = wa_phone
+    ? `https://wa.me/${wa_phone}?text=${encodeURIComponent(editedDraft)}`
+    : null
+
+  return (
+    <div className="mt-2.5 flex flex-col gap-2.5 rounded-control border border-glow/20 p-3"
+      style={{ background: 'color-mix(in srgb, var(--color-bg) 80%, transparent)' }}>
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          <svg className="h-3.5 w-3.5 text-success" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/>
+          </svg>
+          <span className="font-mono text-[9px] uppercase tracking-wider text-glow">WhatsApp Draft · {name}</span>
+        </div>
+        {!wa_phone && (
+          <span className="font-mono text-[8px] text-warn">No phone on file</span>
+        )}
+      </div>
+      {/* Editable draft — RTL for Hebrew */}
+      <textarea
+        value={editedDraft}
+        onChange={e => setEditedDraft(e.target.value)}
+        rows={4}
+        dir="rtl"
+        className="w-full resize-none rounded border border-line bg-raised px-3 py-2.5 text-sm leading-relaxed text-ink outline-none focus:border-glow/30 transition-colors"
+        style={{ scrollbarWidth: 'none', fontFamily: 'var(--font-sans)' }}
+      />
+      {/* Footer */}
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-[8px] text-faint">Review and edit · Erez sends manually</span>
+        {waUrl ? (
+          <a href={waUrl} target="_blank" rel="noreferrer"
+            className="inline-flex items-center gap-1.5 rounded-control px-3 py-1.5 font-mono text-[9px] font-medium text-white transition-all hover:scale-105 active:scale-95"
+            style={{ background: '#25D366', boxShadow: '0 0 12px rgba(37,211,102,0.35)' }}>
+            Open in WhatsApp ↗
+          </a>
+        ) : (
+          <span className="font-mono text-[8px] text-faint">No phone on file for this lead</span>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ── Action chips — pre-filled follow-up queries ───────────────────────────────
 function ActionChips({ actions, onAction }: { actions: string[]; onAction: (a: string) => void }) {
   if (!actions.length) return null
@@ -376,10 +455,17 @@ function Bubble({ msg, onAction }: { msg: Message; onAction: (a: string) => void
           <span className="text-[9px] leading-none text-glow">✦</span>
           <span className="font-mono text-[8px] uppercase tracking-wider text-glow">Nexus</span>
         </div>
-        {/* Formatted prose */}
-        <ReplyText text={msg.content} />
-        {/* Generative widget (intent-driven) */}
-        <WidgetRenderer intent={msg.intent} data={msg.context_data ?? null} />
+        {/* WhatsApp draft card (special bubble) */}
+        {msg.waDraft ? (
+          <WhatsAppDraftCard state={msg.waDraft} />
+        ) : (
+          <>
+            {/* Formatted prose */}
+            <ReplyText text={msg.content} />
+            {/* Generative widget (intent-driven) */}
+            <WidgetRenderer intent={msg.intent} data={msg.context_data ?? null} />
+          </>
+        )}
         {/* Suggested follow-up action chips */}
         {msg.actions && msg.actions.length > 0 && (
           <ActionChips actions={msg.actions} onAction={onAction} />
@@ -646,12 +732,70 @@ export function GlowingAiAssistant() {
   const fmtTime = (s: number) =>
     `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
 
-  // Action chip handler — pre-fills the textarea and auto-sends
+  // ── WhatsApp draft chip handler ───────────────────────────────────────────
+  const handleWaDraft = useCallback(async (personId: string) => {
+    const token = session?.access_token
+    if (!token) return
+
+    // Add a loading draft bubble immediately
+    const loadingMsg: Message = {
+      role: 'assistant',
+      content: 'Generating WhatsApp draft…',
+      waDraft: { status: 'loading' },
+    }
+    setMessages(prev => [...prev, loadingMsg])
+    scrollToBottom()
+
+    try {
+      const res = await fetch(`${API_BASE}/api/cockpit/whatsapp/draft`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ person_id: personId }),
+        signal: AbortSignal.timeout(35_000),
+      })
+      const data = await res.json() as { status: string; draft?: string; wa_phone?: string; person_name?: string; detail?: string }
+
+      if (data.status === 'success' && data.draft) {
+        setMessages(prev => prev.map(m =>
+          m === loadingMsg
+            ? { ...m, content: '', waDraft: { status: 'ready', draft: data.draft!, wa_phone: data.wa_phone ?? '', name: data.person_name ?? 'Lead' } }
+            : m
+        ))
+      } else {
+        setMessages(prev => prev.map(m =>
+          m === loadingMsg
+            ? { ...m, content: '', waDraft: { status: 'error', msg: data.detail ?? 'Could not generate draft.' } }
+            : m
+        ))
+      }
+    } catch {
+      setMessages(prev => prev.map(m =>
+        m === loadingMsg
+          ? { ...m, content: '', waDraft: { status: 'error', msg: 'Connection error — please try again.' } }
+          : m
+      ))
+    }
+    scrollToBottom()
+  }, [session, scrollToBottom])
+
+  // Action chip handler — WhatsApp draft gets special treatment; others pre-fill textarea
   const handleAction = useCallback((action: string) => {
+    if (action === 'Draft WhatsApp follow-up' || action === 'Draft check-in message' || action === 'Draft message') {
+      // Find the most recent SLA message with a person_id in ctx_data
+      const slaMsg = [...messages].reverse().find(
+        m => m.context_data && typeof m.context_data === 'object' && 'person_id' in m.context_data
+      )
+      const personId = (slaMsg?.context_data as Record<string, unknown>)?.person_id as string | undefined
+      if (personId) {
+        void handleWaDraft(personId)
+        return
+      }
+      // No person_id found — fall through to pre-fill so user can specify
+    }
     setMessage(action)
     setOpen(true)
     setTimeout(() => textareaRef.current?.focus(), 100)
-  }, [])
+  }, [messages, handleWaDraft])
 
   const canSend    = (message.trim().length > 0 || chips.length > 0) && message.length <= MAX_CHARS
   const hasHistory = messages.length > 0

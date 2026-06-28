@@ -2769,16 +2769,42 @@ def cockpit_ai_chat(
                             )
                             if primary_intent == "general":
                                 primary_intent = "sla_overview"
+                                # Fetch WA phones for action chip support
+                                cur.execute(
+                                    "SELECT s3.person_id, pi.external_id "
+                                    "FROM lead_sla_status s3 "
+                                    "JOIN person_identity pi "
+                                    "  ON pi.person_id = s3.person_id "
+                                    "  AND pi.channel = 'whatsapp' "
+                                    "LIMIT 20"
+                                )
+                                wa_phones = {str(r[0]): r[1] for r in cur.fetchall()}
+                                # Pull person_id from lead_sla_status for top leads
+                                cur.execute(
+                                    "SELECT s3.person_id, "
+                                    "COALESCE(s3.person_name,'Lead '||p3.wa_ref_code,'Lead'), "
+                                    "s3.stage, s3.hours_in_stage, s3.target_hours, s3.sla_status "
+                                    "FROM lead_sla_status s3 "
+                                    "JOIN person p3 ON p3.id = s3.person_id "
+                                    "ORDER BY "
+                                    "  CASE s3.sla_status WHEN 'breach' THEN 0 "
+                                    "  WHEN 'warn' THEN 1 ELSE 2 END,"
+                                    "  s3.hours_in_stage DESC NULLS LAST "
+                                    "LIMIT 5"
+                                )
+                                top_with_ids = cur.fetchall()
                                 ctx_data = {
                                     "type": "sla_overview",
                                     "counts": dict(counts),
                                     "top_leads": [
                                         {
-                                            "name": r[0], "stage": r[1],
-                                            "hours_in_stage": float(r[2]) if r[2] is not None else 0,
-                                            "target_hours": r[3], "sla_status": r[4],
+                                            "person_id": str(r[0]),
+                                            "name": r[1], "stage": r[2],
+                                            "hours_in_stage": float(r[3]) if r[3] is not None else 0,
+                                            "target_hours": r[4], "sla_status": r[5],
+                                            "wa_phone": wa_phones.get(str(r[0])),
                                         }
-                                        for r in top
+                                        for r in top_with_ids
                                     ],
                                 }
                         else:
@@ -2805,12 +2831,35 @@ def cockpit_ai_chat(
                                 )
                                 if primary_intent == "general":
                                     primary_intent = f"sla_lead_{row[5]}"
+                                    # Fetch WA phone for the draft-WhatsApp action
+                                    wa_phone = None
+                                    pi_cur = conn.cursor()
+                                    pi_cur.execute(
+                                        "SELECT pi.external_id, s2.person_id "
+                                        "FROM lead_sla_status s2 "
+                                        "JOIN person_identity pi ON pi.person_id = s2.person_id "
+                                        "  AND pi.channel = 'whatsapp' "
+                                        "JOIN person p2 ON p2.id = s2.person_id "
+                                        "WHERE (lower(COALESCE(s2.person_name,'')) LIKE %s "
+                                        "    OR lower(COALESCE(p2.wa_ref_code,'')) LIKE %s) "
+                                        "LIMIT 1",
+                                        (f"%{frag_l}%", f"%{frag_l}%"),
+                                    )
+                                    pi_row = pi_cur.fetchone()
+                                    pi_cur.close()
+                                    if pi_row:
+                                        wa_phone = pi_row[0]
+                                        lead_person_id = str(pi_row[1])
+                                    else:
+                                        lead_person_id = None
                                     ctx_data = {
                                         "type": "sla_lead",
                                         "name": row[0], "stage": row[1],
                                         "hours_in_stage": float(row[2]) if row[2] is not None else 0,
                                         "target_hours": row[3], "warn_hours": row[4],
                                         "sla_status": row[5],
+                                        "person_id": lead_person_id,
+                                        "wa_phone":  wa_phone,
                                     }
                             else:
                                 context_blocks.append(
@@ -3118,6 +3167,87 @@ def cockpit_ai_chat(
             "reply":  "Something went wrong. Please try again.",
             "intent": "general", "context_data": None, "actions": _AI_ACTIONS["general"],
         }
+
+
+# ── WhatsApp Draft Generator ─────────────────────────────────────────────────
+#
+# POST /api/cockpit/whatsapp/draft
+#   { person_id: str }
+#   → { status, draft, wa_phone, person_name }
+#
+# Reuses the existing Copilot infrastructure (nexus.copilot PERSONA +
+# DRAFTING_RULES + build_draft_prompt) to generate a personalised Hebrew
+# WhatsApp message.  Frontend presents this in an editable card; Erez reviews
+# and clicks "Open in WhatsApp" to pre-fill wa.me with the draft.
+
+class _WaDraftBody(BaseModel):
+    person_id: str
+
+
+@app.post("/api/cockpit/whatsapp/draft")
+def cockpit_whatsapp_draft(
+    body: _WaDraftBody,
+    user: dict = Depends(require_cockpit_user),
+):
+    """
+    Generate a personalised Hebrew WhatsApp draft for a lead, using:
+      • Person-360 (name / stage / essence / goal / tension)
+      • WhatsApp conversation thread (last 30 messages)
+      • Copilot persona + drafting rules (Israeli Hebrew, short, eye-level)
+
+    Returns the draft text + the lead's WhatsApp phone number so the frontend
+    can open wa.me/{phone}?text={draft} in a new tab.
+    """
+    person_id = body.person_id.strip()
+    if not person_id:
+        return {"status": "error", "detail": "person_id is required."}
+
+    try:
+        with get_db_conn() as conn:
+            # ── Person-360 ────────────────────────────────────────────────────
+            person = _db_person360(conn, person_id)
+            if not person:
+                return {"status": "error", "detail": "Lead not found."}
+
+            # ── WhatsApp thread (last 30 messages) ───────────────────────────
+            thread = _db_whatsapp_thread(conn, person_id, limit=30)
+
+            # ── WhatsApp phone number ─────────────────────────────────────────
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT external_id FROM person_identity "
+                    "WHERE person_id = %s AND channel = 'whatsapp' LIMIT 1",
+                    (person_id,),
+                )
+                pi_row = cur.fetchone()
+            wa_phone = pi_row[0] if pi_row else None
+
+        # ── Build the draft prompt ───────────────────────────────────────────
+        # Use the same Copilot persona + rules as the stream endpoint, but
+        # override the instruction to emphasise re-engagement context.
+        intent = (
+            "כתוב הודעת מעקב קצרה ואנושית לשיחה זו. "
+            "המטרה: להחזיר את הלקוח לשיחה ולקדם לשלב הבא."
+        )
+        prompt = nexus_copilot.build_draft_prompt(person, thread, intent=intent)
+
+        draft = _call_llm(prompt)
+        logger.info(
+            f"[cockpit/whatsapp/draft] person={person_id!r} "
+            f"has_phone={wa_phone is not None} draft_len={len(draft)}"
+        )
+        return {
+            "status":      "success",
+            "draft":       draft,
+            "wa_phone":    wa_phone or "",
+            "person_name": person.get("name") or "Lead",
+        }
+
+    except TimeoutError:
+        return {"status": "error", "detail": "The AI took too long — please try again."}
+    except Exception as e:
+        logger.error(f"[cockpit/whatsapp/draft] error for {person_id!r}: {e}", exc_info=True)
+        return {"status": "error", "detail": "Could not generate draft."}
 
 
 # ── Content Studio (Sprint 5, the Studio pillar) — the cockpit's first write
