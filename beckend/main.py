@@ -2625,6 +2625,304 @@ def cockpit_analytics_sla(user: dict = Depends(require_cockpit_user)):
         return {"status": "error", "detail": "Could not load SLA data."}
 
 
+# ── Cockpit AI Chat — NLP brain for the GlowingAiAssistant ──────────────────
+#
+# Bridges the existing Gemini seam (_call_llm / gemini-2.5-flash) with live
+# cockpit data. Context chips from the frontend are parsed into SQL queries so
+# the LLM has real, grounded data — not hallucinated numbers.
+#
+# POST /api/cockpit/ai/chat
+#   { message, chips: string[], history: [{role, content}] }
+#   → { status: "success"|"error", reply: string }
+
+class _AiChatBody(BaseModel):
+    message: str = ""
+    chips:   list[str] = []
+    history: list[dict] = []
+
+
+@app.post("/api/cockpit/ai/chat")
+def cockpit_ai_chat(
+    body: _AiChatBody,
+    user: dict = Depends(require_cockpit_user),
+):
+    """
+    NLP brain for the cockpit AI assistant.
+
+    Parses each context chip into a targeted DB query to pull live data,
+    builds a grounded system prompt (pipeline schema + live numbers + recent
+    conversation history), then calls _call_llm for a real Gemini response.
+    """
+    msg   = body.message.strip()
+    chips = [c.strip() for c in body.chips if c.strip()]
+
+    if not msg and not chips:
+        return {"status": "error", "reply": "Please enter a question."}
+
+    context_blocks: list[str] = []
+
+    # ── Pull live data for each context chip ──────────────────────────────────
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                for chip in chips:
+                    chip_l = chip.lower()
+
+                    # SLA breach / at risk: pull the individual lead's live record
+                    if "sla" in chip_l or "breach" in chip_l or "at risk" in chip_l:
+                        frag = chip.split("·")[-1].strip() if "·" in chip else chip
+                        frag_l = frag.lower()
+                        cur.execute(
+                            "SELECT COALESCE(s.person_name,'Lead '||p.wa_ref_code,'Lead') AS name,"
+                            "       s.stage, s.hours_in_stage, s.target_hours, "
+                            "       s.warn_hours, s.sla_status "
+                            "FROM lead_sla_status s "
+                            "JOIN person p ON p.id = s.person_id "
+                            "WHERE lower(COALESCE(s.person_name,'')) LIKE %s "
+                            "   OR lower(COALESCE(p.wa_ref_code,'')) LIKE %s "
+                            "LIMIT 1",
+                            (f"%{frag_l}%", f"%{frag_l}%"),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            context_blocks.append(
+                                f"LEAD — {row[0]}:\n"
+                                f"  Stage: {row[1]}  |  Hours in stage: {row[2]}h  "
+                                f"|  SLA target: {row[3]}h  |  Warn at: {row[4]}h  "
+                                f"|  Status: {row[5].upper()}"
+                            )
+                        else:
+                            context_blocks.append(
+                                f"LEAD CONTEXT: {chip}  (no matching record found — "
+                                f"the person may be closed/snoozed)"
+                            )
+
+                    # Follower growth / community growth
+                    elif "follower growth" in chip_l or "growth trend" in chip_l:
+                        community_size = int(_get_config("analytics.community_size") or 0)
+                        cur.execute(
+                            "SELECT to_char(date_trunc('week', followed_at), 'YYYY-MM-DD'), COUNT(*) "
+                            "FROM followers WHERE followed_at IS NOT NULL "
+                            "GROUP BY 1 ORDER BY 1 DESC LIMIT 8"
+                        )
+                        rows = cur.fetchall()
+                        lines = []
+                        for wk, n in reversed(rows):
+                            lines.append(f"  {wk}: +{n} new followers")
+                        context_blocks.append(
+                            f"FOLLOWER GROWTH (community total: {community_size:,}):\n" +
+                            ("\n".join(lines) if lines else "  No weekly data available")
+                        )
+
+                    # Funnel / conversion analysis
+                    elif "funnel" in chip_l or ("conversion" in chip_l and "pipeline" in chip_l):
+                        cur.execute(
+                            "SELECT from_stage, to_stage, unique_leads, conversion_pct, "
+                            "       avg_hours_in_stage "
+                            "FROM funnel_metrics ORDER BY from_stage, to_stage"
+                        )
+                        fm_rows = cur.fetchall()
+                        cur.execute(
+                            "SELECT stage, COUNT(*) FROM opportunities "
+                            "WHERE closed_at IS NULL GROUP BY stage"
+                        )
+                        stage_counts = {r[0]: r[1] for r in cur.fetchall()}
+                        cur.execute("SELECT COUNT(DISTINCT person_id) FROM opportunities")
+                        total_leads = cur.fetchone()[0]
+                        lines = []
+                        for r in fm_rows:
+                            pct = f"{r[3]}%" if r[3] is not None else "—"
+                            vel = f"{r[4]}h avg time" if r[4] is not None else "velocity unknown"
+                            lines.append(f"  {r[0]} → {r[1]}: {r[2]} leads  {pct} conversion  {vel}")
+                        open_str = "  |  ".join(
+                            f"{k}: {v}" for k, v in sorted(stage_counts.items())
+                        ) or "no open leads"
+                        context_blocks.append(
+                            f"PIPELINE FUNNEL ({total_leads} total leads):\n" +
+                            "\n".join(lines) +
+                            f"\n\n  CURRENT OPEN LEADS: {open_str}"
+                        )
+
+                    # Stage-specific pipeline (e.g. "Qualified pipeline — 5 leads")
+                    elif "pipeline" in chip_l:
+                        for sn in ("engaged", "qualified", "captured", "briefed", "booked"):
+                            if sn in chip_l:
+                                cur.execute(
+                                    "SELECT COUNT(*), "
+                                    "       ROUND(AVG(EXTRACT(EPOCH FROM (NOW()-stage_entered_at))/3600),1) "
+                                    "FROM opportunities WHERE stage = %s AND closed_at IS NULL",
+                                    (sn,),
+                                )
+                                row = cur.fetchone()
+                                avg_h = f"  |  avg {row[1]}h in stage" if row[1] else ""
+                                context_blocks.append(
+                                    f"STAGE '{sn.upper()}': {row[0]} open leads{avg_h}"
+                                )
+                                break
+                        else:
+                            context_blocks.append(f"PIPELINE CONTEXT: {chip}")
+
+                    # Velocity analysis
+                    elif "velocity" in chip_l:
+                        for sn in ("engaged", "qualified", "captured", "briefed", "booked"):
+                            if sn in chip_l:
+                                cur.execute(
+                                    "SELECT avg_hours_in_stage, median_hours_in_stage, "
+                                    "       conversion_pct "
+                                    "FROM funnel_metrics WHERE from_stage = %s LIMIT 1",
+                                    (sn,),
+                                )
+                                row = cur.fetchone()
+                                if row and row[0] is not None:
+                                    context_blocks.append(
+                                        f"VELOCITY — {sn.upper()}:\n"
+                                        f"  Avg time before advancing: {row[0]}h\n"
+                                        f"  Median: {row[1]}h  |  Conversion: {row[2]}%"
+                                    )
+                                else:
+                                    context_blocks.append(
+                                        f"VELOCITY — {sn.upper()}: no data yet "
+                                        f"(leads haven't advanced from this stage)"
+                                    )
+                                break
+                        else:
+                            # All-stage velocity summary
+                            cur.execute(
+                                "SELECT from_stage, avg_hours_in_stage, conversion_pct "
+                                "FROM funnel_metrics WHERE avg_hours_in_stage IS NOT NULL "
+                                "ORDER BY from_stage"
+                            )
+                            rows = cur.fetchall()
+                            lines = [
+                                f"  {r[0]}: avg {r[1]}h, {r[2]}% conversion"
+                                for r in rows
+                            ]
+                            context_blocks.append(
+                                "STAGE VELOCITY (all stages):\n" +
+                                ("\n".join(lines) if lines else "  No velocity data yet")
+                            )
+
+                    # Community / reach / conversation
+                    elif any(kw in chip_l for kw in ("community", "reach", "conversation",
+                                                       "likes", "comments", "content")):
+                        community_size = int(_get_config("analytics.community_size") or 0)
+                        cur.execute("SELECT COUNT(*) FROM likers")
+                        total_likes = cur.fetchone()[0]
+                        cur.execute("SELECT COUNT(*) FROM comments")
+                        total_comments = cur.fetchone()[0]
+                        cur.execute("SELECT COUNT(*) FROM posts")
+                        total_posts = cur.fetchone()[0]
+                        context_blocks.append(
+                            f"COMMUNITY METRICS:\n"
+                            f"  Total community size: {community_size:,}\n"
+                            f"  Total tracked likes:  {total_likes:,}\n"
+                            f"  Total comments:       {total_comments:,}\n"
+                            f"  Total posts tracked:  {total_posts:,}"
+                        )
+
+                    # Post engagement (chip contains a shortcode)
+                    elif "post" in chip_l:
+                        # Extract the shortcode token (uppercase alphanumeric, >6 chars)
+                        shortcode = next(
+                            (t.strip("·!,.") for t in chip.split()
+                             if len(t) > 6 and t[0].isupper() and t.replace("-","").isalnum()),
+                            None
+                        )
+                        if shortcode:
+                            cur.execute(
+                                "SELECT COUNT(*) FROM likers WHERE post_shortcode = %s",
+                                (shortcode,),
+                            )
+                            lk = cur.fetchone()[0]
+                            cur.execute(
+                                "SELECT COUNT(*) FROM comments WHERE post_shortcode = %s",
+                                (shortcode,),
+                            )
+                            cm = cur.fetchone()[0]
+                            context_blocks.append(
+                                f"POST {shortcode}: {lk:,} likes, {cm:,} comments"
+                            )
+                        else:
+                            context_blocks.append(f"POST CONTEXT: {chip}")
+
+                    # Booked / north-star
+                    elif "booked" in chip_l or "north star" in chip_l:
+                        cur.execute("SELECT COUNT(*) FROM bookings")
+                        total_b = cur.fetchone()[0]
+                        cur.execute(
+                            "SELECT COUNT(*) FROM opportunities "
+                            "WHERE stage = 'booked' AND closed_at IS NULL"
+                        )
+                        open_b = cur.fetchone()[0]
+                        context_blocks.append(
+                            f"BOOKINGS: {total_b} total all-time  "
+                            f"|  {open_b} currently in 'Booked' stage (confirmed, pending session)"
+                        )
+
+                    else:
+                        context_blocks.append(f"CONTEXT: {chip}")
+
+    except Exception as db_err:
+        logger.error(f"[cockpit/ai/chat] context build error: {db_err}")
+        # Degrade gracefully — continue with whatever context was collected
+
+    # ── Build the grounded system prompt ──────────────────────────────────────
+    pipeline_ref = (
+        "Pipeline stages (in order): "
+        "Engaged (24h SLA) → Qualified (48h) → Captured (72h) → "
+        "Briefed (48h) → Booked (168h).  "
+        "'Booked' is the north-star conversion metric."
+    )
+    system = (
+        "You are Nexus AI — the analytics brain inside Erez Gartsman's private "
+        "command center (the Nexus Cockpit) for his coaching and therapy practice.\n"
+        "Speak like a sharp analyst briefing the operator: concise, data-driven, "
+        "actionable. Use the real numbers provided. Flag what needs attention. "
+        "Suggest one clear next action when relevant. "
+        "Never invent numbers that weren't given. Respond in English.\n\n"
+        f"PIPELINE: {pipeline_ref}"
+    )
+
+    if context_blocks:
+        system += (
+            "\n\nLIVE DATA pulled for this query:\n" +
+            "\n\n".join(context_blocks)
+        )
+
+    # Append recent conversation history for follow-up awareness
+    hist_lines = ""
+    for m in body.history[-6:]:
+        role = "User" if m.get("role") == "user" else "Nexus"
+        hist_lines += f"\n{role}: {m.get('content', '')[:400]}"
+    if hist_lines:
+        system += f"\n\nCONVERSATION SO FAR:{hist_lines}"
+
+    user_turn = msg or "(No text — the user attached the context chips above. Analyse and provide insight.)"
+    full_prompt = f"{system}\n\nUser: {user_turn}\n\nNexus:"
+
+    logger.info(f"[cockpit/ai/chat] chips={len(chips)} context_blocks={len(context_blocks)} "
+                f"msg_len={len(msg)}")
+
+    # ── Call Gemini ───────────────────────────────────────────────────────────
+    try:
+        reply = _call_llm(full_prompt)
+        return {"status": "success", "reply": reply}
+    except TimeoutError:
+        return {
+            "status": "error",
+            "reply": "The AI took too long to respond — please try again in a moment.",
+        }
+    except Exception as llm_err:
+        err_s = str(llm_err).lower()
+        if "429" in err_s or "quota" in err_s or "resource_exhausted" in err_s:
+            return {
+                "status": "error",
+                "reply": "The AI is temporarily busy — please wait ~30 seconds and retry.",
+            }
+        logger.error(f"[cockpit/ai/chat] LLM error: {llm_err}", exc_info=True)
+        return {"status": "error", "reply": "Something went wrong. Please try again."}
+
+
 # ── Content Studio (Sprint 5, the Studio pillar) — the cockpit's first write
 #    surface. CRUD over content_pieces, all Supabase-JWT gated. ───────────────
 _CONTENT_STATUSES = {"idea", "drafting", "published"}

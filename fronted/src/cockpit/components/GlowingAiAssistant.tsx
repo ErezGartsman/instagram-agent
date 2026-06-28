@@ -7,16 +7,20 @@
  *   ContextTarget        — tiny ✦ button for dashboard elements
  *
  * State model:
- *   messages  — full chat history (user + assistant bubbles)
- *   chips     — context tokens injected from dashboard (dismissed on send)
+ *   messages    — full chat history (user + assistant bubbles)
+ *   chips       — context tokens injected from dashboard (dismissed on send)
  *   isRecording — transforms input into waveform recording UI
  *
- * P2 Copilot: assistant replies are simulated until POST /api/cockpit/copilot/draft is wired.
+ * Backend: POST /api/cockpit/ai/chat — Gemini 2.5 Flash with live DB context.
+ * Context chips are parsed server-side into real SQL queries so the LLM has
+ * grounded data, not hallucinated numbers.
  */
 
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { Paperclip, Link2, Code2, Mic, Send, Info, Bot, X } from 'lucide-react'
 import { useAuth } from '../auth/AuthProvider'
+
+const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 type Message = {
@@ -61,6 +65,24 @@ function ContextChip({ label, onRemove }: { label: string; onRemove: () => void 
 
 // ── Message bubble ─────────────────────────────────────────────────────────────
 function Bubble({ msg }: { msg: Message }) {
+  // Typing indicator — shown while waiting for the backend
+  if (msg.role === 'assistant' && msg.content === '__thinking__') {
+    return (
+      <div className="flex justify-start">
+        <div className="flex items-center gap-2 rounded-2xl rounded-bl-sm border border-glow/15 bg-raised px-3.5 py-3">
+          <span className="font-mono text-[9px] leading-none text-glow">✦</span>
+          {[0, 1, 2].map(i => (
+            <div
+              key={i}
+              className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted"
+              style={{ animationDelay: `${i * 0.15}s` }}
+            />
+          ))}
+        </div>
+      </div>
+    )
+  }
+
   if (msg.role === 'user') {
     return (
       <div className="flex justify-end">
@@ -79,6 +101,7 @@ function Bubble({ msg }: { msg: Message }) {
       </div>
     )
   }
+
   return (
     <div className="flex justify-start">
       <div className="max-w-[88%] rounded-2xl rounded-bl-sm border border-glow/15 bg-raised px-3.5 py-2.5 text-sm text-ink">
@@ -111,12 +134,33 @@ function Waveform() {
   )
 }
 
-// ── Simulated assistant reply ──────────────────────────────────────────────────
-function buildReply(chips: string[], content: string): string {
-  const ref = chips[0] ?? (content.slice(0, 55) || 'your query')
-  return `Received your query about "${ref}". ` +
-    `The Nexus reasoning engine (P2 Copilot) will process this in the next workstream — ` +
-    `Erez will be notified and can respond directly from the Work Queue.`
+// ── Real API call ──────────────────────────────────────────────────────────────
+async function fetchAiReply(
+  token: string,
+  message: string,
+  chips: string[],
+  history: Message[],
+): Promise<string> {
+  const res = await fetch(`${API_BASE}/api/cockpit/ai/chat`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      message,
+      chips,
+      history: history
+        .filter(m => m.content !== '__thinking__')
+        .slice(-6)
+        .map(m => ({ role: m.role, content: m.file ? `[File: ${m.file}]` : m.content })),
+    }),
+    signal: AbortSignal.timeout(35_000),  // matches backend LLM timeout + buffer
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const data = await res.json() as { status: string; reply: string }
+  if (data.status === 'error') throw new Error(data.reply)
+  return data.reply
 }
 
 const MAX_CHARS = 2000
@@ -185,49 +229,93 @@ export function GlowingAiAssistant() {
     return () => window.removeEventListener('keydown', h)
   }, [open])
 
-  // ── Send message ────────────────────────────────────────────────────────────
-  const handleSend = useCallback(() => {
+  // ── Send message — real Gemini call via /api/cockpit/ai/chat ────────────────
+  const handleSend = useCallback(async () => {
     const hasContent = message.trim().length > 0 || chips.length > 0
     if (!hasContent) return
 
-    const userMsg: Message = { role: 'user', content: message.trim(), chips: chips.length ? [...chips] : undefined }
-    setMessages(prev => [...prev, userMsg])
+    const token = session?.access_token
+    const userMsg: Message = {
+      role:    'user',
+      content: message.trim(),
+      chips:   chips.length ? [...chips] : undefined,
+    }
+
+    // Snapshot current history BEFORE state updates (for the API call below)
+    const historySnapshot = messages.slice()
+
+    setMessages(prev => [...prev, userMsg, { role: 'assistant', content: '__thinking__' }])
     setMessage('')
     setChips([])
     setCodeMode(false)
     setLinkMode(false)
     scrollToBottom()
 
-    // Simulated assistant reply (replace with real API call in P2)
-    // session.access_token will be the bearer token for POST /api/cockpit/copilot/draft
-    setTimeout(() => {
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: buildReply(userMsg.chips ?? [], userMsg.content),
-      }])
-      scrollToBottom()
-    }, 900)
-  }, [message, chips, session, scrollToBottom])
+    if (!token) {
+      setMessages(prev =>
+        prev.map(m => m.content === '__thinking__'
+          ? { role: 'assistant', content: 'Sign in to use the AI assistant.' }
+          : m)
+      )
+      return
+    }
+
+    try {
+      const reply = await fetchAiReply(
+        token,
+        userMsg.content,
+        userMsg.chips ?? [],
+        historySnapshot,
+      )
+      setMessages(prev =>
+        prev.map(m => m.content === '__thinking__' ? { role: 'assistant', content: reply } : m)
+      )
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Connection error — please try again.'
+      setMessages(prev =>
+        prev.map(m => m.content === '__thinking__' ? { role: 'assistant', content: msg } : m)
+      )
+    }
+    scrollToBottom()
+  }, [message, chips, messages, session, scrollToBottom])
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
   }
 
   // ── File attach ─────────────────────────────────────────────────────────────
-  const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
-    const msg: Message = { role: 'user', content: '', file: file.name }
-    setMessages(prev => [...prev, msg])
+    const token = session?.access_token
+    const fileMsg: Message = { role: 'user', content: '', file: file.name }
+
+    setMessages(prev => [...prev, fileMsg, { role: 'assistant', content: '__thinking__' }])
     scrollToBottom()
-    setTimeout(() => {
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: `File "${file.name}" received. I'll include it in context when the P2 engine goes live.`,
-      }])
-      scrollToBottom()
-    }, 900)
     e.target.value = ''
+
+    if (!token) {
+      setMessages(prev =>
+        prev.map(m => m.content === '__thinking__'
+          ? { role: 'assistant', content: 'Sign in to use the AI assistant.' }
+          : m)
+      )
+      return
+    }
+
+    try {
+      const reply = await fetchAiReply(token, `[File: ${file.name}]`, [], messages)
+      setMessages(prev =>
+        prev.map(m => m.content === '__thinking__' ? { role: 'assistant', content: reply } : m)
+      )
+    } catch {
+      setMessages(prev =>
+        prev.map(m => m.content === '__thinking__'
+          ? { role: 'assistant', content: `File "${file.name}" noted. Unable to reach the AI — please try again.` }
+          : m)
+      )
+    }
+    scrollToBottom()
   }
 
   // ── Link inject ─────────────────────────────────────────────────────────────
