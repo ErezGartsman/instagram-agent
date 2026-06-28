@@ -2627,13 +2627,27 @@ def cockpit_analytics_sla(user: dict = Depends(require_cockpit_user)):
 
 # ── Cockpit AI Chat — NLP brain for the GlowingAiAssistant ──────────────────
 #
-# Bridges the existing Gemini seam (_call_llm / gemini-2.5-flash) with live
-# cockpit data. Context chips from the frontend are parsed into SQL queries so
-# the LLM has real, grounded data — not hallucinated numbers.
-#
 # POST /api/cockpit/ai/chat
 #   { message, chips: string[], history: [{role, content}] }
-#   → { status: "success"|"error", reply: string }
+#   → { status, reply, intent, context_data, actions }
+#
+# intent + context_data drive the frontend Generative UI widget renderer.
+# actions are template-based follow-up chips (never LLM-generated — too unreliable).
+
+_AI_ACTIONS: dict[str, list[str]] = {
+    "sla_lead_breach": ["Draft WhatsApp follow-up",  "View in Work Queue", "Show pipeline overview"],
+    "sla_lead_warn":   ["Draft check-in message",     "View in Work Queue", "Show velocity"],
+    "sla_lead_ok":     ["View lead profile",           "Show pipeline overview", "Analyse funnel"],
+    "sla_lead":        ["View in Work Queue",          "Show pipeline overview", "Draft message"],
+    "funnel":          ["Show velocity analysis",      "Filter to last 30 days", "Top drop-off stage"],
+    "growth":          ["Show top posts",              "Compare to lead pipeline", "Filter to 90 days"],
+    "post":            ["Analyse top performers",      "Show all top posts", "Engagement trend"],
+    "community":       ["Growth trend",                "Top posts by engagement", "Show lead pipeline"],
+    "velocity":        ["Show funnel overview",        "Compare all stages", "Identify bottleneck"],
+    "pipeline":        ["SLA health check",            "Show velocity", "View all open leads"],
+    "general":         ["SLA dashboard",               "Pipeline overview", "Community metrics"],
+}
+
 
 class _AiChatBody(BaseModel):
     message: str = ""
@@ -2660,6 +2674,8 @@ def cockpit_ai_chat(
         return {"status": "error", "reply": "Please enter a question."}
 
     context_blocks: list[str] = []
+    primary_intent  = "general"
+    ctx_data: dict | None = None   # structured data for the frontend widget
 
     # ── Pull live data for each context chip ──────────────────────────────────
     try:
@@ -2691,6 +2707,17 @@ def cockpit_ai_chat(
                                 f"|  SLA target: {row[3]}h  |  Warn at: {row[4]}h  "
                                 f"|  Status: {row[5].upper()}"
                             )
+                            if primary_intent == "general":
+                                primary_intent = f"sla_lead_{row[5]}"   # e.g. sla_lead_breach
+                                ctx_data = {
+                                    "type": "sla_lead",
+                                    "name": row[0],
+                                    "stage": row[1],
+                                    "hours_in_stage": float(row[2]) if row[2] is not None else 0,
+                                    "target_hours": row[3],
+                                    "warn_hours":   row[4],
+                                    "sla_status":   row[5],
+                                }
                         else:
                             context_blocks.append(
                                 f"LEAD CONTEXT: {chip}  (no matching record found — "
@@ -2706,13 +2733,15 @@ def cockpit_ai_chat(
                             "GROUP BY 1 ORDER BY 1 DESC LIMIT 8"
                         )
                         rows = cur.fetchall()
-                        lines = []
-                        for wk, n in reversed(rows):
-                            lines.append(f"  {wk}: +{n} new followers")
+                        weekly = [{"week": wk, "new_followers": n} for wk, n in reversed(rows)]
+                        lines = [f"  {r['week']}: +{r['new_followers']} new followers" for r in weekly]
                         context_blocks.append(
                             f"FOLLOWER GROWTH (community total: {community_size:,}):\n" +
                             ("\n".join(lines) if lines else "  No weekly data available")
                         )
+                        if primary_intent == "general":
+                            primary_intent = "growth"
+                            ctx_data = {"type": "growth", "community_size": community_size, "weekly": weekly}
 
                     # Funnel / conversion analysis
                     elif "funnel" in chip_l or ("conversion" in chip_l and "pipeline" in chip_l):
@@ -2742,9 +2771,27 @@ def cockpit_ai_chat(
                             "\n".join(lines) +
                             f"\n\n  CURRENT OPEN LEADS: {open_str}"
                         )
+                        if primary_intent == "general":
+                            primary_intent = "funnel"
+                            # Build a stage list aligned to the pipeline order
+                            pipeline_order = ["engaged", "qualified", "captured", "briefed", "booked"]
+                            stages_widget = []
+                            for sn in pipeline_order:
+                                pair = next((r for r in fm_rows if r[0] == sn), None)
+                                stages_widget.append({
+                                    "stage":    sn,
+                                    "count":    stage_counts.get(sn, 0),
+                                    "conv_pct": float(pair[3]) if pair and pair[3] is not None else None,
+                                })
+                            ctx_data = {
+                                "type":        "funnel",
+                                "total_leads": total_leads,
+                                "stages":      stages_widget,
+                            }
 
                     # Stage-specific pipeline (e.g. "Qualified pipeline — 5 leads")
                     elif "pipeline" in chip_l:
+                        matched_stage = None
                         for sn in ("engaged", "qualified", "captured", "briefed", "booked"):
                             if sn in chip_l:
                                 cur.execute(
@@ -2755,11 +2802,18 @@ def cockpit_ai_chat(
                                 )
                                 row = cur.fetchone()
                                 avg_h = f"  |  avg {row[1]}h in stage" if row[1] else ""
-                                context_blocks.append(
-                                    f"STAGE '{sn.upper()}': {row[0]} open leads{avg_h}"
-                                )
+                                context_blocks.append(f"STAGE '{sn.upper()}': {row[0]} open leads{avg_h}")
+                                matched_stage = sn
+                                if primary_intent == "general":
+                                    primary_intent = "pipeline"
+                                    ctx_data = {
+                                        "type": "pipeline",
+                                        "stage": sn,
+                                        "count": row[0],
+                                        "avg_hours": float(row[1]) if row[1] is not None else None,
+                                    }
                                 break
-                        else:
+                        if not matched_stage:
                             context_blocks.append(f"PIPELINE CONTEXT: {chip}")
 
                     # Velocity analysis
@@ -2779,6 +2833,15 @@ def cockpit_ai_chat(
                                         f"  Avg time before advancing: {row[0]}h\n"
                                         f"  Median: {row[1]}h  |  Conversion: {row[2]}%"
                                     )
+                                    if primary_intent == "general":
+                                        primary_intent = "velocity"
+                                        ctx_data = {
+                                            "type":       "velocity",
+                                            "stage":      sn,
+                                            "avg_hours":  float(row[0]),
+                                            "median_hours": float(row[1]) if row[1] is not None else None,
+                                            "conv_pct":   float(row[2]) if row[2] is not None else None,
+                                        }
                                 else:
                                     context_blocks.append(
                                         f"VELOCITY — {sn.upper()}: no data yet "
@@ -2786,21 +2849,19 @@ def cockpit_ai_chat(
                                     )
                                 break
                         else:
-                            # All-stage velocity summary
                             cur.execute(
                                 "SELECT from_stage, avg_hours_in_stage, conversion_pct "
                                 "FROM funnel_metrics WHERE avg_hours_in_stage IS NOT NULL "
                                 "ORDER BY from_stage"
                             )
                             rows = cur.fetchall()
-                            lines = [
-                                f"  {r[0]}: avg {r[1]}h, {r[2]}% conversion"
-                                for r in rows
-                            ]
+                            lines = [f"  {r[0]}: avg {r[1]}h, {r[2]}% conversion" for r in rows]
                             context_blocks.append(
                                 "STAGE VELOCITY (all stages):\n" +
                                 ("\n".join(lines) if lines else "  No velocity data yet")
                             )
+                            if primary_intent == "general":
+                                primary_intent = "velocity"
 
                     # Community / reach / conversation
                     elif any(kw in chip_l for kw in ("community", "reach", "conversation",
@@ -2819,29 +2880,32 @@ def cockpit_ai_chat(
                             f"  Total comments:       {total_comments:,}\n"
                             f"  Total posts tracked:  {total_posts:,}"
                         )
+                        if primary_intent == "general":
+                            primary_intent = "community"
+                            ctx_data = {
+                                "type": "community",
+                                "community_size": community_size,
+                                "total_likes":    total_likes,
+                                "total_comments": total_comments,
+                                "total_posts":    total_posts,
+                            }
 
                     # Post engagement (chip contains a shortcode)
                     elif "post" in chip_l:
-                        # Extract the shortcode token (uppercase alphanumeric, >6 chars)
                         shortcode = next(
                             (t.strip("·!,.") for t in chip.split()
                              if len(t) > 6 and t[0].isupper() and t.replace("-","").isalnum()),
                             None
                         )
                         if shortcode:
-                            cur.execute(
-                                "SELECT COUNT(*) FROM likers WHERE post_shortcode = %s",
-                                (shortcode,),
-                            )
+                            cur.execute("SELECT COUNT(*) FROM likers WHERE post_shortcode = %s", (shortcode,))
                             lk = cur.fetchone()[0]
-                            cur.execute(
-                                "SELECT COUNT(*) FROM comments WHERE post_shortcode = %s",
-                                (shortcode,),
-                            )
+                            cur.execute("SELECT COUNT(*) FROM comments WHERE post_shortcode = %s", (shortcode,))
                             cm = cur.fetchone()[0]
-                            context_blocks.append(
-                                f"POST {shortcode}: {lk:,} likes, {cm:,} comments"
-                            )
+                            context_blocks.append(f"POST {shortcode}: {lk:,} likes, {cm:,} comments")
+                            if primary_intent == "general":
+                                primary_intent = "post"
+                                ctx_data = {"type": "post", "shortcode": shortcode, "likes": lk, "comments": cm}
                         else:
                             context_blocks.append(f"POST CONTEXT: {chip}")
 
@@ -2856,7 +2920,7 @@ def cockpit_ai_chat(
                         open_b = cur.fetchone()[0]
                         context_blocks.append(
                             f"BOOKINGS: {total_b} total all-time  "
-                            f"|  {open_b} currently in 'Booked' stage (confirmed, pending session)"
+                            f"|  {open_b} currently in 'Booked' stage"
                         )
 
                     else:
@@ -2904,23 +2968,43 @@ def cockpit_ai_chat(
                 f"msg_len={len(msg)}")
 
     # ── Call Gemini ───────────────────────────────────────────────────────────
+    # Resolve action list: try specific intent variant (e.g. sla_lead_breach),
+    # then base intent (e.g. sla_lead), then general fallback.
+    actions = (
+        _AI_ACTIONS.get(primary_intent)
+        or _AI_ACTIONS.get(primary_intent.rsplit("_", 1)[0])
+        or _AI_ACTIONS["general"]
+    )
+
     try:
         reply = _call_llm(full_prompt)
-        return {"status": "success", "reply": reply}
+        return {
+            "status":       "success",
+            "reply":        reply,
+            "intent":       primary_intent,
+            "context_data": ctx_data,
+            "actions":      actions,
+        }
     except TimeoutError:
         return {
             "status": "error",
-            "reply": "The AI took too long to respond — please try again in a moment.",
+            "reply":  "The AI took too long to respond — please try again in a moment.",
+            "intent": "general", "context_data": None, "actions": _AI_ACTIONS["general"],
         }
     except Exception as llm_err:
         err_s = str(llm_err).lower()
         if "429" in err_s or "quota" in err_s or "resource_exhausted" in err_s:
             return {
                 "status": "error",
-                "reply": "The AI is temporarily busy — please wait ~30 seconds and retry.",
+                "reply":  "The AI is temporarily busy — please wait ~30 seconds and retry.",
+                "intent": "general", "context_data": None, "actions": _AI_ACTIONS["general"],
             }
         logger.error(f"[cockpit/ai/chat] LLM error: {llm_err}", exc_info=True)
-        return {"status": "error", "reply": "Something went wrong. Please try again."}
+        return {
+            "status": "error",
+            "reply":  "Something went wrong. Please try again.",
+            "intent": "general", "context_data": None, "actions": _AI_ACTIONS["general"],
+        }
 
 
 # ── Content Studio (Sprint 5, the Studio pillar) — the cockpit's first write

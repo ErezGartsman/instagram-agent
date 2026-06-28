@@ -23,11 +23,16 @@ import { useAuth } from '../auth/AuthProvider'
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
 // ── Types ──────────────────────────────────────────────────────────────────────
+type ContextData = Record<string, unknown> | null
+
 type Message = {
-  role: 'user' | 'assistant'
-  content: string
-  chips?: string[]   // context chips attached at send time
-  file?: string      // filename if the message is a file attachment
+  role:         'user' | 'assistant'
+  content:      string
+  chips?:       string[]     // context chips attached at send time
+  file?:        string       // filename if the message is a file attachment
+  intent?:      string       // backend-signalled widget type
+  context_data?: ContextData  // structured DB data for the widget
+  actions?:     string[]     // suggested follow-up chips
 }
 
 // ── Context bridge (window-event based, zero prop drilling) ────────────────────
@@ -63,17 +68,210 @@ function ContextChip({ label, onRemove }: { label: string; onRemove: () => void 
   )
 }
 
+// ── ReplyText — strips raw Markdown into clean semantic spans ─────────────────
+// Handles **bold**, *italic*, and bare line-breaks without any library.
+function ReplyText({ text }: { text: string }) {
+  const lines = text.split('\n')
+  return (
+    <div className="space-y-1">
+      {lines.map((line, li) => {
+        if (!line.trim()) return <div key={li} className="h-2" />
+        // Segment each line by **bold** spans
+        const parts: { t: string; bold: boolean }[] = []
+        let remaining = line
+        while (remaining) {
+          const idx = remaining.indexOf('**')
+          if (idx === -1) { parts.push({ t: remaining, bold: false }); break }
+          if (idx > 0)     parts.push({ t: remaining.slice(0, idx), bold: false })
+          const end = remaining.indexOf('**', idx + 2)
+          if (end === -1) { parts.push({ t: remaining.slice(idx), bold: false }); break }
+          parts.push({ t: remaining.slice(idx + 2, end), bold: true })
+          remaining = remaining.slice(end + 2)
+        }
+        return (
+          <p key={li} className="leading-relaxed">
+            {parts.map((p, pi) =>
+              p.bold
+                ? <strong key={pi} className="font-semibold text-ink">{p.t}</strong>
+                : <span key={pi}>{p.t}</span>
+            )}
+          </p>
+        )
+      })}
+    </div>
+  )
+}
+
+// ── Generative UI widgets ─────────────────────────────────────────────────────
+
+function SlaWidget({ data }: { data: ContextData }) {
+  if (!data) return null
+  const d = data as { name: string; stage: string; hours_in_stage: number; target_hours: number; warn_hours: number; sla_status: string }
+  const pct   = Math.min((d.hours_in_stage / (d.target_hours || 1)) * 100, 100)
+  const isBreached = d.sla_status === 'breach'
+  const isWarn     = d.sla_status === 'warn'
+  const statusColor = isBreached ? 'text-danger' : isWarn ? 'text-warn' : 'text-success'
+  const barColor    = isBreached ? 'var(--color-danger)' : isWarn ? 'var(--color-warn)' : 'var(--color-success)'
+  return (
+    <div className="mt-2.5 rounded-control border border-line p-3"
+      style={{ background: 'color-mix(in srgb, var(--color-bg) 80%, transparent)' }}>
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-mono text-[11px] font-semibold text-ink">{d.name}</span>
+        <span className={`rounded-full px-2 py-0.5 font-mono text-[8px] uppercase tracking-wider ${statusColor}`}
+          style={{ background: `color-mix(in srgb, ${barColor} 12%, transparent)`, border: `1px solid color-mix(in srgb, ${barColor} 25%, transparent)` }}>
+          {d.sla_status}
+        </span>
+      </div>
+      <div className="mt-1.5 flex items-center gap-2">
+        <span className="font-mono text-[9px] text-muted w-14 shrink-0">{d.stage}</span>
+        <div className="flex-1 h-1.5 rounded-full bg-raised overflow-hidden">
+          <div className="h-full rounded-full transition-[width] duration-700"
+            style={{ width: `${pct}%`, background: barColor }} />
+        </div>
+        <span className={`font-mono text-[9px] tabular-nums shrink-0 ${statusColor}`}>
+          {d.hours_in_stage}h / {d.target_hours}h
+        </span>
+      </div>
+    </div>
+  )
+}
+
+function FunnelWidget({ data }: { data: ContextData }) {
+  if (!data) return null
+  const d = data as { total_leads: number; stages: { stage: string; count: number; conv_pct: number | null }[] }
+  const maxCount = Math.max(...d.stages.map(s => s.count), 1)
+  const LABELS: Record<string, string> = {
+    engaged: 'Engaged', qualified: 'Qualified', captured: 'Captured',
+    briefed: 'Briefed', booked: 'Booked',
+  }
+  return (
+    <div className="mt-2.5 rounded-control border border-line p-3 space-y-1.5"
+      style={{ background: 'color-mix(in srgb, var(--color-bg) 80%, transparent)' }}>
+      <div className="mb-2 font-mono text-[9px] text-faint">{d.total_leads} total leads</div>
+      {d.stages.map(s => (
+        <div key={s.stage} className="flex items-center gap-2">
+          <span className="w-14 shrink-0 font-mono text-[9px] text-muted">{LABELS[s.stage] ?? s.stage}</span>
+          <div className="flex-1 h-1.5 rounded-full bg-raised overflow-hidden">
+            <div className="h-full rounded-full"
+              style={{ width: `${(s.count / maxCount) * 100}%`, background: 'var(--color-accent)', opacity: 0.85 }} />
+          </div>
+          <span className="w-5 shrink-0 font-mono text-[9px] tabular-nums text-ink text-right">{s.count}</span>
+          <span className={`w-10 shrink-0 font-mono text-[9px] tabular-nums text-right ${
+            s.conv_pct === null ? 'text-faint'
+            : s.conv_pct >= 60 ? 'text-success'
+            : s.conv_pct >= 30 ? 'text-warn'
+            : 'text-danger'
+          }`}>{s.conv_pct !== null ? `${s.conv_pct}%→` : ''}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function VelocityWidget({ data }: { data: ContextData }) {
+  if (!data) return null
+  const d = data as { stage: string; avg_hours: number; median_hours: number | null; conv_pct: number | null }
+  const fmt = (h: number | null) => {
+    if (h === null) return '—'
+    if (h < 1)  return '<1h'
+    if (h < 24) return `${Math.round(h)}h`
+    const days = Math.floor(h / 24), hrs = Math.round(h % 24)
+    return hrs > 0 ? `${days}d ${hrs}h` : `${days}d`
+  }
+  return (
+    <div className="mt-2.5 flex gap-2 rounded-control border border-line p-3"
+      style={{ background: 'color-mix(in srgb, var(--color-bg) 80%, transparent)' }}>
+      {[
+        { label: 'Avg time', value: fmt(d.avg_hours) },
+        { label: 'Median',   value: fmt(d.median_hours) },
+        { label: 'Conv. rate', value: d.conv_pct !== null ? `${d.conv_pct}%` : '—' },
+      ].map(m => (
+        <div key={m.label} className="flex-1 rounded border border-line/50 p-2 text-center">
+          <div className="font-mono text-base tabular-nums text-ink">{m.value}</div>
+          <div className="mt-0.5 font-mono text-[8px] text-faint">{m.label}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function PostWidget({ data }: { data: ContextData }) {
+  if (!data) return null
+  const d = data as { shortcode: string; likes: number; comments: number }
+  const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+  return (
+    <div className="mt-2.5 flex items-center gap-3 rounded-control border border-line px-3 py-2.5"
+      style={{ background: 'color-mix(in srgb, var(--color-bg) 80%, transparent)' }}>
+      <span className="font-mono text-[11px] text-muted flex-1 truncate">{d.shortcode}</span>
+      <span className="font-mono text-[11px] tabular-nums text-accent">{fmt(d.likes)} ♥</span>
+      <span className="font-mono text-[11px] tabular-nums text-faint">{fmt(d.comments)} ✦</span>
+      <a href={`https://instagram.com/p/${d.shortcode}`} target="_blank" rel="noreferrer"
+        className="font-mono text-[9px] text-glow/70 hover:text-glow transition-colors">
+        View ↗
+      </a>
+    </div>
+  )
+}
+
+function CommunityWidget({ data }: { data: ContextData }) {
+  if (!data) return null
+  const d = data as { community_size: number; total_likes: number; total_comments: number; total_posts: number }
+  const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+  const stats = [
+    { label: 'Community', value: fmt(d.community_size) },
+    { label: 'Likes',     value: fmt(d.total_likes) },
+    { label: 'Comments',  value: fmt(d.total_comments) },
+    { label: 'Posts',     value: fmt(d.total_posts) },
+  ]
+  return (
+    <div className="mt-2.5 grid grid-cols-4 gap-1.5 rounded-control border border-line p-2.5"
+      style={{ background: 'color-mix(in srgb, var(--color-bg) 80%, transparent)' }}>
+      {stats.map(s => (
+        <div key={s.label} className="rounded border border-line/50 p-1.5 text-center">
+          <div className="font-mono text-sm tabular-nums text-ink">{s.value}</div>
+          <div className="mt-0.5 font-mono text-[8px] text-faint">{s.label}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function WidgetRenderer({ intent, data }: { intent?: string; data: ContextData }) {
+  if (!intent || !data) return null
+  if (intent.startsWith('sla_lead'))    return <SlaWidget data={data} />
+  if (intent === 'funnel')              return <FunnelWidget data={data} />
+  if (intent === 'velocity')            return <VelocityWidget data={data} />
+  if (intent === 'post')                return <PostWidget data={data} />
+  if (intent === 'community')           return <CommunityWidget data={data} />
+  return null
+}
+
+// ── Action chips — pre-filled follow-up queries ───────────────────────────────
+function ActionChips({ actions, onAction }: { actions: string[]; onAction: (a: string) => void }) {
+  if (!actions.length) return null
+  return (
+    <div className="mt-2.5 flex flex-wrap gap-1.5">
+      {actions.map(a => (
+        <button key={a} type="button" onClick={() => onAction(a)}
+          className="rounded-full border border-glow/20 px-2.5 py-1 font-mono text-[9px] text-glow/70 transition-all hover:border-glow/40 hover:text-glow hover:scale-[1.02] active:scale-95"
+          style={{ background: 'color-mix(in srgb, var(--color-accent) 6%, transparent)' }}>
+          {a}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 // ── Message bubble ─────────────────────────────────────────────────────────────
-function Bubble({ msg }: { msg: Message }) {
-  // Typing indicator — shown while waiting for the backend
+function Bubble({ msg, onAction }: { msg: Message; onAction: (a: string) => void }) {
+  // Typing indicator
   if (msg.role === 'assistant' && msg.content === '__thinking__') {
     return (
       <div className="flex justify-start">
         <div className="flex items-center gap-2 rounded-2xl rounded-bl-sm border border-glow/15 bg-raised px-3.5 py-3">
           <span className="font-mono text-[9px] leading-none text-glow">✦</span>
           {[0, 1, 2].map(i => (
-            <div
-              key={i}
+            <div key={i}
               className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted"
               style={{ animationDelay: `${i * 0.15}s` }}
             />
@@ -83,6 +281,7 @@ function Bubble({ msg }: { msg: Message }) {
     )
   }
 
+  // User bubble
   if (msg.role === 'user') {
     return (
       <div className="flex justify-end">
@@ -96,20 +295,29 @@ function Bubble({ msg }: { msg: Message }) {
               <Paperclip className="h-3.5 w-3.5 shrink-0 opacity-70" />
               <span className="font-mono text-[11px]">{msg.file}</span>
             </div>
-          ) : msg.content}
+          ) : <ReplyText text={msg.content} />}
         </div>
       </div>
     )
   }
 
+  // Assistant bubble — full Generative UI
   return (
     <div className="flex justify-start">
-      <div className="max-w-[88%] rounded-2xl rounded-bl-sm border border-glow/15 bg-raised px-3.5 py-2.5 text-sm text-ink">
-        <div className="mb-1.5 flex items-center gap-1.5">
+      <div className="max-w-[92%] rounded-2xl rounded-bl-sm border border-glow/15 bg-raised px-3.5 py-2.5 text-sm text-ink">
+        {/* Header */}
+        <div className="mb-2 flex items-center gap-1.5">
           <span className="text-[9px] leading-none text-glow">✦</span>
           <span className="font-mono text-[8px] uppercase tracking-wider text-glow">Nexus</span>
         </div>
-        {msg.content}
+        {/* Formatted prose */}
+        <ReplyText text={msg.content} />
+        {/* Generative widget (intent-driven) */}
+        <WidgetRenderer intent={msg.intent} data={msg.context_data ?? null} />
+        {/* Suggested follow-up action chips */}
+        {msg.actions && msg.actions.length > 0 && (
+          <ActionChips actions={msg.actions} onAction={onAction} />
+        )}
       </div>
     </div>
   )
@@ -135,12 +343,20 @@ function Waveform() {
 }
 
 // ── Real API call ──────────────────────────────────────────────────────────────
+type AiApiResponse = {
+  status:       string
+  reply:        string
+  intent?:      string
+  context_data?: ContextData
+  actions?:     string[]
+}
+
 async function fetchAiReply(
   token: string,
   message: string,
   chips: string[],
   history: Message[],
-): Promise<string> {
+): Promise<AiApiResponse> {
   const res = await fetch(`${API_BASE}/api/cockpit/ai/chat`, {
     method: 'POST',
     headers: {
@@ -155,12 +371,12 @@ async function fetchAiReply(
         .slice(-6)
         .map(m => ({ role: m.role, content: m.file ? `[File: ${m.file}]` : m.content })),
     }),
-    signal: AbortSignal.timeout(35_000),  // matches backend LLM timeout + buffer
+    signal: AbortSignal.timeout(35_000),
   })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  const data = await res.json() as { status: string; reply: string }
+  const data = await res.json() as AiApiResponse
   if (data.status === 'error') throw new Error(data.reply)
-  return data.reply
+  return data
 }
 
 const MAX_CHARS = 2000
@@ -261,19 +477,16 @@ export function GlowingAiAssistant() {
     }
 
     try {
-      const reply = await fetchAiReply(
-        token,
-        userMsg.content,
-        userMsg.chips ?? [],
-        historySnapshot,
-      )
-      setMessages(prev =>
-        prev.map(m => m.content === '__thinking__' ? { role: 'assistant', content: reply } : m)
-      )
+      const res = await fetchAiReply(token, userMsg.content, userMsg.chips ?? [], historySnapshot)
+      setMessages(prev => prev.map(m =>
+        m.content === '__thinking__'
+          ? { role: 'assistant', content: res.reply, intent: res.intent, context_data: res.context_data, actions: res.actions }
+          : m
+      ))
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Connection error — please try again.'
+      const errMsg = err instanceof Error ? err.message : 'Connection error — please try again.'
       setMessages(prev =>
-        prev.map(m => m.content === '__thinking__' ? { role: 'assistant', content: msg } : m)
+        prev.map(m => m.content === '__thinking__' ? { role: 'assistant', content: errMsg } : m)
       )
     }
     scrollToBottom()
@@ -304,9 +517,11 @@ export function GlowingAiAssistant() {
     }
 
     try {
-      const reply = await fetchAiReply(token, `[File: ${file.name}]`, [], messages)
+      const res = await fetchAiReply(token, `[File: ${file.name}]`, [], messages)
       setMessages(prev =>
-        prev.map(m => m.content === '__thinking__' ? { role: 'assistant', content: reply } : m)
+        prev.map(m => m.content === '__thinking__'
+          ? { role: 'assistant', content: res.reply, intent: res.intent, context_data: res.context_data, actions: res.actions }
+          : m)
       )
     } catch {
       setMessages(prev =>
@@ -364,6 +579,13 @@ export function GlowingAiAssistant() {
 
   const fmtTime = (s: number) =>
     `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
+
+  // Action chip handler — pre-fills the textarea and auto-sends
+  const handleAction = useCallback((action: string) => {
+    setMessage(action)
+    setOpen(true)
+    setTimeout(() => textareaRef.current?.focus(), 100)
+  }, [])
 
   const canSend    = (message.trim().length > 0 || chips.length > 0) && message.length <= MAX_CHARS
   const hasHistory = messages.length > 0
@@ -430,7 +652,7 @@ export function GlowingAiAssistant() {
             {hasHistory && (
               <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4" style={{ scrollbarWidth: 'none' }}>
                 <div className="flex flex-col gap-3">
-                  {messages.map((msg, i) => <Bubble key={i} msg={msg} />)}
+                  {messages.map((msg, i) => <Bubble key={i} msg={msg} onAction={handleAction} />)}
                 </div>
                 <div ref={messagesEndRef} />
               </div>
