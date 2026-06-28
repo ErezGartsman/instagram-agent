@@ -2634,6 +2634,41 @@ def cockpit_analytics_sla(user: dict = Depends(require_cockpit_user)):
 # intent + context_data drive the frontend Generative UI widget renderer.
 # actions are template-based follow-up chips (never LLM-generated — too unreliable).
 
+# Maps plain-text Action Chip strings (lowercased) → synthetic context chip labels.
+# When the user clicks a chip and sends plain text, this router adds the matching
+# chip to the list before the parser runs, so the DB query fires as expected.
+_ACTION_CHIP_MAP: dict[str, str] = {
+    # Pipeline / funnel
+    "show pipeline overview":    "Pipeline Funnel conversion analysis",
+    "pipeline overview":         "Pipeline Funnel conversion analysis",
+    "analyse funnel":            "Pipeline Funnel conversion analysis",
+    "show funnel overview":      "Pipeline Funnel conversion analysis",
+    "compare to lead pipeline":  "Pipeline Funnel conversion analysis",
+    "top drop-off stage":        "Pipeline Funnel conversion analysis",
+    "filter to last 30 days":    "Pipeline Funnel conversion analysis",
+    "view all open leads":       "Pipeline Funnel conversion analysis",
+    "show lead pipeline":        "Pipeline Funnel conversion analysis",
+    # Velocity
+    "show velocity analysis":    "Stage velocity — avg time before advancing",
+    "show velocity":             "Stage velocity — avg time before advancing",
+    "compare all stages":        "Stage velocity — avg time before advancing",
+    "identify bottleneck":       "Stage velocity — avg time before advancing",
+    # Community / growth
+    "growth trend":              "Follower Growth Trend",
+    "community metrics":         "Community reach — total post likes",
+    "engagement trend":          "Community reach — total post likes",
+    # SLA overview
+    "sla dashboard":             "SLA status overview",
+    "sla health check":          "SLA status overview",
+    "sla overview":              "SLA status overview",
+    # Top posts
+    "show top posts":            "Top Posts by likes",
+    "analyse top performers":    "Top Posts by likes",
+    "show all top posts":        "Top Posts by likes",
+    "top posts by engagement":   "Top Posts by likes",
+    "top content":               "Top Posts by likes",
+}
+
 _AI_ACTIONS: dict[str, list[str]] = {
     "sla_lead_breach": ["Draft WhatsApp follow-up",  "View in Work Queue", "Show pipeline overview"],
     "sla_lead_warn":   ["Draft check-in message",     "View in Work Queue", "Show velocity"],
@@ -2646,6 +2681,8 @@ _AI_ACTIONS: dict[str, list[str]] = {
     "velocity":        ["Show funnel overview",        "Compare all stages", "Identify bottleneck"],
     "pipeline":        ["SLA health check",            "Show velocity", "View all open leads"],
     "general":         ["SLA dashboard",               "Pipeline overview", "Community metrics"],
+    "sla_overview":    ["Show pipeline overview",      "Community metrics",  "Show velocity analysis"],
+    "top_posts":       ["Show pipeline overview",      "Community metrics",  "Growth trend"],
 }
 
 
@@ -2673,6 +2710,14 @@ def cockpit_ai_chat(
     if not msg and not chips:
         return {"status": "error", "reply": "Please enter a question."}
 
+    # ── Action Chip Router ────────────────────────────────────────────────────
+    # When the user clicks a follow-up action chip, the message arrives as plain
+    # text with no chips[] array.  Map it to a synthetic chip so the DB query
+    # fires exactly as if the user had injected a context tag.
+    routed_chip = _ACTION_CHIP_MAP.get(msg.lower())
+    if routed_chip and routed_chip not in chips:
+        chips = [routed_chip] + chips
+
     context_blocks: list[str] = []
     primary_intent  = "general"
     ctx_data: dict | None = None   # structured data for the frontend widget
@@ -2684,45 +2729,94 @@ def cockpit_ai_chat(
                 for chip in chips:
                     chip_l = chip.lower()
 
-                    # SLA breach / at risk: pull the individual lead's live record
+                    # SLA branch: person-specific (has ·) or global overview
                     if "sla" in chip_l or "breach" in chip_l or "at risk" in chip_l:
-                        frag = chip.split("·")[-1].strip() if "·" in chip else chip
-                        frag_l = frag.lower()
-                        cur.execute(
-                            "SELECT COALESCE(s.person_name,'Lead '||p.wa_ref_code,'Lead') AS name,"
-                            "       s.stage, s.hours_in_stage, s.target_hours, "
-                            "       s.warn_hours, s.sla_status "
-                            "FROM lead_sla_status s "
-                            "JOIN person p ON p.id = s.person_id "
-                            "WHERE lower(COALESCE(s.person_name,'')) LIKE %s "
-                            "   OR lower(COALESCE(p.wa_ref_code,'')) LIKE %s "
-                            "LIMIT 1",
-                            (f"%{frag_l}%", f"%{frag_l}%"),
+                        # Detect if a specific person name is embedded (after ·)
+                        has_person = "·" in chip
+                        frag = chip.split("·")[-1].strip() if has_person else ""
+                        is_generic = not frag or any(
+                            kw in frag.lower()
+                            for kw in ("overview", "dashboard", "status", "health", "check")
                         )
-                        row = cur.fetchone()
-                        if row:
+
+                        if is_generic:
+                            # ── Global SLA overview ──────────────────────────
+                            cur.execute(
+                                "SELECT sla_status, COUNT(*) FROM lead_sla_status GROUP BY sla_status"
+                            )
+                            counts = {r[0]: r[1] for r in cur.fetchall()}
+                            cur.execute(
+                                "SELECT COALESCE(s.person_name,'Lead '||p.wa_ref_code,'Lead'),"
+                                "       s.stage, s.hours_in_stage, s.target_hours, s.sla_status "
+                                "FROM lead_sla_status s "
+                                "JOIN person p ON p.id = s.person_id "
+                                "ORDER BY "
+                                "  CASE s.sla_status WHEN 'breach' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END,"
+                                "  s.hours_in_stage DESC NULLS LAST "
+                                "LIMIT 5"
+                            )
+                            top = cur.fetchall()
+                            top_lines = [
+                                f"  {r[0]}: {r[1]} · {r[2]}h/{r[3]}h · {r[4].upper()}"
+                                for r in top
+                            ]
                             context_blocks.append(
-                                f"LEAD — {row[0]}:\n"
-                                f"  Stage: {row[1]}  |  Hours in stage: {row[2]}h  "
-                                f"|  SLA target: {row[3]}h  |  Warn at: {row[4]}h  "
-                                f"|  Status: {row[5].upper()}"
+                                f"SLA OVERVIEW:\n"
+                                f"  Breached: {counts.get('breach',0)}  "
+                                f"At risk: {counts.get('warn',0)}  "
+                                f"On track: {counts.get('ok',0)}\n"
+                                f"TOP LEADS BY URGENCY:\n" + "\n".join(top_lines)
                             )
                             if primary_intent == "general":
-                                primary_intent = f"sla_lead_{row[5]}"   # e.g. sla_lead_breach
+                                primary_intent = "sla_overview"
                                 ctx_data = {
-                                    "type": "sla_lead",
-                                    "name": row[0],
-                                    "stage": row[1],
-                                    "hours_in_stage": float(row[2]) if row[2] is not None else 0,
-                                    "target_hours": row[3],
-                                    "warn_hours":   row[4],
-                                    "sla_status":   row[5],
+                                    "type": "sla_overview",
+                                    "counts": dict(counts),
+                                    "top_leads": [
+                                        {
+                                            "name": r[0], "stage": r[1],
+                                            "hours_in_stage": float(r[2]) if r[2] is not None else 0,
+                                            "target_hours": r[3], "sla_status": r[4],
+                                        }
+                                        for r in top
+                                    ],
                                 }
                         else:
-                            context_blocks.append(
-                                f"LEAD CONTEXT: {chip}  (no matching record found — "
-                                f"the person may be closed/snoozed)"
+                            # ── Person-specific SLA lookup ───────────────────
+                            frag_l = frag.lower()
+                            cur.execute(
+                                "SELECT COALESCE(s.person_name,'Lead '||p.wa_ref_code,'Lead') AS name,"
+                                "       s.stage, s.hours_in_stage, s.target_hours, "
+                                "       s.warn_hours, s.sla_status "
+                                "FROM lead_sla_status s "
+                                "JOIN person p ON p.id = s.person_id "
+                                "WHERE lower(COALESCE(s.person_name,'')) LIKE %s "
+                                "   OR lower(COALESCE(p.wa_ref_code,'')) LIKE %s "
+                                "LIMIT 1",
+                                (f"%{frag_l}%", f"%{frag_l}%"),
                             )
+                            row = cur.fetchone()
+                            if row:
+                                context_blocks.append(
+                                    f"LEAD — {row[0]}:\n"
+                                    f"  Stage: {row[1]}  |  Hours in stage: {row[2]}h  "
+                                    f"|  SLA target: {row[3]}h  |  Warn at: {row[4]}h  "
+                                    f"|  Status: {row[5].upper()}"
+                                )
+                                if primary_intent == "general":
+                                    primary_intent = f"sla_lead_{row[5]}"
+                                    ctx_data = {
+                                        "type": "sla_lead",
+                                        "name": row[0], "stage": row[1],
+                                        "hours_in_stage": float(row[2]) if row[2] is not None else 0,
+                                        "target_hours": row[3], "warn_hours": row[4],
+                                        "sla_status": row[5],
+                                    }
+                            else:
+                                context_blocks.append(
+                                    f"LEAD CONTEXT: {chip}  (no matching record — "
+                                    f"the person may be closed/snoozed)"
+                                )
 
                     # Follower growth / community growth
                     elif "follower growth" in chip_l or "growth trend" in chip_l:
@@ -2890,7 +2984,7 @@ def cockpit_ai_chat(
                                 "total_posts":    total_posts,
                             }
 
-                    # Post engagement (chip contains a shortcode)
+                    # Post engagement: specific shortcode OR top-posts aggregate
                     elif "post" in chip_l:
                         shortcode = next(
                             (t.strip("·!,.") for t in chip.split()
@@ -2907,7 +3001,26 @@ def cockpit_ai_chat(
                                 primary_intent = "post"
                                 ctx_data = {"type": "post", "shortcode": shortcode, "likes": lk, "comments": cm}
                         else:
-                            context_blocks.append(f"POST CONTEXT: {chip}")
+                            # No shortcode → return top-posts aggregate
+                            cur.execute(
+                                "WITH lk AS (SELECT post_shortcode, COUNT(*) c FROM likers GROUP BY 1), "
+                                "     cm AS (SELECT post_shortcode, COUNT(*) c FROM comments GROUP BY 1) "
+                                "SELECT p.post_shortcode, COALESCE(lk.c,0), COALESCE(cm.c,0) "
+                                "FROM posts p "
+                                "LEFT JOIN lk ON lk.post_shortcode = p.post_shortcode "
+                                "LEFT JOIN cm ON cm.post_shortcode = p.post_shortcode "
+                                "ORDER BY COALESCE(lk.c,0) DESC LIMIT 5"
+                            )
+                            top = cur.fetchall()
+                            lines = [f"  #{i+1} {r[0]}: {r[1]:,} likes, {r[2]:,} comments"
+                                     for i, r in enumerate(top)]
+                            context_blocks.append("TOP POSTS BY LIKES:\n" + "\n".join(lines))
+                            if primary_intent == "general":
+                                primary_intent = "top_posts"
+                                ctx_data = {
+                                    "type": "top_posts",
+                                    "posts": [{"shortcode": r[0], "likes": r[1], "comments": r[2]} for r in top],
+                                }
 
                     # Booked / north-star
                     elif "booked" in chip_l or "north star" in chip_l:

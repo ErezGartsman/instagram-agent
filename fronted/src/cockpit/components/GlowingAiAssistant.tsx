@@ -236,12 +236,78 @@ function CommunityWidget({ data }: { data: ContextData }) {
   )
 }
 
+function SlaOverviewWidget({ data }: { data: ContextData }) {
+  if (!data) return null
+  const d = data as {
+    counts: Record<string, number>
+    top_leads: { name: string; stage: string; hours_in_stage: number; target_hours: number; sla_status: string }[]
+  }
+  return (
+    <div className="mt-2.5 space-y-2.5 rounded-control border border-line p-3"
+      style={{ background: 'color-mix(in srgb, var(--color-bg) 80%, transparent)' }}>
+      <div className="flex gap-2">
+        {[
+          { label: 'Breached', count: d.counts['breach'] ?? 0, color: 'text-danger', bg: 'var(--color-danger)' },
+          { label: 'At risk',  count: d.counts['warn']   ?? 0, color: 'text-warn',   bg: 'var(--color-warn)' },
+          { label: 'On track', count: d.counts['ok']     ?? 0, color: 'text-success', bg: 'var(--color-success)' },
+        ].map(s => (
+          <div key={s.label}
+            className={`flex-1 rounded border border-line/50 p-2 text-center ${s.color}`}
+            style={{ background: `color-mix(in srgb, ${s.bg} 8%, transparent)` }}>
+            <div className="font-mono text-xl tabular-nums">{s.count}</div>
+            <div className="mt-0.5 font-mono text-[8px] text-faint">{s.label}</div>
+          </div>
+        ))}
+      </div>
+      {d.top_leads.slice(0, 4).map(l => {
+        const pct = Math.min((l.hours_in_stage / (l.target_hours || 1)) * 100, 100)
+        const bar = l.sla_status === 'breach' ? 'var(--color-danger)' : l.sla_status === 'warn' ? 'var(--color-warn)' : 'var(--color-success)'
+        return (
+          <div key={l.name} className="flex items-center gap-2">
+            <span className="w-24 shrink-0 truncate font-mono text-[9px] text-muted">{l.name}</span>
+            <div className="flex-1 h-1 overflow-hidden rounded-full bg-raised">
+              <div className="h-full rounded-full" style={{ width: `${pct}%`, background: bar }} />
+            </div>
+            <span className="w-14 shrink-0 text-right font-mono text-[8px] tabular-nums text-faint">
+              {l.hours_in_stage}h / {l.target_hours}h
+            </span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function TopPostsWidget({ data }: { data: ContextData }) {
+  if (!data) return null
+  const d = data as { posts: { shortcode: string; likes: number; comments: number }[] }
+  const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+  return (
+    <div className="mt-2.5 space-y-1.5 rounded-control border border-line p-3"
+      style={{ background: 'color-mix(in srgb, var(--color-bg) 80%, transparent)' }}>
+      {d.posts.map((p, i) => (
+        <div key={p.shortcode} className="flex items-center gap-2">
+          <span className="w-4 shrink-0 font-mono text-[9px] text-faint">#{i + 1}</span>
+          <a href={`https://instagram.com/p/${p.shortcode}`} target="_blank" rel="noreferrer"
+            className="flex-1 truncate font-mono text-[10px] text-muted transition-colors hover:text-ink">
+            {p.shortcode}
+          </a>
+          <span className="font-mono text-[9px] tabular-nums text-accent">{fmt(p.likes)} ♥</span>
+          <span className="font-mono text-[9px] tabular-nums text-faint">{fmt(p.comments)} ✦</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function WidgetRenderer({ intent, data }: { intent?: string; data: ContextData }) {
   if (!intent || !data) return null
   if (intent.startsWith('sla_lead'))    return <SlaWidget data={data} />
+  if (intent === 'sla_overview')        return <SlaOverviewWidget data={data} />
   if (intent === 'funnel')              return <FunnelWidget data={data} />
   if (intent === 'velocity')            return <VelocityWidget data={data} />
   if (intent === 'post')                return <PostWidget data={data} />
+  if (intent === 'top_posts')           return <TopPostsWidget data={data} />
   if (intent === 'community')           return <CommunityWidget data={data} />
   return null
 }
