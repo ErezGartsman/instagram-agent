@@ -391,13 +391,26 @@ function WhatsAppDraftCard({ state }: { state: WaDraftState }) {
   )
 }
 
+// Module-level constant — no re-creation on every render
+const WA_DRAFT_ACTIONS = new Set([
+  'Draft WhatsApp follow-up',
+  'Draft check-in message',
+  'Draft message',
+])
+
 // ── Action chips — pre-filled follow-up queries ───────────────────────────────
-function ActionChips({ actions, onAction }: { actions: string[]; onAction: (a: string) => void }) {
+// contextData flows from the owning message so WA draft chips carry person_id
+// directly through the click — no backwards history search needed.
+function ActionChips({ actions, onAction, contextData }: {
+  actions: string[]
+  onAction: (a: string, ctx?: ContextData) => void
+  contextData?: ContextData
+}) {
   if (!actions.length) return null
   return (
     <div className="mt-2.5 flex flex-wrap gap-1.5">
       {actions.map(a => (
-        <button key={a} type="button" onClick={() => onAction(a)}
+        <button key={a} type="button" onClick={() => onAction(a, contextData)}
           className="rounded-full border border-glow/20 px-2.5 py-1 font-mono text-[9px] text-glow/70 transition-all hover:border-glow/40 hover:text-glow hover:scale-[1.02] active:scale-95"
           style={{ background: 'color-mix(in srgb, var(--color-accent) 6%, transparent)' }}>
           {a}
@@ -408,7 +421,7 @@ function ActionChips({ actions, onAction }: { actions: string[]; onAction: (a: s
 }
 
 // ── Message bubble ─────────────────────────────────────────────────────────────
-function Bubble({ msg, onAction }: { msg: Message; onAction: (a: string) => void }) {
+function Bubble({ msg, onAction }: { msg: Message; onAction: (a: string, ctx?: ContextData) => void }) {
   // Typing indicator
   if (msg.role === 'assistant' && msg.content === '__thinking__') {
     return (
@@ -466,9 +479,9 @@ function Bubble({ msg, onAction }: { msg: Message; onAction: (a: string) => void
             <WidgetRenderer intent={msg.intent} data={msg.context_data ?? null} />
           </>
         )}
-        {/* Suggested follow-up action chips */}
+        {/* Action chips — context_data bound so WA draft has person_id at click time */}
         {msg.actions && msg.actions.length > 0 && (
-          <ActionChips actions={msg.actions} onAction={onAction} />
+          <ActionChips actions={msg.actions} onAction={onAction} contextData={msg.context_data} />
         )}
       </div>
     </div>
@@ -779,43 +792,32 @@ export function GlowingAiAssistant() {
   }, [session, scrollToBottom])
 
   // Action chip handler — WhatsApp draft gets special treatment; others pre-fill textarea
-  const WA_DRAFT_ACTIONS = new Set([
-    'Draft WhatsApp follow-up',
-    'Draft check-in message',
-    'Draft message',
-  ])
-
-  const handleAction = useCallback((action: string) => {
+  const handleAction = useCallback((action: string, contextData?: ContextData) => {
     // ── WhatsApp draft: NEVER fall through to the generic NLP chat ────────────
+    // person_id is passed directly from the chip's owning message ctx_data.
     if (WA_DRAFT_ACTIONS.has(action)) {
-      // Walk backwards through history to find the most recent SLA message
-      // that carries a person_id (added to ctx_data since the last deploy).
-      const slaMsg = [...messages].reverse().find(m => {
-        const cd = m.context_data as Record<string, unknown> | null
-        return cd && typeof cd.person_id === 'string' && cd.person_id.length > 0
-      })
-      const personId = (slaMsg?.context_data as Record<string, unknown> | null)
-        ?.person_id as string | undefined
+      const cd = contextData as Record<string, unknown> | null
+      const personId = typeof cd?.person_id === 'string' && cd.person_id.length > 0
+        ? cd.person_id
+        : undefined
 
       if (personId) {
         void handleWaDraft(personId)
       } else {
-        // No SLA context in history — show a clear guidance bubble instead of
-        // letting the text fall into the regular chat and confuse the LLM.
         setMessages(prev => [...prev, {
           role: 'assistant' as const,
-          content: 'To draft a WhatsApp message, first target a specific lead — click ✦ on a breach row in the Leads tab, then click "Draft WhatsApp follow-up" from the AI panel.',
+          content: 'To draft a WhatsApp message, first target a specific lead — click ✦ on a breach row in the Leads tab, then click "Draft WhatsApp follow-up".',
         }])
         scrollToBottom()
       }
-      return  // ← always return; this action must NEVER reach handleSend
+      return  // always return — never reaches handleSend
     }
 
-    // All other chips: pre-fill the textarea and focus it
+    // All other chips: pre-fill the textarea
     setMessage(action)
     setOpen(true)
     setTimeout(() => textareaRef.current?.focus(), 100)
-  }, [messages, handleWaDraft, scrollToBottom])
+  }, [handleWaDraft, scrollToBottom])
 
   const canSend    = (message.trim().length > 0 || chips.length > 0) && message.length <= MAX_CHARS
   const hasHistory = messages.length > 0
