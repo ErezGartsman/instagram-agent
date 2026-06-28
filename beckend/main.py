@@ -3223,11 +3223,15 @@ def cockpit_whatsapp_draft(
             wa_phone = pi_row[0] if pi_row else None
 
         # ── Build the draft prompt ───────────────────────────────────────────
-        # Use the same Copilot persona + rules as the stream endpoint, but
-        # override the instruction to emphasise re-engagement context.
+        # The Copilot PERSONA + DRAFTING_RULES already mandate short Hebrew text.
+        # Re-state the language requirement in the intent instruction so Gemini
+        # can't drift to English even when person data is sparse.
+        stage_label = (person.get("stage") or "unknown stage").capitalize()
         intent = (
-            "כתוב הודעת מעקב קצרה ואנושית לשיחה זו. "
-            "המטרה: להחזיר את הלקוח לשיחה ולקדם לשלב הבא."
+            f"WRITE IN HEBREW ONLY (עברית בלבד). "
+            f"הלקוח נמצא בשלב {stage_label} ולא הגיב זמן רב. "
+            f"כתוב הודעת מעקב קצרה (1-3 משפטים), אנושית ואישית. "
+            f"המטרה: להחזיר את הלקוח לשיחה ולקדם לשלב הבא."
         )
         prompt = nexus_copilot.build_draft_prompt(person, thread, intent=intent)
 

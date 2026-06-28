@@ -779,23 +779,43 @@ export function GlowingAiAssistant() {
   }, [session, scrollToBottom])
 
   // Action chip handler — WhatsApp draft gets special treatment; others pre-fill textarea
+  const WA_DRAFT_ACTIONS = new Set([
+    'Draft WhatsApp follow-up',
+    'Draft check-in message',
+    'Draft message',
+  ])
+
   const handleAction = useCallback((action: string) => {
-    if (action === 'Draft WhatsApp follow-up' || action === 'Draft check-in message' || action === 'Draft message') {
-      // Find the most recent SLA message with a person_id in ctx_data
-      const slaMsg = [...messages].reverse().find(
-        m => m.context_data && typeof m.context_data === 'object' && 'person_id' in m.context_data
-      )
-      const personId = (slaMsg?.context_data as Record<string, unknown>)?.person_id as string | undefined
+    // ── WhatsApp draft: NEVER fall through to the generic NLP chat ────────────
+    if (WA_DRAFT_ACTIONS.has(action)) {
+      // Walk backwards through history to find the most recent SLA message
+      // that carries a person_id (added to ctx_data since the last deploy).
+      const slaMsg = [...messages].reverse().find(m => {
+        const cd = m.context_data as Record<string, unknown> | null
+        return cd && typeof cd.person_id === 'string' && cd.person_id.length > 0
+      })
+      const personId = (slaMsg?.context_data as Record<string, unknown> | null)
+        ?.person_id as string | undefined
+
       if (personId) {
         void handleWaDraft(personId)
-        return
+      } else {
+        // No SLA context in history — show a clear guidance bubble instead of
+        // letting the text fall into the regular chat and confuse the LLM.
+        setMessages(prev => [...prev, {
+          role: 'assistant' as const,
+          content: 'To draft a WhatsApp message, first target a specific lead — click ✦ on a breach row in the Leads tab, then click "Draft WhatsApp follow-up" from the AI panel.',
+        }])
+        scrollToBottom()
       }
-      // No person_id found — fall through to pre-fill so user can specify
+      return  // ← always return; this action must NEVER reach handleSend
     }
+
+    // All other chips: pre-fill the textarea and focus it
     setMessage(action)
     setOpen(true)
     setTimeout(() => textareaRef.current?.focus(), 100)
-  }, [messages, handleWaDraft])
+  }, [messages, handleWaDraft, scrollToBottom])
 
   const canSend    = (message.trim().length > 0 || chips.length > 0) && message.length <= MAX_CHARS
   const hasHistory = messages.length > 0
