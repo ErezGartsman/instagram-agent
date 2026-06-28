@@ -4,7 +4,7 @@ import { ResponsiveContainer, AreaChart, Area, Tooltip, YAxis } from 'recharts'
 import { PageHeader } from '../components/PageHeader'
 import { Icon } from '../components/Icon'
 import { SurfaceLoading, SurfaceError } from '../components/SurfaceStates'
-import { ContextTarget, pushAiContext } from '../components/GlowingAiAssistant'
+import { pushAiContext } from '../components/GlowingAiAssistant'
 import { useAuth } from '../auth/AuthProvider'
 import { STAGE_LABELS } from '../lib/pipeline'
 import {
@@ -193,8 +193,11 @@ function FunnelTab({ token, days }: { token: string | null; days: Days }) {
     <div className="flex flex-col gap-6">
       {/* ── Horizontal stream funnel ─────────────────────────────────────────── */}
       <div className="rounded-card border border-line bg-surface p-5 [box-shadow:var(--shadow-card)]">
-        <div className="mb-5 font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
-          Pipeline funnel · all-time flow
+        <div className="mb-5 flex items-center">
+          <span className="font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
+            Pipeline funnel · all-time flow
+          </span>
+          <InsightBtn context="Pipeline funnel — conversion rates and drop-off between stages" />
         </div>
 
         {/* SVG stream */}
@@ -279,17 +282,33 @@ function FunnelTab({ token, days }: { token: string | null; days: Days }) {
 
       {/* ── Velocity grid ─────────────────────────────────────────────────────── */}
       <div className="rounded-card border border-line bg-surface p-5 [box-shadow:var(--shadow-card)]">
-        <div className="mb-4 font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
-          Stage velocity · avg time before advancing
+        <div className="mb-4 flex items-center">
+          <span className="font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
+            Stage velocity · avg time before advancing
+          </span>
+          <InsightBtn context="Stage velocity — time leads spend in each pipeline stage before advancing" label="Analyse Velocity" />
         </div>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
           {pipelineStages.map((s, i) => {
             const isEntry    = i === 0
             const isTerminal = i === pipelineStages.length - 1
             const hasData    = s.avg_hours !== null
+            const ctx = hasData
+              ? `${s.label} velocity: avg ${fmtHours(s.avg_hours)} before advancing`
+              : `${s.label} stage — ${isEntry ? 'pipeline entry point' : 'no velocity data yet'}`
             return (
-              <div key={s.stage} className="rounded-control border border-line bg-raised p-3">
-                <div className="font-mono text-[9px] uppercase tracking-wider text-faint">{s.label}</div>
+              <div
+                key={s.stage}
+                className="group relative cursor-pointer rounded-control border border-line bg-raised p-3 transition-colors hover:border-glow/25 hover:bg-raised"
+                onClick={() => pushAiContext(ctx)}
+                title="Click to ask AI about this stage"
+              >
+                <div className="flex items-start justify-between">
+                  <div className="font-mono text-[9px] uppercase tracking-wider text-faint">{s.label}</div>
+                  <span className="font-mono text-[7px] text-glow opacity-0 transition-opacity group-hover:opacity-100">
+                    ✦
+                  </span>
+                </div>
                 {isEntry ? (
                   <>
                     <div className="mt-1.5 font-mono text-sm text-faint">entry</div>
@@ -334,7 +353,7 @@ function FunnelTab({ token, days }: { token: string | null; days: Days }) {
               </thead>
               <tbody>
                 {pairs.map((p, i) => (
-                  <tr key={i} className="border-b border-line/50 last:border-0">
+                  <tr key={i} className="group border-b border-line/50 last:border-0 transition-colors hover:bg-raised/40">
                     <td className="py-2 pr-4 font-mono text-muted">{STAGE_LABELS[p.from_stage] ?? p.from_stage}</td>
                     <td className="py-2 pr-4 font-mono text-muted">{STAGE_LABELS[p.to_stage]   ?? p.to_stage}</td>
                     <td className="py-2 pr-4 font-mono tabular-nums text-ink">{p.unique_leads}</td>
@@ -344,7 +363,20 @@ function FunnelTab({ token, days }: { token: string | null; days: Days }) {
                       p.conversion_pct >= 30    ? 'text-warn'    : 'text-danger'
                     }`}>{p.conversion_pct !== null ? `${p.conversion_pct}%` : '—'}</td>
                     <td className="py-2 pr-4 font-mono tabular-nums text-muted">{fmtHours(p.avg_hours_in_stage)}</td>
-                    <td className="py-2 font-mono tabular-nums text-muted">{fmtHours(p.median_hours_in_stage)}</td>
+                    <td className="py-2 font-mono tabular-nums text-muted">
+                      <div className="flex items-center gap-3">
+                        <span>{fmtHours(p.median_hours_in_stage)}</span>
+                        <button
+                          type="button"
+                          onClick={() => pushAiContext(
+                            `${STAGE_LABELS[p.from_stage] ?? p.from_stage} → ${STAGE_LABELS[p.to_stage] ?? p.to_stage}: ${p.unique_leads} leads, ${p.conversion_pct ?? '—'}% conversion, avg ${fmtHours(p.avg_hours_in_stage)}`
+                          )}
+                          className="ml-auto opacity-0 transition-opacity group-hover:opacity-100 font-mono text-[9px] text-glow/70 hover:text-glow whitespace-nowrap"
+                        >
+                          Ask AI ✦
+                        </button>
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -524,23 +556,58 @@ function LeadsTab({ token }: { token: string | null }) {
 // ── Overview Bento ─────────────────────────────────────────────────────────────
 function Bento({ data }: { data: AnalyticsData }) {
   const { community, pipeline, booked } = data
+  const navigate = useNavigate()
+
+  // Week-over-week follower delta from the last 2 data points
+  const lastTwo   = community.growth.slice(-2)
+  const weekDelta = lastTwo.length >= 2 ? lastTwo[1].followers - lastTwo[0].followers : null
+  const pipeMax   = Math.max(...pipeline.map(x => x.count), 1)
+
   return (
     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+
+      {/* ── Community · followers — with live week delta ─────────────────── */}
       <Tile i={0} span={2} signature>
-        <Label>Community · followers</Label>
-        <div className="mt-1.5 font-mono text-4xl tabular-nums leading-none text-accent">{compact(community.size)}</div>
-        <div className="mt-1.5 font-mono text-[10px] text-faint">{compact(community.followers_tracked)} tracked · IG + TikTok</div>
+        <div className="flex items-start justify-between">
+          <Label>Community · followers</Label>
+          {weekDelta !== null && (
+            <span
+              className={`rounded-full px-2 py-0.5 font-mono text-[9px] tabular-nums ${
+                weekDelta >= 0 ? 'text-success' : 'text-danger'
+              }`}
+              style={{
+                background: weekDelta >= 0
+                  ? 'color-mix(in srgb, var(--color-success) 12%, transparent)'
+                  : 'color-mix(in srgb, var(--color-danger) 12%, transparent)',
+              }}
+            >
+              {weekDelta >= 0 ? '+' : ''}{compact(Math.abs(weekDelta))} this week
+            </span>
+          )}
+        </div>
+        <div className="mt-1.5 font-mono text-4xl tabular-nums leading-none text-accent">
+          {compact(community.size)}
+        </div>
+        <div className="mt-1.5 font-mono text-[10px] text-faint">
+          {compact(community.followers_tracked)} tracked · IG + TikTok
+        </div>
         <div className="mt-auto pt-3"><Spark data={community.growth} /></div>
       </Tile>
 
-      <StatTile i={1} label="Reach · likes"    value={compact(community.likes)} />
-      <StatTile i={2} label="Conversation"      value={compact(community.comments)} note="comments" />
+      {/* ── Reach + Conversation — clickable StatTiles ──────────────────── */}
+      <StatTile i={1} label="Reach · likes"
+        value={compact(community.likes)}
+        context="Community reach — total post likes" />
+      <StatTile i={2} label="Conversation"
+        value={compact(community.comments)}
+        note="comments"
+        context="Community conversation — comment volume and engagement" />
 
-      {/* Growth chart — fix: auto-scaled Y-axis so sparse data isn't flat */}
+      {/* ── Follower growth chart — InsightBtn in header ─────────────────── */}
       <Tile i={3} span={2} className="min-h-[200px]">
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center">
           <Label>Follower growth · weekly tracked</Label>
-          <ContextTarget label="Follower Growth Chart" />
+          <InsightBtn context="Follower growth trend — weekly follower progression" />
         </div>
         <div className="mt-2 flex-1">
           <ResponsiveContainer width="100%" height="100%">
@@ -551,59 +618,105 @@ function Bento({ data }: { data: AnalyticsData }) {
                 isAnimationActive={!REDUCED} animationDuration={900} />
               <Tooltip
                 cursor={{ stroke: 'rgba(242,235,224,0.15)' }}
-                contentStyle={{ background: '#0e0b08', border: '0.5px solid rgba(255,235,180,0.08)',
-                  borderRadius: 8, fontFamily: 'JetBrains Mono, monospace', fontSize: 11, color: '#fff' }}
-                labelStyle={{ color: '#52525b' }}
-                formatter={(v) => [compact(Number(v)), 'followers']}
+                contentStyle={{
+                  background: 'var(--color-bg)',
+                  border: '1px solid var(--color-line)',
+                  borderRadius: 8, fontFamily: 'JetBrains Mono, monospace', fontSize: 11, color: '#fff',
+                  boxShadow: 'var(--shadow-card)',
+                }}
+                labelStyle={{ color: 'var(--color-faint)', marginBottom: 2 }}
+                formatter={(v: unknown) => [compact(Number(v)), 'followers']}
               />
             </AreaChart>
           </ResponsiveContainer>
         </div>
       </Tile>
 
-      {/* Top posts */}
+      {/* ── Top posts — full-row hover action menu ───────────────────────── */}
       <Tile i={4} span={2} className="min-h-[200px]">
         <Label>Top posts · by likes</Label>
-        <div className="mt-3 flex flex-col gap-2.5">
-          {community.top_posts.slice(0, 5).map((p, i) => (
-            <div key={p.shortcode} className="flex items-center gap-2">
-              <a href={`https://instagram.com/p/${p.shortcode}`}
-                target="_blank" rel="noreferrer"
-                className="flex flex-1 items-center gap-3 text-sm text-muted transition-colors hover:text-ink">
-                <span className="w-5 shrink-0 font-mono text-[10px] tabular-nums text-faint">#{i + 1}</span>
-                <span className="flex-1 truncate font-mono text-[11px] text-muted">{p.shortcode}</span>
-                <span className="flex shrink-0 items-center gap-3 font-mono text-[11px] tabular-nums">
-                  <span className="text-accent">{compact(p.likes)} ♥</span>
-                  <span className="text-faint">{compact(p.comments)} ✦</span>
-                </span>
-              </a>
-              <ContextTarget label={`Top Post #${i + 1} · ${p.shortcode}`} className="shrink-0" />
+        <div className="mt-3 flex flex-col gap-1">
+          {community.top_posts.slice(0, 5).map((p, idx) => (
+            <div
+              key={p.shortcode}
+              className="group relative flex items-center gap-3 rounded-control px-2 py-1.5 transition-colors hover:bg-raised"
+            >
+              <span className="w-5 shrink-0 font-mono text-[10px] tabular-nums text-faint">#{idx + 1}</span>
+              <span className="flex-1 truncate font-mono text-[11px] text-muted">{p.shortcode}</span>
+              <span className="flex shrink-0 items-center gap-3 font-mono text-[11px] tabular-nums">
+                <span className="text-accent">{compact(p.likes)} ♥</span>
+                <span className="text-faint">{compact(p.comments)} ✦</span>
+              </span>
+              <HoverMenu>
+                <MenuBtn
+                  label="Ask AI ✦"
+                  onClick={() => pushAiContext(`Post ${p.shortcode} · ${compact(p.likes)} likes`)}
+                  accent
+                />
+                <MenuBtn
+                  label="View ↗"
+                  onClick={() => window.open(`https://instagram.com/p/${p.shortcode}`, '_blank')}
+                />
+                <MenuBtn
+                  label="Copy URL"
+                  onClick={() => navigator.clipboard.writeText(`https://instagram.com/p/${p.shortcode}`)}
+                />
+              </HoverMenu>
             </div>
           ))}
         </div>
       </Tile>
 
+      {/* ── CRM pipeline — clickable rows with hover nav ─────────────────── */}
       <Tile i={5} span={2}>
-        <Label>CRM pipeline</Label>
-        <div className="mt-3 flex flex-col gap-2.5">
-          {pipeline.map((s) => {
-            const max = Math.max(...pipeline.map((x) => x.count), 1)
-            return (
-              <div key={s.stage} className="flex items-center gap-2.5">
-                <span className="w-16 shrink-0 font-mono text-[10px] text-muted">{STAGE_LABELS[s.stage] ?? s.stage}</span>
-                <span className="h-1.5 flex-1 overflow-hidden rounded-full bg-raised">
-                  <span className="block h-full rounded-full transition-[width] duration-700"
-                    style={{ width: `${(s.count / max) * 100}%`, background: s.stage === 'booked' ? BRONZE : SAGE }} />
-                </span>
-                <span className="w-5 shrink-0 text-right font-mono text-[10px] tabular-nums text-muted">{s.count}</span>
-              </div>
-            )
-          })}
+        <div className="flex items-center">
+          <Label>CRM pipeline</Label>
+          <InsightBtn context="CRM pipeline — stage distribution and lead volume" />
+        </div>
+        <div className="mt-3 flex flex-col gap-1">
+          {pipeline.map((s) => (
+            <div
+              key={s.stage}
+              className="group relative flex cursor-pointer items-center gap-2.5 rounded-control px-2 py-1.5 transition-colors hover:bg-raised"
+              onClick={() => navigate(`/app/queue?stage=${s.stage}`)}
+            >
+              <span className="w-16 shrink-0 font-mono text-[10px] text-muted">
+                {STAGE_LABELS[s.stage] ?? s.stage}
+              </span>
+              <span className="h-1.5 flex-1 overflow-hidden rounded-full bg-raised">
+                <span className="block h-full rounded-full transition-[width] duration-700"
+                  style={{
+                    width: `${(s.count / pipeMax) * 100}%`,
+                    background: s.stage === 'booked' ? BRONZE : SAGE,
+                  }} />
+              </span>
+              <span className="w-5 shrink-0 text-right font-mono text-[10px] tabular-nums text-muted">
+                {s.count}
+              </span>
+              <HoverMenu>
+                <MenuBtn
+                  label="View leads →"
+                  onClick={() => navigate(`/app/queue?stage=${s.stage}`)}
+                />
+                <MenuBtn
+                  label="Ask AI ✦"
+                  onClick={() => pushAiContext(`${STAGE_LABELS[s.stage] ?? s.stage} pipeline — ${s.count} leads`)}
+                  accent
+                />
+              </HoverMenu>
+            </div>
+          ))}
         </div>
       </Tile>
 
-      <StatTile i={6} label="Content · posts"     value={compact(community.posts)} />
-      <StatTile i={7} label="Booked · north star" value={String(booked)} signature />
+      {/* ── Bottom row StatTiles ─────────────────────────────────────────── */}
+      <StatTile i={6} label="Content · posts"
+        value={compact(community.posts)}
+        context="Content library — total published posts" />
+      <StatTile i={7} label="Booked · north star"
+        value={String(booked)}
+        signature
+        context="Booked sessions — the key conversion north star metric" />
     </div>
   )
 }
@@ -623,26 +736,89 @@ function Spark({ data }: { data: AnalyticsData['community']['growth'] }) {
   )
 }
 
-function Tile({ children, i, span = 1, signature = false, className = '' }: {
-  children: ReactNode; i: number; span?: 1 | 2; signature?: boolean; className?: string
-}) {
+// ── Interaction primitives ────────────────────────────────────────────────────
+
+/** Glassmorphic slide-in menu — place inside a `group` div. */
+function HoverMenu({ children }: { children: ReactNode }) {
   return (
-    <div className={`cq-rise flex flex-col rounded-card border bg-surface p-4 transition-colors hover:bg-raised ${
-      signature ? 'border-accent/30' : 'border-line'
-    } ${span === 2 ? 'sm:col-span-2' : ''} ${className}`}
-      style={{ animationDelay: `${i * 55}ms` }}>
+    <div
+      className="absolute right-1 top-1/2 z-10 flex -translate-y-1/2 translate-x-2 items-center gap-px rounded-control border border-line opacity-0 pointer-events-none transition-all duration-150 group-hover:translate-x-0 group-hover:opacity-100 group-hover:pointer-events-auto"
+      style={{
+        background: 'color-mix(in srgb, var(--color-bg) 90%, transparent)',
+        backdropFilter: 'blur(8px)',
+        boxShadow: 'var(--shadow-card)',
+        padding: '2px',
+      }}
+      onClick={e => e.stopPropagation()}
+    >
       {children}
     </div>
   )
 }
 
-function StatTile({ label, value, note, i, signature = false }: {
-  label: string; value: string; note?: string; i: number; signature?: boolean
+function MenuBtn({ label, onClick, accent = false }: {
+  label: string; onClick: (e: React.MouseEvent) => void; accent?: boolean
 }) {
   return (
-    <Tile i={i} signature={signature}>
-      <Label>{label}</Label>
-      <div className={`mt-1.5 font-mono text-3xl tabular-nums leading-none ${signature ? 'text-accent' : 'text-ink'}`}>{value}</div>
+    <button
+      type="button"
+      onClick={e => { e.stopPropagation(); onClick(e) }}
+      className={`whitespace-nowrap rounded px-2 py-1 font-mono text-[9px] transition-colors hover:bg-raised ${
+        accent ? 'text-glow' : 'text-muted hover:text-ink'
+      }`}
+    >
+      {label}
+    </button>
+  )
+}
+
+/** Subtle always-visible "✦ Generate Insight" trigger for chart/section headers. */
+function InsightBtn({ context, label = 'Generate Insight' }: { context: string; label?: string }) {
+  return (
+    <button
+      type="button"
+      onClick={() => pushAiContext(context)}
+      className="ml-auto inline-flex items-center gap-1 rounded-control border border-glow/18 px-2 py-0.5 font-mono text-[8px] text-glow/50 transition-all hover:border-glow/40 hover:text-glow"
+      style={{ background: 'color-mix(in srgb, var(--color-accent) 6%, transparent)' }}
+    >
+      <span className="text-[7px]">✦</span> {label}
+    </button>
+  )
+}
+
+function Tile({ children, i, span = 1, signature = false, className = '', onClick }: {
+  children: ReactNode; i: number; span?: 1 | 2; signature?: boolean; className?: string; onClick?: () => void
+}) {
+  return (
+    <div
+      className={`cq-rise flex flex-col rounded-card border bg-surface p-4 transition-colors hover:bg-raised ${
+        signature ? 'border-accent/30' : 'border-line'
+      } ${span === 2 ? 'sm:col-span-2' : ''} ${onClick ? 'cursor-pointer' : ''} ${className}`}
+      style={{ animationDelay: `${i * 55}ms` }}
+      onClick={onClick}
+    >
+      {children}
+    </div>
+  )
+}
+
+function StatTile({ label, value, note, i, signature = false, context }: {
+  label: string; value: string; note?: string; i: number; signature?: boolean; context?: string
+}) {
+  return (
+    <Tile i={i} signature={signature} onClick={context ? () => pushAiContext(context) : undefined}
+      className={context ? 'group relative' : ''}>
+      <div className="flex items-start justify-between">
+        <Label>{label}</Label>
+        {context && (
+          <span className="font-mono text-[8px] text-glow opacity-0 transition-opacity group-hover:opacity-100">
+            ✦ Ask AI
+          </span>
+        )}
+      </div>
+      <div className={`mt-1.5 font-mono text-3xl tabular-nums leading-none ${signature ? 'text-accent' : 'text-ink'}`}>
+        {value}
+      </div>
       {note && <div className="mt-1.5 font-mono text-[10px] text-faint">{note}</div>}
     </Tile>
   )
