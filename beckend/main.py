@@ -3255,6 +3255,96 @@ def cockpit_whatsapp_draft(
         return {"status": "error", "detail": "Could not generate draft."}
 
 
+# ── WhatsApp Phone Save — data enrichment from the draft card ─────────────────
+#
+# POST /api/cockpit/whatsapp/phone
+#   { person_id: str, phone: str }
+#   → { status, wa_phone }
+#
+# Persists an operator-entered phone number into person_identity so the draft
+# card never hits "no phone on file" again for this lead. person_identity has
+# no unique constraint on (person_id, channel), so we check-then-write rather
+# than relying on ON CONFLICT.
+
+def _normalize_wa_phone(raw: str) -> Optional[str]:
+    """
+    Normalise a free-typed phone into the wa.me digit format (e.g. 972547104559).
+    Handles Israeli local (0XX…→972XX…) and bare mobile (5XXXXXXXX→972…).
+    Returns None if the result isn't a plausible international number.
+    """
+    digits = re.sub(r"\D", "", raw or "")
+    if not digits:
+        return None
+    if digits.startswith("00"):          # 00<cc> international prefix
+        digits = digits[2:]
+    if digits.startswith("0"):           # Israeli local: 054… → 97254…
+        digits = "972" + digits[1:]
+    elif len(digits) == 9 and digits.startswith("5"):  # bare IL mobile
+        digits = "972" + digits
+    if not (10 <= len(digits) <= 15):    # E.164 plausibility
+        return None
+    return digits
+
+
+class _WaPhoneBody(BaseModel):
+    person_id: str
+    phone:     str
+
+
+@app.post("/api/cockpit/whatsapp/phone")
+def cockpit_whatsapp_phone(
+    body: _WaPhoneBody,
+    user: dict = Depends(require_cockpit_user),
+):
+    """Save / update a lead's WhatsApp phone number in person_identity."""
+    person_id = body.person_id.strip()
+    if not person_id:
+        return {"status": "error", "detail": "person_id is required."}
+
+    wa_phone = _normalize_wa_phone(body.phone)
+    if not wa_phone:
+        return {
+            "status": "error",
+            "detail": "That doesn't look like a valid phone number.",
+        }
+
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                # Guard: the person must exist (FK would fail anyway, but a clean
+                # message beats a 500).
+                cur.execute("SELECT 1 FROM person WHERE id = %s", (person_id,))
+                if cur.fetchone() is None:
+                    return {"status": "error", "detail": "Lead not found."}
+
+                # Check-then-write (no unique index to ON CONFLICT on).
+                cur.execute(
+                    "SELECT id FROM person_identity "
+                    "WHERE person_id = %s AND channel = 'whatsapp' LIMIT 1",
+                    (person_id,),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    cur.execute(
+                        "UPDATE person_identity SET external_id = %s WHERE id = %s",
+                        (wa_phone, existing[0]),
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO person_identity (person_id, channel, external_id, confidence) "
+                        "VALUES (%s, 'whatsapp', %s, 'operator_entered')",
+                        (person_id, wa_phone),
+                    )
+                conn.commit()
+
+        logger.info(f"[cockpit/whatsapp/phone] saved {wa_phone} for person={person_id!r}")
+        return {"status": "success", "wa_phone": wa_phone}
+
+    except Exception as e:
+        logger.error(f"[cockpit/whatsapp/phone] error for {person_id!r}: {e}", exc_info=True)
+        return {"status": "error", "detail": "Could not save the phone number."}
+
+
 # ── Content Studio (Sprint 5, the Studio pillar) — the cockpit's first write
 #    surface. CRUD over content_pieces, all Supabase-JWT gated. ───────────────
 _CONTENT_STATUSES = {"idea", "drafting", "published"}

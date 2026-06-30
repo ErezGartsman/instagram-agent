@@ -314,15 +314,34 @@ function WidgetRenderer({ intent, data }: { intent?: string; data: ContextData }
 }
 
 // ── WhatsApp draft card — shown as a special assistant bubble ─────────────────
-type WaDraftState = { status: 'loading' } | { status: 'ready'; draft: string; wa_phone: string; name: string } | { status: 'error'; msg: string }
+type WaDraftState =
+  | { status: 'loading' }
+  | { status: 'ready'; draft: string; wa_phone: string; name: string; person_id: string }
+  | { status: 'error'; msg: string }
+
+/** Mirror of backend _normalize_wa_phone — keeps the live wa.me link correct. */
+function normalizeWaPhone(raw: string): string {
+  let d = (raw || '').replace(/\D/g, '')
+  if (d.startsWith('00')) d = d.slice(2)
+  if (d.startsWith('0')) d = '972' + d.slice(1)
+  else if (d.length === 9 && d.startsWith('5')) d = '972' + d
+  return d
+}
 
 function WhatsAppDraftCard({ state }: { state: WaDraftState }) {
-  const [editedDraft, setEditedDraft] = useState(
-    state.status === 'ready' ? state.draft : ''
-  )
-  // Sync if state changes from loading → ready
+  const { session } = useAuth()
+  const [editedDraft, setEditedDraft] = useState(state.status === 'ready' ? state.draft : '')
+  const [phone, setPhone]             = useState(state.status === 'ready' ? state.wa_phone : '')
+  const [saveState, setSaveState]     = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [saveErr, setSaveErr]         = useState('')
+
+  // Sync local state when the card transitions loading → ready
   useEffect(() => {
-    if (state.status === 'ready') setEditedDraft(state.draft)
+    if (state.status === 'ready') {
+      setEditedDraft(state.draft)
+      setPhone(state.wa_phone)
+      setSaveState('idle')
+    }
   }, [state])
 
   if (state.status === 'loading') {
@@ -345,10 +364,37 @@ function WhatsAppDraftCard({ state }: { state: WaDraftState }) {
       </div>
     )
   }
-  const { wa_phone, name } = state
-  const waUrl = wa_phone
-    ? `https://wa.me/${wa_phone}?text=${encodeURIComponent(editedDraft)}`
+
+  const { name, person_id } = state
+  const normalized   = normalizeWaPhone(phone)
+  const phoneIsValid = normalized.length >= 10
+  const waUrl        = phoneIsValid
+    ? `https://wa.me/${normalized}?text=${encodeURIComponent(editedDraft)}`
     : null
+  // Show the enrichment input until a number is confirmed (on file OR just saved)
+  const hasConfirmedPhone = Boolean(state.wa_phone) || saveState === 'saved'
+
+  const handleSavePhone = async () => {
+    const token = session?.access_token
+    if (!token || !phoneIsValid) return
+    setSaveState('saving'); setSaveErr('')
+    try {
+      const res = await fetch(`${API_BASE}/api/cockpit/whatsapp/phone`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ person_id, phone: normalized }),
+      })
+      const data = await res.json() as { status: string; wa_phone?: string; detail?: string }
+      if (data.status === 'success') {
+        setSaveState('saved')
+        if (data.wa_phone) setPhone(data.wa_phone)
+      } else {
+        setSaveState('error'); setSaveErr(data.detail ?? 'Could not save.')
+      }
+    } catch {
+      setSaveState('error'); setSaveErr('Connection error — please try again.')
+    }
+  }
 
   return (
     <div className="mt-2.5 flex flex-col gap-2.5 rounded-control border border-glow/20 p-3"
@@ -361,10 +407,11 @@ function WhatsAppDraftCard({ state }: { state: WaDraftState }) {
           </svg>
           <span className="font-mono text-[9px] uppercase tracking-wider text-glow">WhatsApp Draft · {name}</span>
         </div>
-        {!wa_phone && (
-          <span className="font-mono text-[8px] text-warn">No phone on file</span>
-        )}
+        {hasConfirmedPhone
+          ? <span className="font-mono text-[8px] text-success">✓ {normalized}</span>
+          : <span className="font-mono text-[8px] text-warn">No phone on file</span>}
       </div>
+
       {/* Editable draft — RTL for Hebrew */}
       <textarea
         value={editedDraft}
@@ -374,9 +421,49 @@ function WhatsAppDraftCard({ state }: { state: WaDraftState }) {
         className="w-full resize-none rounded border border-line bg-raised px-3 py-2.5 text-sm leading-relaxed text-ink outline-none focus:border-glow/30 transition-colors"
         style={{ scrollbarWidth: 'none', fontFamily: 'var(--font-sans)' }}
       />
+
+      {/* Phone enrichment — input + save, only until a number is confirmed */}
+      {!hasConfirmedPhone && (
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center gap-1.5">
+            <div className="flex flex-1 items-center gap-2 rounded border border-line bg-raised px-2.5 py-1.5 focus-within:border-glow/30 transition-colors">
+              <svg className="h-3 w-3 shrink-0 text-faint" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="7" y="2" width="10" height="20" rx="2" /><line x1="11" y1="18" x2="13" y2="18" />
+              </svg>
+              <input
+                type="tel"
+                value={phone}
+                onChange={e => { setPhone(e.target.value); if (saveState !== 'idle') setSaveState('idle') }}
+                placeholder="Add phone number to draft"
+                className="flex-1 bg-transparent font-mono text-[11px] tabular-nums text-ink outline-none placeholder:text-faint"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={handleSavePhone}
+              disabled={!phoneIsValid || saveState === 'saving'}
+              className="shrink-0 rounded-control border border-glow/25 px-2.5 py-1.5 font-mono text-[9px] text-glow transition-all hover:bg-glow/10 disabled:cursor-not-allowed disabled:opacity-30"
+              style={{ background: 'color-mix(in srgb, var(--color-glow) 5%, transparent)' }}
+            >
+              {saveState === 'saving' ? 'Saving…' : 'Save to lead'}
+            </button>
+          </div>
+          {saveState === 'error' && (
+            <span className="font-mono text-[8px] text-danger">{saveErr}</span>
+          )}
+          {phone && !phoneIsValid && saveState !== 'error' && (
+            <span className="font-mono text-[8px] text-faint">
+              Enter a valid number (e.g. 054-710-4559 or 972547104559)
+            </span>
+          )}
+        </div>
+      )}
+
       {/* Footer */}
       <div className="flex items-center justify-between">
-        <span className="font-mono text-[8px] text-faint">Review and edit · Erez sends manually</span>
+        <span className="font-mono text-[8px] text-faint">
+          {saveState === 'saved' ? '✓ Saved to lead · Erez sends manually' : 'Review and edit · Erez sends manually'}
+        </span>
         {waUrl ? (
           <a href={waUrl} target="_blank" rel="noreferrer"
             className="inline-flex items-center gap-1.5 rounded-control px-3 py-1.5 font-mono text-[9px] font-medium text-white transition-all hover:scale-105 active:scale-95"
@@ -384,7 +471,7 @@ function WhatsAppDraftCard({ state }: { state: WaDraftState }) {
             Open in WhatsApp ↗
           </a>
         ) : (
-          <span className="font-mono text-[8px] text-faint">No phone on file for this lead</span>
+          <span className="font-mono text-[8px] text-faint">Add a number to enable sending</span>
         )}
       </div>
     </div>
@@ -771,7 +858,7 @@ export function GlowingAiAssistant() {
       if (data.status === 'success' && data.draft) {
         setMessages(prev => prev.map(m =>
           m === loadingMsg
-            ? { ...m, content: '', waDraft: { status: 'ready', draft: data.draft!, wa_phone: data.wa_phone ?? '', name: data.person_name ?? 'Lead' } }
+            ? { ...m, content: '', waDraft: { status: 'ready', draft: data.draft!, wa_phone: data.wa_phone ?? '', name: data.person_name ?? 'Lead', person_id: personId } }
             : m
         ))
       } else {
@@ -796,17 +883,9 @@ export function GlowingAiAssistant() {
     // ── WhatsApp draft: NEVER fall through to the generic NLP chat ────────────
     if (WA_DRAFT_ACTIONS.has(action)) {
       const cd = contextData as Record<string, unknown> | null
-
-      // Debug trace — remove after confirming the fix
-      console.log('[Nexus] WA draft chip clicked')
-      console.log('[Nexus] contextData full:', JSON.stringify(contextData))
-      console.log('[Nexus] person_id value:', cd?.person_id, '| type:', typeof cd?.person_id)
-
       const personId = typeof cd?.person_id === 'string' && cd.person_id.length > 0
         ? cd.person_id
         : undefined
-
-      console.log('[Nexus] resolved personId:', personId)
 
       if (personId) {
         void handleWaDraft(personId)
