@@ -334,6 +334,7 @@ function WhatsAppDraftCard({ state }: { state: WaDraftState }) {
   const [phone, setPhone]             = useState(state.status === 'ready' ? state.wa_phone : '')
   const [saveState, setSaveState]     = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [saveErr, setSaveErr]         = useState('')
+  const [outreachLogged, setOutreachLogged] = useState(false)
 
   // Sync local state when the card transitions loading → ready
   useEffect(() => {
@@ -341,6 +342,7 @@ function WhatsAppDraftCard({ state }: { state: WaDraftState }) {
       setEditedDraft(state.draft)
       setPhone(state.wa_phone)
       setSaveState('idle')
+      setOutreachLogged(false)
     }
   }, [state])
 
@@ -394,6 +396,21 @@ function WhatsAppDraftCard({ state }: { state: WaDraftState }) {
     } catch {
       setSaveState('error'); setSaveErr('Connection error — please try again.')
     }
+  }
+
+  // Fire-and-forget outreach log — closes the Action Loop (resets the SLA clock).
+  // keepalive lets the POST survive even if the tab navigates; we never block the
+  // user's actual goal (opening WhatsApp), so the <a>'s default nav still runs.
+  const logOutreach = () => {
+    const token = session?.access_token
+    if (!token) return
+    setOutreachLogged(true)   // optimistic — the SLA will reflect on next refetch
+    void fetch(`${API_BASE}/api/cockpit/whatsapp/outreach`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ person_id, draft_preview: editedDraft.slice(0, 120) }),
+      keepalive: true,
+    }).catch(() => { /* best-effort; idempotent dedup_key makes a retry safe */ })
   }
 
   return (
@@ -461,11 +478,15 @@ function WhatsAppDraftCard({ state }: { state: WaDraftState }) {
 
       {/* Footer */}
       <div className="flex items-center justify-between">
-        <span className="font-mono text-[8px] text-faint">
-          {saveState === 'saved' ? '✓ Saved to lead · Erez sends manually' : 'Review and edit · Erez sends manually'}
+        <span className={`font-mono text-[8px] ${outreachLogged ? 'text-success' : 'text-faint'}`}>
+          {outreachLogged
+            ? '✓ Outreach logged · SLA clock reset'
+            : saveState === 'saved'
+              ? '✓ Saved to lead · Erez sends manually'
+              : 'Review and edit · Erez sends manually'}
         </span>
         {waUrl ? (
-          <a href={waUrl} target="_blank" rel="noreferrer"
+          <a href={waUrl} target="_blank" rel="noreferrer" onClick={logOutreach}
             className="inline-flex items-center gap-1.5 rounded-control px-3 py-1.5 font-mono text-[9px] font-medium text-white transition-all hover:scale-105 active:scale-95"
             style={{ background: '#25D366', boxShadow: '0 0 12px rgba(37,211,102,0.35)' }}>
             Open in WhatsApp ↗

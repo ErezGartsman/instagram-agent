@@ -3345,6 +3345,80 @@ def cockpit_whatsapp_phone(
         return {"status": "error", "detail": "Could not save the phone number."}
 
 
+# ── WhatsApp Outreach Logging — closes the Action Loop ───────────────────────
+#
+# POST /api/cockpit/whatsapp/outreach
+#   { person_id, draft_preview? }
+#   → { status, logged }
+#
+# Fired (fire-and-forget, keepalive) when the operator clicks "Open in WhatsApp"
+# on the draft card. Logs an `outreach_click` interaction — the kind the V1 build
+# plan reserved for exactly this wa.me deep-link click, already consumed by the
+# work-queue ranker. This is the operator-touch signal that the migration-004
+# accountability SLA reads: logging it resets the lead's SLA clock to green.
+#
+# Honest boundary: `outreach_click` records *intent to reach out via wa.me* — NOT
+# a confirmed send. It does not write outbound_messages (which stays reserved for
+# confirmed sends with a real body, e.g. the Kapso API path). The system never
+# claims a message was delivered when it can only know the operator opened the link.
+
+class _WaOutreachBody(BaseModel):
+    person_id:     str
+    draft_preview: str = ""
+
+
+@app.post("/api/cockpit/whatsapp/outreach")
+def cockpit_whatsapp_outreach(
+    body: _WaOutreachBody,
+    user: dict = Depends(require_cockpit_user),
+):
+    """Log an operator outreach-click so the accountability SLA clock resets."""
+    person_id = body.person_id.strip()
+    if not person_id:
+        return {"status": "error", "detail": "person_id is required."}
+
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM person WHERE id = %s", (person_id,))
+                if cur.fetchone() is None:
+                    return {"status": "error", "detail": "Lead not found."}
+                # Resolve the open opportunity for payload context (optional).
+                cur.execute(
+                    "SELECT id FROM opportunities "
+                    "WHERE person_id = %s AND closed_at IS NULL "
+                    "ORDER BY stage_entered_at DESC NULLS LAST LIMIT 1",
+                    (person_id,),
+                )
+                opp = cur.fetchone()
+                opportunity_id = str(opp[0]) if opp else None
+
+            # Idempotent per-minute: double-clicks collapse via dedup_key
+            # (interactions_dedup_uniq partial unique index + ON CONFLICT DO NOTHING).
+            minute_bucket = int(time.time() // 60)
+            preview = (body.draft_preview or "").strip()[:120]
+            written = nexus_interactions.log_interaction(
+                conn, "outreach_click", "whatsapp",
+                person_id=person_id,
+                payload={
+                    "via": "wa.me",
+                    "by": "operator",
+                    "opportunity_id": opportunity_id,
+                    "draft_preview": preview,
+                },
+                dedup_key=f"outreach:{person_id}:{minute_bucket}",
+                source="cockpit",
+            )
+            conn.commit()
+
+        logger.info(f"[cockpit/whatsapp/outreach] person={person_id!r} logged={written}")
+        return {"status": "success", "logged": written}
+
+    except Exception as e:
+        logger.error(f"[cockpit/whatsapp/outreach] error for {person_id!r}: {e}", exc_info=True)
+        return {"status": "error", "detail": "Could not log outreach."}
+
+
 # ── Content Studio (Sprint 5, the Studio pillar) — the cockpit's first write
 #    surface. CRUD over content_pieces, all Supabase-JWT gated. ───────────────
 _CONTENT_STATUSES = {"idea", "drafting", "published"}
