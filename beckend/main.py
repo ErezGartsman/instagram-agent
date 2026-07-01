@@ -2578,8 +2578,12 @@ def cockpit_analytics_funnel(
 @app.get("/api/cockpit/analytics/sla")
 def cockpit_analytics_sla(user: dict = Depends(require_cockpit_user)):
     """
-    Per-lead SLA status.
+    Per-lead SLA status — accountability-based (migration 004).
+
     Fix: person_name falls back to wa_ref_code when display_name is NULL.
+    Sort + display now key off hours_since_touch (accountable_since), not
+    hours_in_stage — stage age climbs even while the operator is actively
+    working a lead, so it no longer drives the truth or the ordering.
     """
     try:
         with get_db_conn() as conn:
@@ -2589,26 +2593,29 @@ def cockpit_analytics_sla(user: dict = Depends(require_cockpit_user)):
                     "SELECT s.opportunity_id, s.person_id, "
                     "       COALESCE(s.person_name, 'Lead ' || p.wa_ref_code, 'Lead') AS person_name, "
                     "       s.stage, s.stage_entered_at, s.hours_in_stage, "
-                    "       s.target_hours, s.warn_hours, s.sla_status "
+                    "       s.target_hours, s.warn_hours, s.sla_status, "
+                    "       s.hours_since_touch, s.waiting_on "
                     "FROM lead_sla_status s "
                     "JOIN person p ON p.id = s.person_id "
                     "ORDER BY "
                     "  CASE s.sla_status WHEN 'breach' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END, "
-                    "  s.hours_in_stage DESC NULLS LAST"
+                    "  s.hours_since_touch DESC NULLS LAST"
                 )
                 rows = cur.fetchall()
 
         leads = [
             {
-                "opportunity_id":  str(r[0]),
-                "person_id":       str(r[1]),
-                "person_name":     r[2],
-                "stage":           r[3],
-                "stage_entered_at": r[4].isoformat() if r[4] else None,
-                "hours_in_stage":  float(r[5]) if r[5] is not None else None,
-                "target_hours":    r[6],
-                "warn_hours":      r[7],
-                "sla_status":      r[8] or "unknown",
+                "opportunity_id":    str(r[0]),
+                "person_id":         str(r[1]),
+                "person_name":       r[2],
+                "stage":             r[3],
+                "stage_entered_at":  r[4].isoformat() if r[4] else None,
+                "hours_in_stage":    float(r[5]) if r[5] is not None else None,
+                "target_hours":      r[6],
+                "warn_hours":        r[7],
+                "sla_status":        r[8] or "unknown",
+                "hours_since_touch": float(r[9]) if r[9] is not None else None,
+                "waiting_on":        r[10] or "untouched",
             }
             for r in rows
         ]

@@ -404,13 +404,20 @@ function WhatsAppDraftCard({ state }: { state: WaDraftState }) {
   const logOutreach = () => {
     const token = session?.access_token
     if (!token) return
-    setOutreachLogged(true)   // optimistic — the SLA will reflect on next refetch
+    setOutreachLogged(true)   // optimistic UI — the footer text updates immediately
     void fetch(`${API_BASE}/api/cockpit/whatsapp/outreach`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({ person_id, draft_preview: editedDraft.slice(0, 120) }),
       keepalive: true,
-    }).catch(() => { /* best-effort; idempotent dedup_key makes a retry safe */ })
+    })
+      .then(() => {
+        // Only fire once the write is confirmed — the Leads tab's refetch must
+        // see the committed interaction, not race it. Any live component
+        // reading SLA/accountability data listens for this to refresh itself.
+        window.dispatchEvent(new CustomEvent('nexus:sla-changed', { detail: { person_id } }))
+      })
+      .catch(() => { /* best-effort; idempotent dedup_key makes a retry safe */ })
   }
 
   return (

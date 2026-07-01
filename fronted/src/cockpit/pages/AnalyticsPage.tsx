@@ -11,7 +11,7 @@ import {
   compact, fmtHours,
   fetchAnalytics, fetchFunnel, fetchSla,
   SAMPLE_ANALYTICS,
-  type AnalyticsData, type FunnelData, type SlaData, type SlaStatus,
+  type AnalyticsData, type FunnelData, type SlaData, type SlaStatus, type WaitingOn,
 } from '../lib/analytics'
 
 const BRONZE  = '#d4a843'
@@ -396,6 +396,16 @@ const SLA_CHIP: Record<SlaStatus, { label: string; cls: string }> = {
   unknown: { label: 'Unknown',  cls: 'text-faint bg-raised' },
 }
 
+// "Who does the system need action from" — the accountability read, separate
+// from the SLA breach/warn/ok severity chip.
+const MOVE_CHIP: Record<WaitingOn, { label: string; cls: string }> = {
+  operator:  { label: 'Your move',  cls: 'text-glow bg-glow/10' },
+  lead:      { label: 'Their move', cls: 'text-success bg-success/10' },
+  untouched: { label: 'New',        cls: 'text-accent bg-accent/10' },
+}
+
+const SLA_REFETCH_DEBOUNCE_MS = 500
+
 function LeadsTab({ token }: { token: string | null }) {
   type State = { kind: 'loading' } | { kind: 'error' } | { kind: 'ready'; data: SlaData }
   const [state,   setState]   = useState<State>({ kind: 'loading' })
@@ -405,6 +415,7 @@ function LeadsTab({ token }: { token: string | null }) {
   const navigate = useNavigate()
   const retry    = useCallback(() => { setState({ kind: 'loading' }); setNonce(n => n + 1) }, [])
 
+  // Initial + retry-triggered load — the only path that shows the loading skeleton.
   useEffect(() => {
     if (!token) return
     const ctrl = new AbortController()
@@ -414,6 +425,36 @@ function LeadsTab({ token }: { token: string | null }) {
       .catch((err: unknown) => { if ((err as { name?: string })?.name !== 'AbortError') setState({ kind: 'error' }) })
     return () => ctrl.abort()
   }, [token, nonce])
+
+  // Live propagation — silent background refetch (no loading flash, keeps
+  // existing data on a transient failure), triggered by:
+  //   • tab regains focus / becomes visible (operator switches back)
+  //   • 'nexus:sla-changed' — fired by the AI panel after an outreach click
+  //     logs an interaction, so this table never needs a remount to see the
+  //     new accountable_since take effect.
+  useEffect(() => {
+    if (!token) return
+    let debounce: ReturnType<typeof setTimeout> | null = null
+    const silentRefetch = () => {
+      fetchSla(token)
+        .then(data => setState({ kind: 'ready', data }))
+        .catch(() => { /* transient — keep showing what's already on screen */ })
+    }
+    const trigger = () => {
+      if (debounce) clearTimeout(debounce)
+      debounce = setTimeout(silentRefetch, SLA_REFETCH_DEBOUNCE_MS)
+    }
+    const onVisibility = () => { if (document.visibilityState === 'visible') trigger() }
+    window.addEventListener('focus', trigger)
+    document.addEventListener('visibilitychange', onVisibility)
+    window.addEventListener('nexus:sla-changed', trigger)
+    return () => {
+      window.removeEventListener('focus', trigger)
+      document.removeEventListener('visibilitychange', onVisibility)
+      window.removeEventListener('nexus:sla-changed', trigger)
+      if (debounce) clearTimeout(debounce)
+    }
+  }, [token])
 
   const visibleLeads = useMemo(() => {
     if (state.kind !== 'ready') return []
@@ -491,18 +532,24 @@ function LeadsTab({ token }: { token: string | null }) {
           {search || filter !== 'all' ? 'No leads match the current filters.' : 'No open leads right now.'}
         </p>
       ) : (
-        <div className="rounded-card border border-line bg-surface [box-shadow:var(--shadow-card)]">
+        <div className="overflow-x-auto rounded-card border border-line bg-surface [box-shadow:var(--shadow-card)]">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-line">
-                {['Lead', 'Stage', 'Time in stage', 'Target', 'SLA', ''].map((h, i) => (
-                  <th key={i} className="px-4 py-3 text-left font-mono text-[9px] uppercase tracking-wider text-faint">{h}</th>
+                {['Lead', 'Stage', 'Move', 'Accountability', 'Target', 'SLA', ''].map((h, i) => (
+                  <th key={i} className="whitespace-nowrap px-4 py-3 text-left font-mono text-[9px] uppercase tracking-wider text-faint">{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
               {visibleLeads.map(lead => {
                 const chip = SLA_CHIP[lead.sla_status]
+                const moveChip = MOVE_CHIP[lead.waiting_on]
+                const accountabilityCls =
+                  lead.sla_status === 'breach' ? 'text-danger'
+                  : lead.sla_status === 'warn'  ? 'text-warn'
+                  : lead.sla_status === 'ok'    ? 'text-ink'
+                  : 'text-faint'
                 return (
                   <tr
                     key={lead.opportunity_id}
@@ -517,14 +564,26 @@ function LeadsTab({ token }: { token: string | null }) {
                     <td className="px-4 py-3 font-mono text-[11px] text-muted">
                       {STAGE_LABELS[lead.stage] ?? lead.stage}
                     </td>
-                    <td className="px-4 py-3 font-mono tabular-nums text-ink">
-                      {fmtHours(lead.hours_in_stage)}
+                    <td className="px-4 py-3">
+                      <span className={`whitespace-nowrap rounded-control px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider ${moveChip.cls}`}>
+                        {moveChip.label}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex flex-col gap-0.5">
+                        <span className={`font-mono text-[11px] tabular-nums ${accountabilityCls}`}>
+                          {fmtHours(lead.hours_since_touch)}
+                        </span>
+                        <span className="whitespace-nowrap font-mono text-[9px] text-faint">
+                          in {STAGE_LABELS[lead.stage] ?? lead.stage} {fmtHours(lead.hours_in_stage)}
+                        </span>
+                      </div>
                     </td>
                     <td className="px-4 py-3 font-mono tabular-nums text-faint">
                       {lead.target_hours !== null ? `${lead.target_hours}h` : '—'}
                     </td>
                     <td className="px-4 py-3">
-                      <span className={`rounded-control px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider ${chip.cls}`}>
+                      <span className={`whitespace-nowrap rounded-control px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider ${chip.cls}`}>
                         {chip.label}
                       </span>
                     </td>
@@ -536,7 +595,7 @@ function LeadsTab({ token }: { token: string | null }) {
                             : lead.sla_status === 'warn'   ? 'SLA At Risk'
                             : 'Lead'} · ${lead.person_name}`
                         )}
-                        className="inline-flex items-center gap-1.5 rounded-control border border-glow/25 px-3 py-1.5 font-mono text-[10px] text-glow opacity-0 transition-all duration-150 group-hover:opacity-100 hover:bg-glow/10"
+                        className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-control border border-glow/25 px-3 py-1.5 font-mono text-[10px] text-glow opacity-0 transition-all duration-150 group-hover:opacity-100 hover:bg-glow/10"
                         style={{ background: 'color-mix(in srgb, var(--color-glow) 5%, transparent)' }}
                       >
                         <span className="text-[8px]">✦</span> Ask AI

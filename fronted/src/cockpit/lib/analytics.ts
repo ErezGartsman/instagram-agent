@@ -92,6 +92,14 @@ export type FunnelData = {
 
 export type SlaStatus = 'ok' | 'warn' | 'breach' | 'unknown'
 
+/**
+ * Who the accountability clock is waiting on (migration 004):
+ *   'operator'  — the lead replied; we owe the next move ("Your move")
+ *   'lead'      — we reached out; awaiting their reply ("Their move")
+ *   'untouched' — never engaged either direction ("New")
+ */
+export type WaitingOn = 'operator' | 'lead' | 'untouched'
+
 export type SlaLead = {
   opportunity_id: string
   person_id: string
@@ -102,6 +110,9 @@ export type SlaLead = {
   target_hours: number | null
   warn_hours: number | null
   sla_status: SlaStatus
+  /** Hours since accountable_since — the TRUE SLA clock (resets on operator touch/inbound). */
+  hours_since_touch: number | null
+  waiting_on: WaitingOn
 }
 
 export type SlaData = {
