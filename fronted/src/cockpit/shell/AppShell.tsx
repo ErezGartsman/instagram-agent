@@ -4,7 +4,7 @@ import { AnimatePresence, motion } from 'framer-motion'
 import { Sidebar } from './Sidebar'
 import { Topbar } from './Topbar'
 import { CommandPalette } from '../components/CommandPalette'
-import { NexusAIPanel } from '../components/NexusAIPanel'
+import { GlowingAiAssistant } from '../components/GlowingAiAssistant'
 
 /** The authenticated frame: cursor orb + fixed left nav + top bar + animated page well. */
 export function AppShell() {
@@ -46,8 +46,8 @@ export function AppShell() {
         </main>
       </div>
       <CommandPalette open={paletteOpen} onClose={closePalette} />
-      {/* Global AI assistant — fixed right-edge tab, visible on every page */}
-      <NexusAIPanel />
+      {/* Global floating AI assistant — replaces NexusAIPanel slide-out */}
+      <GlowingAiAssistant />
     </div>
   )
 }

@@ -38,6 +38,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
+from nexus import ai_planner as nexus_ai_planner
 from nexus import bookings as nexus_bookings
 from nexus import copilot as nexus_copilot
 from nexus import db as nexus_db
@@ -1786,7 +1787,7 @@ def cockpit_queue(user: dict = Depends(require_cockpit_user)):
                 if person_ids:
                     cur.execute(
                         "SELECT person_id, kind, occurred_at FROM interactions "
-                        "WHERE person_id = ANY(%s) ORDER BY occurred_at DESC",
+                        "WHERE person_id = ANY(%s::uuid[]) ORDER BY occurred_at DESC",
                         (person_ids,),
                     )
                     for pid, kind, occurred_at in cur.fetchall():
@@ -2294,6 +2295,44 @@ def cockpit_agents_active(user: dict = Depends(require_cockpit_user)):
         return {"status": "error", "detail": "Could not load active agents."}
 
 
+class AgentTriggerBody(BaseModel):
+    person_id: str
+    agent_type: str = "qualification"
+
+
+@app.post("/api/cockpit/agents/trigger")
+def cockpit_agents_trigger(
+    body: AgentTriggerBody,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(require_cockpit_user),
+):
+    """
+    Manually fire an agent for a person without touching the opportunity.
+
+    The lead stays in the Work Queue; the AgentPip and Agent Log tab update
+    live via Supabase Realtime as the run progresses. Designed for observation
+    and debugging — the lead is never removed from the screen. Returns
+    immediately (the agent runs in a BackgroundTask).
+    """
+    if body.agent_type != "qualification":
+        raise HTTPException(status_code=400, detail=f"Unknown agent type {body.agent_type!r}.")
+
+    by = user.get("email") or user.get("sub") or "operator"
+    background_tasks.add_task(
+        run_agent,
+        agent_type="qualification",
+        person_id=body.person_id,
+        triggered_by="manual",
+        agent_fn=qualification_agent,
+        input_snapshot={"triggered_by_user": by},
+    )
+    logger.info(
+        "[cockpit/agents/trigger] qualification agent queued for person=%s by=%s",
+        body.person_id, by,
+    )
+    return {"status": "accepted", "person_id": body.person_id, "agent_type": body.agent_type}
+
+
 @app.get("/api/cockpit/analytics")
 def cockpit_analytics(user: dict = Depends(require_cockpit_user)):
     """
@@ -2327,7 +2366,7 @@ def cockpit_analytics(user: dict = Depends(require_cockpit_user)):
                     "FROM followers WHERE followed_at IS NOT NULL GROUP BY 1 ORDER BY 1"
                 )
                 weekly = cur.fetchall()
-                # Top posts by likes (with their comment counts).
+                # Top posts by likes (shortcode + counts only — no caption column assumed).
                 cur.execute(
                     "WITH lk AS (SELECT post_shortcode, COUNT(*) c FROM likers GROUP BY 1), "
                     "     cm AS (SELECT post_shortcode, COUNT(*) c FROM comments GROUP BY 1) "
@@ -2362,7 +2401,8 @@ def cockpit_analytics(user: dict = Depends(require_cockpit_user)):
                 "posts": posts,
                 "growth": growth,
                 "top_posts": [
-                    {"shortcode": sc, "likes": lk, "comments": cm} for (sc, lk, cm) in top
+                    {"shortcode": sc, "likes": lk, "comments": cm}
+                    for (sc, lk, cm) in top
                 ],
             },
             "pipeline": [
@@ -2374,6 +2414,1082 @@ def cockpit_analytics(user: dict = Depends(require_cockpit_user)):
     except Exception as e:
         logger.error(f"[cockpit/analytics] query failed: {e}")
         return {"status": "error", "detail": "Could not load analytics."}
+
+
+@app.get("/api/cockpit/analytics/funnel")
+def cockpit_analytics_funnel(
+    user: dict = Depends(require_cockpit_user),
+    days: Optional[int] = None,   # 7 | 30 | 90 | None = all-time
+):
+    """
+    Conversion rates and velocity. Optional ?days=N limits to the last N days.
+
+    Fix: 'engaged' ever_entered uses total opportunity count (leads are created as
+    'engaged' by default — no stage_change interaction is logged for the initial state).
+    For all other stages, interaction-based entry counts are accurate.
+    """
+    since_clause = "AND occurred_at >= NOW() - (%s * interval '1 day')" if days else ""
+    since_args   = (days,) if days else ()
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                # Pair data — filter by date window when days is set
+                if days:
+                    # Simple count-only query for date-filtered view.
+                    # Velocity (avg hours) requires nested window+aggregate which PostgreSQL
+                    # disallows at the same query level — return NULL for those columns.
+                    cur.execute(
+                        "SELECT payload->>'from' AS from_stage, "
+                        "       payload->>'to'   AS to_stage, "
+                        "       COUNT(*)         AS transition_count, "
+                        "       COUNT(DISTINCT person_id) AS unique_leads, "
+                        "       NULL::numeric    AS total_entered_from_stage, "
+                        "       NULL::numeric    AS conversion_pct, "
+                        "       NULL::numeric    AS avg_hours_in_stage, "
+                        "       NULL::numeric    AS median_hours_in_stage, "
+                        "       MAX(occurred_at) AS last_transition_at "
+                        "FROM interactions "
+                        "WHERE kind = 'stage_change' "
+                        "  AND payload->>'from' IS NOT NULL "
+                        "  AND payload->>'to'   IS NOT NULL "
+                        "  AND occurred_at >= NOW() - (%s * interval '1 day') "
+                        "GROUP BY payload->>'from', payload->>'to' "
+                        "ORDER BY payload->>'from', payload->>'to'",
+                        (days,),
+                    )
+                else:
+                    # All-time: query interactions directly (same logic as funnel_metrics
+                    # materialized view) so we always get live data without waiting for
+                    # the nightly REFRESH. The mat-view is empty until first refresh runs.
+                    cur.execute(
+                        "WITH entries AS ("
+                        "  SELECT payload->>'to' AS stage,"
+                        "         COUNT(DISTINCT person_id) AS entered_count"
+                        "  FROM interactions"
+                        "  WHERE kind='stage_change' AND payload->>'to' IS NOT NULL"
+                        "  GROUP BY payload->>'to'"
+                        "), "
+                        "transitions AS ("
+                        "  SELECT t.payload->>'from' AS from_stage,"
+                        "         t.payload->>'to'   AS to_stage,"
+                        "         COUNT(*)            AS transition_count,"
+                        "         COUNT(DISTINCT t.person_id) AS unique_leads,"
+                        "         AVG(EXTRACT(EPOCH FROM (t.occurred_at - entry.occurred_at)) / 3600.0)::NUMERIC(8,1) AS avg_hours_in_stage,"
+                        "         PERCENTILE_CONT(0.5) WITHIN GROUP ("
+                        "           ORDER BY EXTRACT(EPOCH FROM (t.occurred_at - entry.occurred_at)) / 3600.0"
+                        "         )::NUMERIC(8,1) AS median_hours_in_stage,"
+                        "         MAX(t.occurred_at) AS last_transition_at"
+                        "  FROM interactions t"
+                        "  LEFT JOIN LATERAL ("
+                        "    SELECT occurred_at FROM interactions"
+                        "    WHERE person_id = t.person_id AND kind='stage_change'"
+                        "      AND payload->>'to' = t.payload->>'from'"
+                        "      AND occurred_at < t.occurred_at"
+                        "    ORDER BY occurred_at DESC LIMIT 1"
+                        "  ) entry ON TRUE"
+                        "  WHERE t.kind='stage_change'"
+                        "    AND t.payload->>'from' IS NOT NULL"
+                        "    AND t.payload->>'to'   IS NOT NULL"
+                        "  GROUP BY t.payload->>'from', t.payload->>'to'"
+                        ") "
+                        "SELECT tr.from_stage, tr.to_stage, tr.transition_count, tr.unique_leads,"
+                        "       e.entered_count,"
+                        "       ROUND(tr.unique_leads::NUMERIC / NULLIF(e.entered_count,0) * 100, 1),"
+                        "       tr.avg_hours_in_stage, tr.median_hours_in_stage, tr.last_transition_at"
+                        " FROM transitions tr"
+                        " LEFT JOIN entries e ON e.stage = tr.from_stage"
+                        " ORDER BY tr.from_stage, tr.to_stage"
+                    )
+                pair_rows = cur.fetchall()
+                logger.info(f"[cockpit/analytics/funnel] pair_rows={len(pair_rows)} days={days}")
+
+                # Per-stage entry counts from interactions (excludes initial 'engaged')
+                cur.execute(
+                    "SELECT payload->>'to' AS stage, COUNT(DISTINCT person_id) AS entered "
+                    "FROM interactions "
+                    f"WHERE kind = 'stage_change' AND payload->>'to' IS NOT NULL {since_clause}"
+                    "GROUP BY payload->>'to'",
+                    since_args,
+                )
+                entry_rows = cur.fetchall()
+
+                # 'engaged' special case: total all-time opportunity count is the true entry
+                # (opportunities are created at 'engaged' — no stage_change recorded for it).
+                if days:
+                    cur.execute(
+                        "SELECT COUNT(DISTINCT person_id) FROM opportunities "
+                        "WHERE created_at >= NOW() - (%s * interval '1 day')",
+                        (days,),
+                    )
+                else:
+                    cur.execute("SELECT COUNT(DISTINCT person_id) FROM opportunities")
+                engaged_total = cur.fetchone()[0]
+                logger.info(f"[cockpit/analytics/funnel] entry_rows={entry_rows} engaged_total={engaged_total}")
+
+                # Current open counts per stage
+                cur.execute(
+                    "SELECT stage, COUNT(*) FROM opportunities "
+                    "WHERE closed_at IS NULL GROUP BY stage"
+                )
+                open_rows = cur.fetchall()
+
+        pairs = [
+            {
+                "from_stage":               r[0],
+                "to_stage":                 r[1],
+                "transition_count":         r[2],
+                "unique_leads":             r[3],
+                "total_entered_from_stage": r[4],
+                "conversion_pct":           float(r[5]) if r[5] is not None else None,
+                "avg_hours_in_stage":       float(r[6]) if r[6] is not None else None,
+                "median_hours_in_stage":    float(r[7]) if r[7] is not None else None,
+                "last_transition_at":       r[8].isoformat() if r[8] else None,
+            }
+            for r in pair_rows
+        ]
+        entries     = {r[0]: r[1] for r in entry_rows}
+        open_counts = {r[0]: r[1] for r in open_rows}
+        # 'engaged' has no stage_change INTO it (leads start there), so the CTE
+        # can't compute entered_count or conversion_pct for engaged→* pairs.
+        # Patch both using engaged_total from the opportunities count.
+        entries["engaged"] = engaged_total
+        if engaged_total:
+            for p in pairs:
+                if p["from_stage"] == "engaged" and p["conversion_pct"] is None:
+                    p["total_entered_from_stage"] = int(engaged_total)
+                    p["conversion_pct"] = round(
+                        float(p["unique_leads"]) / float(engaged_total) * 100, 1
+                    )
+
+        stages = [
+            {
+                "stage":        s,
+                "ever_entered": entries.get(s, 0),
+                "open_now":     open_counts.get(s, 0),
+            }
+            for s in nexus_interactions.PIPELINE_STAGES
+        ]
+
+        return {"status": "success", "pairs": pairs, "stages": stages, "days": days}
+    except Exception as e:
+        logger.error(f"[cockpit/analytics/funnel] query failed: {e}")
+        return {"status": "error", "detail": "Could not load funnel data."}
+
+
+@app.get("/api/cockpit/analytics/sla")
+def cockpit_analytics_sla(user: dict = Depends(require_cockpit_user)):
+    """
+    Per-lead SLA status — accountability-based (migration 004).
+
+    Fix: person_name falls back to wa_ref_code when display_name is NULL.
+    Sort + display now key off hours_since_touch (accountable_since), not
+    hours_in_stage — stage age climbs even while the operator is actively
+    working a lead, so it no longer drives the truth or the ordering.
+    """
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                # Join against person to get wa_ref_code fallback for unnamed leads
+                cur.execute(
+                    "SELECT s.opportunity_id, s.person_id, "
+                    "       COALESCE(s.person_name, 'Lead ' || p.wa_ref_code, 'Lead') AS person_name, "
+                    "       s.stage, s.stage_entered_at, s.hours_in_stage, "
+                    "       s.target_hours, s.warn_hours, s.sla_status, "
+                    "       s.hours_since_touch, s.waiting_on "
+                    "FROM lead_sla_status s "
+                    "JOIN person p ON p.id = s.person_id "
+                    "ORDER BY "
+                    "  CASE s.sla_status WHEN 'breach' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END, "
+                    "  s.hours_since_touch DESC NULLS LAST"
+                )
+                rows = cur.fetchall()
+
+        leads = [
+            {
+                "opportunity_id":    str(r[0]),
+                "person_id":         str(r[1]),
+                "person_name":       r[2],
+                "stage":             r[3],
+                "stage_entered_at":  r[4].isoformat() if r[4] else None,
+                "hours_in_stage":    float(r[5]) if r[5] is not None else None,
+                "target_hours":      r[6],
+                "warn_hours":        r[7],
+                "sla_status":        r[8] or "unknown",
+                "hours_since_touch": float(r[9]) if r[9] is not None else None,
+                "waiting_on":        r[10] or "untouched",
+            }
+            for r in rows
+        ]
+        summary = {
+            "breach":  sum(1 for l in leads if l["sla_status"] == "breach"),
+            "warn":    sum(1 for l in leads if l["sla_status"] == "warn"),
+            "ok":      sum(1 for l in leads if l["sla_status"] == "ok"),
+            "unknown": sum(1 for l in leads if l["sla_status"] == "unknown"),
+            "total":   len(leads),
+        }
+        return {"status": "success", "leads": leads, "summary": summary}
+    except Exception as e:
+        logger.error(f"[cockpit/analytics/sla] query failed: {e}")
+        return {"status": "error", "detail": "Could not load SLA data."}
+
+
+# ── Cockpit AI Chat — NLP brain for the GlowingAiAssistant ──────────────────
+#
+# POST /api/cockpit/ai/chat
+#   { message, chips: string[], history: [{role, content}] }
+#   → { status, reply, intent, context_data, actions }
+#
+# intent + context_data drive the frontend Generative UI widget renderer.
+# actions are template-based follow-up chips (never LLM-generated — too unreliable).
+
+# Maps plain-text Action Chip strings (lowercased) → synthetic context chip labels.
+# When the user clicks a chip and sends plain text, this router adds the matching
+# chip to the list before the parser runs, so the DB query fires as expected.
+_ACTION_CHIP_MAP: dict[str, str] = {
+    # Pipeline / funnel
+    "show pipeline overview":    "Pipeline Funnel conversion analysis",
+    "pipeline overview":         "Pipeline Funnel conversion analysis",
+    "analyse funnel":            "Pipeline Funnel conversion analysis",
+    "show funnel overview":      "Pipeline Funnel conversion analysis",
+    "compare to lead pipeline":  "Pipeline Funnel conversion analysis",
+    "top drop-off stage":        "Pipeline Funnel conversion analysis",
+    "filter to last 30 days":    "Pipeline Funnel conversion analysis",
+    "view all open leads":       "Pipeline Funnel conversion analysis",
+    "show lead pipeline":        "Pipeline Funnel conversion analysis",
+    # Velocity
+    "show velocity analysis":    "Stage velocity — avg time before advancing",
+    "show velocity":             "Stage velocity — avg time before advancing",
+    "compare all stages":        "Stage velocity — avg time before advancing",
+    "identify bottleneck":       "Stage velocity — avg time before advancing",
+    # Community / growth
+    "growth trend":              "Follower Growth Trend",
+    "community metrics":         "Community reach — total post likes",
+    "engagement trend":          "Community reach — total post likes",
+    # SLA overview
+    "sla dashboard":             "SLA status overview",
+    "sla health check":          "SLA status overview",
+    "sla overview":              "SLA status overview",
+    # Top posts
+    "show top posts":            "Top Posts by likes",
+    "analyse top performers":    "Top Posts by likes",
+    "show all top posts":        "Top Posts by likes",
+    "top posts by engagement":   "Top Posts by likes",
+    "top content":               "Top Posts by likes",
+}
+
+_AI_ACTIONS: dict[str, list[str]] = {
+    "sla_lead_breach": ["Draft WhatsApp follow-up",  "View in Work Queue", "Show pipeline overview"],
+    "sla_lead_warn":   ["Draft check-in message",     "View in Work Queue", "Show velocity"],
+    "sla_lead_ok":     ["View lead profile",           "Show pipeline overview", "Analyse funnel"],
+    "sla_lead":        ["View in Work Queue",          "Show pipeline overview", "Draft message"],
+    "funnel":          ["Show velocity analysis",      "Filter to last 30 days", "Top drop-off stage"],
+    "growth":          ["Show top posts",              "Compare to lead pipeline", "Filter to 90 days"],
+    "post":            ["Analyse top performers",      "Show all top posts", "Engagement trend"],
+    "community":       ["Growth trend",                "Top posts by engagement", "Show lead pipeline"],
+    "velocity":        ["Show funnel overview",        "Compare all stages", "Identify bottleneck"],
+    "pipeline":        ["SLA health check",            "Show velocity", "View all open leads"],
+    "general":         ["SLA dashboard",               "Pipeline overview", "Community metrics"],
+    "sla_overview":    ["Show pipeline overview",      "Community metrics",  "Show velocity analysis"],
+    "top_posts":       ["Show pipeline overview",      "Community metrics",  "Growth trend"],
+}
+
+
+class _AiChatBody(BaseModel):
+    message: str = ""
+    chips:   list[str] = []
+    history: list[dict] = []
+
+
+def _legacy_ai_chat_context(
+    msg: str, chips: list[str]
+) -> tuple[list[str], list[str], str, dict | None]:
+    """
+    LEGACY chip router — the original keyword-matching context builder, kept
+    byte-for-byte as the fallback path for the tool-use planner (flag
+    `ai_chat.planner_enabled`, and automatic on any plan parse/validation
+    failure). Do not extend this: new capabilities are registry entries in
+    nexus/ai_planner.py, never new elif branches here.
+
+    Returns (chips, context_blocks, primary_intent, ctx_data).
+    """
+    # ── Action Chip Router ────────────────────────────────────────────────────
+    # When the user clicks a follow-up action chip, the message arrives as plain
+    # text with no chips[] array.  Map it to a synthetic chip so the DB query
+    # fires exactly as if the user had injected a context tag.
+    routed_chip = _ACTION_CHIP_MAP.get(msg.lower())
+    if routed_chip and routed_chip not in chips:
+        chips = [routed_chip] + chips
+
+    context_blocks: list[str] = []
+    primary_intent  = "general"
+    ctx_data: dict | None = None   # structured data for the frontend widget
+
+    # ── Pull live data for each context chip ──────────────────────────────────
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                for chip in chips:
+                    chip_l = chip.lower()
+
+                    # SLA branch: person-specific (has ·) or global overview
+                    if "sla" in chip_l or "breach" in chip_l or "at risk" in chip_l:
+                        # Detect if a specific person name is embedded (after ·)
+                        has_person = "·" in chip
+                        frag = chip.split("·")[-1].strip() if has_person else ""
+                        is_generic = not frag or any(
+                            kw in frag.lower()
+                            for kw in ("overview", "dashboard", "status", "health", "check")
+                        )
+
+                        if is_generic:
+                            # ── Global SLA overview ──────────────────────────
+                            cur.execute(
+                                "SELECT sla_status, COUNT(*) FROM lead_sla_status GROUP BY sla_status"
+                            )
+                            counts = {r[0]: r[1] for r in cur.fetchall()}
+                            cur.execute(
+                                "SELECT COALESCE(s.person_name,'Lead '||p.wa_ref_code,'Lead'),"
+                                "       s.stage, s.hours_in_stage, s.target_hours, s.sla_status "
+                                "FROM lead_sla_status s "
+                                "JOIN person p ON p.id = s.person_id "
+                                "ORDER BY "
+                                "  CASE s.sla_status WHEN 'breach' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END,"
+                                "  s.hours_in_stage DESC NULLS LAST "
+                                "LIMIT 5"
+                            )
+                            top = cur.fetchall()
+                            top_lines = [
+                                f"  {r[0]}: {r[1]} · {r[2]}h/{r[3]}h · {r[4].upper()}"
+                                for r in top
+                            ]
+                            context_blocks.append(
+                                f"SLA OVERVIEW:\n"
+                                f"  Breached: {counts.get('breach',0)}  "
+                                f"At risk: {counts.get('warn',0)}  "
+                                f"On track: {counts.get('ok',0)}\n"
+                                f"TOP LEADS BY URGENCY:\n" + "\n".join(top_lines)
+                            )
+                            if primary_intent == "general":
+                                primary_intent = "sla_overview"
+                                # Fetch WA phones for action chip support
+                                cur.execute(
+                                    "SELECT s3.person_id, pi.external_id "
+                                    "FROM lead_sla_status s3 "
+                                    "JOIN person_identity pi "
+                                    "  ON pi.person_id = s3.person_id "
+                                    "  AND pi.channel = 'whatsapp' "
+                                    "LIMIT 20"
+                                )
+                                wa_phones = {str(r[0]): r[1] for r in cur.fetchall()}
+                                # Pull person_id from lead_sla_status for top leads
+                                cur.execute(
+                                    "SELECT s3.person_id, "
+                                    "COALESCE(s3.person_name,'Lead '||p3.wa_ref_code,'Lead'), "
+                                    "s3.stage, s3.hours_in_stage, s3.target_hours, s3.sla_status "
+                                    "FROM lead_sla_status s3 "
+                                    "JOIN person p3 ON p3.id = s3.person_id "
+                                    "ORDER BY "
+                                    "  CASE s3.sla_status WHEN 'breach' THEN 0 "
+                                    "  WHEN 'warn' THEN 1 ELSE 2 END,"
+                                    "  s3.hours_in_stage DESC NULLS LAST "
+                                    "LIMIT 5"
+                                )
+                                top_with_ids = cur.fetchall()
+                                ctx_data = {
+                                    "type": "sla_overview",
+                                    "counts": dict(counts),
+                                    "top_leads": [
+                                        {
+                                            "person_id": str(r[0]),
+                                            "name": r[1], "stage": r[2],
+                                            "hours_in_stage": float(r[3]) if r[3] is not None else 0,
+                                            "target_hours": r[4], "sla_status": r[5],
+                                            "wa_phone": wa_phones.get(str(r[0])),
+                                        }
+                                        for r in top_with_ids
+                                    ],
+                                }
+                        else:
+                            # ── Person-specific SLA lookup ───────────────────
+                            # Select s.person_id directly — it is always present in
+                            # the view (= o.person_id).  The previous second-query
+                            # approach used an INNER JOIN on person_identity which
+                            # silently returned 0 rows when the lead had no WA
+                            # identity record, causing person_id = None.
+                            frag_l = frag.lower()
+                            cur.execute(
+                                "SELECT COALESCE(s.person_name,'Lead '||p.wa_ref_code,'Lead'),"
+                                "       s.stage, s.hours_in_stage, s.target_hours, "
+                                "       s.warn_hours, s.sla_status, s.person_id "
+                                "FROM lead_sla_status s "
+                                "JOIN person p ON p.id = s.person_id "
+                                "WHERE lower(COALESCE(s.person_name,'')) LIKE %s "
+                                "   OR lower(COALESCE(p.wa_ref_code,'')) LIKE %s "
+                                "LIMIT 1",
+                                (f"%{frag_l}%", f"%{frag_l}%"),
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                context_blocks.append(
+                                    f"LEAD — {row[0]}:\n"
+                                    f"  Stage: {row[1]}  |  Hours in stage: {row[2]}h  "
+                                    f"|  SLA target: {row[3]}h  |  Warn at: {row[4]}h  "
+                                    f"|  Status: {row[5].upper()}"
+                                )
+                                if primary_intent == "general":
+                                    # Guard the dynamic intent against the frozen
+                                    # enum — an unexpected sla_status value must
+                                    # collapse to the base intent, never leak.
+                                    primary_intent = (
+                                        f"sla_lead_{row[5]}"
+                                        if row[5] in ("breach", "warn", "ok")
+                                        else "sla_lead"
+                                    )
+                                    # row[6] = person_id UUID — always populated.
+                                    # WA phone is a separate optional lookup.
+                                    person_uuid = row[6]
+                                    cur.execute(
+                                        "SELECT external_id FROM person_identity "
+                                        "WHERE person_id = %s AND channel = 'whatsapp' LIMIT 1",
+                                        (person_uuid,),
+                                    )
+                                    ph_row = cur.fetchone()
+                                    wa_phone = ph_row[0] if ph_row else None
+                                    lead_pid  = str(person_uuid) if person_uuid else None
+                                    logger.info(
+                                        f"[cockpit/ai/chat] SLA lead person_id={lead_pid!r} "
+                                        f"wa_phone={'yes' if wa_phone else 'none'}"
+                                    )
+                                    ctx_data = {
+                                        "type":           "sla_lead",
+                                        "name":           row[0],
+                                        "stage":          row[1],
+                                        "hours_in_stage": float(row[2]) if row[2] is not None else 0,
+                                        "target_hours":   row[3],
+                                        "warn_hours":     row[4],
+                                        "sla_status":     row[5],
+                                        "person_id":      lead_pid,
+                                        "wa_phone":       wa_phone,
+                                    }
+                            else:
+                                context_blocks.append(
+                                    f"LEAD CONTEXT: {chip}  (no matching record — "
+                                    f"the person may be closed/snoozed)"
+                                )
+
+                    # Follower growth / community growth
+                    elif "follower growth" in chip_l or "growth trend" in chip_l:
+                        community_size = int(_get_config("analytics.community_size") or 0)
+                        cur.execute(
+                            "SELECT to_char(date_trunc('week', followed_at), 'YYYY-MM-DD'), COUNT(*) "
+                            "FROM followers WHERE followed_at IS NOT NULL "
+                            "GROUP BY 1 ORDER BY 1 DESC LIMIT 8"
+                        )
+                        rows = cur.fetchall()
+                        weekly = [{"week": wk, "new_followers": n} for wk, n in reversed(rows)]
+                        lines = [f"  {r['week']}: +{r['new_followers']} new followers" for r in weekly]
+                        context_blocks.append(
+                            f"FOLLOWER GROWTH (community total: {community_size:,}):\n" +
+                            ("\n".join(lines) if lines else "  No weekly data available")
+                        )
+                        if primary_intent == "general":
+                            primary_intent = "growth"
+                            ctx_data = {"type": "growth", "community_size": community_size, "weekly": weekly}
+
+                    # Funnel / conversion analysis
+                    elif "funnel" in chip_l or ("conversion" in chip_l and "pipeline" in chip_l):
+                        cur.execute(
+                            "SELECT from_stage, to_stage, unique_leads, conversion_pct, "
+                            "       avg_hours_in_stage "
+                            "FROM funnel_metrics ORDER BY from_stage, to_stage"
+                        )
+                        fm_rows = cur.fetchall()
+                        cur.execute(
+                            "SELECT stage, COUNT(*) FROM opportunities "
+                            "WHERE closed_at IS NULL GROUP BY stage"
+                        )
+                        stage_counts = {r[0]: r[1] for r in cur.fetchall()}
+                        cur.execute("SELECT COUNT(DISTINCT person_id) FROM opportunities")
+                        total_leads = cur.fetchone()[0]
+                        lines = []
+                        for r in fm_rows:
+                            pct = f"{r[3]}%" if r[3] is not None else "—"
+                            vel = f"{r[4]}h avg time" if r[4] is not None else "velocity unknown"
+                            lines.append(f"  {r[0]} → {r[1]}: {r[2]} leads  {pct} conversion  {vel}")
+                        open_str = "  |  ".join(
+                            f"{k}: {v}" for k, v in sorted(stage_counts.items())
+                        ) or "no open leads"
+                        context_blocks.append(
+                            f"PIPELINE FUNNEL ({total_leads} total leads):\n" +
+                            "\n".join(lines) +
+                            f"\n\n  CURRENT OPEN LEADS: {open_str}"
+                        )
+                        if primary_intent == "general":
+                            primary_intent = "funnel"
+                            # Build a stage list aligned to the pipeline order
+                            pipeline_order = ["engaged", "qualified", "captured", "briefed", "booked"]
+                            stages_widget = []
+                            for sn in pipeline_order:
+                                pair = next((r for r in fm_rows if r[0] == sn), None)
+                                stages_widget.append({
+                                    "stage":    sn,
+                                    "count":    stage_counts.get(sn, 0),
+                                    "conv_pct": float(pair[3]) if pair and pair[3] is not None else None,
+                                })
+                            ctx_data = {
+                                "type":        "funnel",
+                                "total_leads": total_leads,
+                                "stages":      stages_widget,
+                            }
+
+                    # Stage-specific pipeline (e.g. "Qualified pipeline — 5 leads")
+                    elif "pipeline" in chip_l:
+                        matched_stage = None
+                        for sn in ("engaged", "qualified", "captured", "briefed", "booked"):
+                            if sn in chip_l:
+                                cur.execute(
+                                    "SELECT COUNT(*), "
+                                    "       ROUND(AVG(EXTRACT(EPOCH FROM (NOW()-stage_entered_at))/3600),1) "
+                                    "FROM opportunities WHERE stage = %s AND closed_at IS NULL",
+                                    (sn,),
+                                )
+                                row = cur.fetchone()
+                                avg_h = f"  |  avg {row[1]}h in stage" if row[1] else ""
+                                context_blocks.append(f"STAGE '{sn.upper()}': {row[0]} open leads{avg_h}")
+                                matched_stage = sn
+                                if primary_intent == "general":
+                                    primary_intent = "pipeline"
+                                    ctx_data = {
+                                        "type": "pipeline",
+                                        "stage": sn,
+                                        "count": row[0],
+                                        "avg_hours": float(row[1]) if row[1] is not None else None,
+                                    }
+                                break
+                        if not matched_stage:
+                            context_blocks.append(f"PIPELINE CONTEXT: {chip}")
+
+                    # Velocity analysis
+                    elif "velocity" in chip_l:
+                        for sn in ("engaged", "qualified", "captured", "briefed", "booked"):
+                            if sn in chip_l:
+                                cur.execute(
+                                    "SELECT avg_hours_in_stage, median_hours_in_stage, "
+                                    "       conversion_pct "
+                                    "FROM funnel_metrics WHERE from_stage = %s LIMIT 1",
+                                    (sn,),
+                                )
+                                row = cur.fetchone()
+                                if row and row[0] is not None:
+                                    context_blocks.append(
+                                        f"VELOCITY — {sn.upper()}:\n"
+                                        f"  Avg time before advancing: {row[0]}h\n"
+                                        f"  Median: {row[1]}h  |  Conversion: {row[2]}%"
+                                    )
+                                    if primary_intent == "general":
+                                        primary_intent = "velocity"
+                                        ctx_data = {
+                                            "type":       "velocity",
+                                            "stage":      sn,
+                                            "avg_hours":  float(row[0]),
+                                            "median_hours": float(row[1]) if row[1] is not None else None,
+                                            "conv_pct":   float(row[2]) if row[2] is not None else None,
+                                        }
+                                else:
+                                    context_blocks.append(
+                                        f"VELOCITY — {sn.upper()}: no data yet "
+                                        f"(leads haven't advanced from this stage)"
+                                    )
+                                break
+                        else:
+                            cur.execute(
+                                "SELECT from_stage, avg_hours_in_stage, conversion_pct "
+                                "FROM funnel_metrics WHERE avg_hours_in_stage IS NOT NULL "
+                                "ORDER BY from_stage"
+                            )
+                            rows = cur.fetchall()
+                            lines = [f"  {r[0]}: avg {r[1]}h, {r[2]}% conversion" for r in rows]
+                            context_blocks.append(
+                                "STAGE VELOCITY (all stages):\n" +
+                                ("\n".join(lines) if lines else "  No velocity data yet")
+                            )
+                            if primary_intent == "general":
+                                primary_intent = "velocity"
+
+                    # Community / reach / conversation
+                    elif any(kw in chip_l for kw in ("community", "reach", "conversation",
+                                                       "likes", "comments", "content")):
+                        community_size = int(_get_config("analytics.community_size") or 0)
+                        cur.execute("SELECT COUNT(*) FROM likers")
+                        total_likes = cur.fetchone()[0]
+                        cur.execute("SELECT COUNT(*) FROM comments")
+                        total_comments = cur.fetchone()[0]
+                        cur.execute("SELECT COUNT(*) FROM posts")
+                        total_posts = cur.fetchone()[0]
+                        context_blocks.append(
+                            f"COMMUNITY METRICS:\n"
+                            f"  Total community size: {community_size:,}\n"
+                            f"  Total tracked likes:  {total_likes:,}\n"
+                            f"  Total comments:       {total_comments:,}\n"
+                            f"  Total posts tracked:  {total_posts:,}"
+                        )
+                        if primary_intent == "general":
+                            primary_intent = "community"
+                            ctx_data = {
+                                "type": "community",
+                                "community_size": community_size,
+                                "total_likes":    total_likes,
+                                "total_comments": total_comments,
+                                "total_posts":    total_posts,
+                            }
+
+                    # Post engagement: specific shortcode OR top-posts aggregate
+                    elif "post" in chip_l:
+                        shortcode = next(
+                            (t.strip("·!,.") for t in chip.split()
+                             if len(t) > 6 and t[0].isupper() and t.replace("-","").isalnum()),
+                            None
+                        )
+                        if shortcode:
+                            cur.execute("SELECT COUNT(*) FROM likers WHERE post_shortcode = %s", (shortcode,))
+                            lk = cur.fetchone()[0]
+                            cur.execute("SELECT COUNT(*) FROM comments WHERE post_shortcode = %s", (shortcode,))
+                            cm = cur.fetchone()[0]
+                            context_blocks.append(f"POST {shortcode}: {lk:,} likes, {cm:,} comments")
+                            if primary_intent == "general":
+                                primary_intent = "post"
+                                ctx_data = {"type": "post", "shortcode": shortcode, "likes": lk, "comments": cm}
+                        else:
+                            # No shortcode → return top-posts aggregate
+                            cur.execute(
+                                "WITH lk AS (SELECT post_shortcode, COUNT(*) c FROM likers GROUP BY 1), "
+                                "     cm AS (SELECT post_shortcode, COUNT(*) c FROM comments GROUP BY 1) "
+                                "SELECT p.post_shortcode, COALESCE(lk.c,0), COALESCE(cm.c,0) "
+                                "FROM posts p "
+                                "LEFT JOIN lk ON lk.post_shortcode = p.post_shortcode "
+                                "LEFT JOIN cm ON cm.post_shortcode = p.post_shortcode "
+                                "ORDER BY COALESCE(lk.c,0) DESC LIMIT 5"
+                            )
+                            top = cur.fetchall()
+                            lines = [f"  #{i+1} {r[0]}: {r[1]:,} likes, {r[2]:,} comments"
+                                     for i, r in enumerate(top)]
+                            context_blocks.append("TOP POSTS BY LIKES:\n" + "\n".join(lines))
+                            if primary_intent == "general":
+                                primary_intent = "top_posts"
+                                ctx_data = {
+                                    "type": "top_posts",
+                                    "posts": [{"shortcode": r[0], "likes": r[1], "comments": r[2]} for r in top],
+                                }
+
+                    # Booked / north-star
+                    elif "booked" in chip_l or "north star" in chip_l:
+                        cur.execute("SELECT COUNT(*) FROM bookings")
+                        total_b = cur.fetchone()[0]
+                        cur.execute(
+                            "SELECT COUNT(*) FROM opportunities "
+                            "WHERE stage = 'booked' AND closed_at IS NULL"
+                        )
+                        open_b = cur.fetchone()[0]
+                        context_blocks.append(
+                            f"BOOKINGS: {total_b} total all-time  "
+                            f"|  {open_b} currently in 'Booked' stage"
+                        )
+
+                    else:
+                        context_blocks.append(f"CONTEXT: {chip}")
+
+    except Exception as db_err:
+        logger.error(f"[cockpit/ai/chat] context build error: {db_err}")
+        # Degrade gracefully — continue with whatever context was collected
+
+    return chips, context_blocks, primary_intent, ctx_data
+
+
+def _execute_ai_plan(plan: list) -> list:
+    """
+    Run validated planner steps against ONE pooled connection inside a
+    read-only sub-transaction (same guard as the raw-SQL endpoint at
+    _run_readonly_query, minus the nexus_reader role drop — planner SQL is
+    ours, parameter-bound, and needs the lead tables that role blocks).
+    Postgres itself rejects any write while the guard savepoint is active.
+    A failing tool rolls back only its own step savepoint so later steps
+    still run on a clean state.
+    """
+    results: list = []
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SAVEPOINT _ai_plan_guard")
+            cur.execute("SET LOCAL transaction_read_only = on")
+            try:
+                for step in plan:
+                    cur.execute("SAVEPOINT _ai_plan_step")
+                    try:
+                        results.append(nexus_ai_planner.run_tool(
+                            step, cur,
+                            nexus_ai_planner.DEFAULT_TENANT_ID, _get_config,
+                        ))
+                        cur.execute("RELEASE SAVEPOINT _ai_plan_step")
+                    except Exception as tool_err:
+                        cur.execute("ROLLBACK TO SAVEPOINT _ai_plan_step")
+                        cur.execute("RELEASE SAVEPOINT _ai_plan_step")
+                        logger.error(
+                            f"[cockpit/ai/chat] tool '{step.tool}' failed: {tool_err}"
+                        )
+            finally:
+                # Restores transaction_read_only to its pre-savepoint value and
+                # leaves the pooled connection clean.
+                cur.execute("ROLLBACK TO SAVEPOINT _ai_plan_guard")
+                cur.execute("RELEASE SAVEPOINT _ai_plan_guard")
+    return results
+
+
+@app.post("/api/cockpit/ai/chat")
+def cockpit_ai_chat(
+    body: _AiChatBody,
+    user: dict = Depends(require_cockpit_user),
+):
+    """
+    NLP brain for the cockpit AI assistant — tool-use query planner.
+
+    Call 1 (plan): the LLM sees the nexus.ai_planner tool catalog and returns a
+    strict-JSON plan — tool names + typed args only, never SQL. The plan is
+    parsed defensively and validated; ANY failure falls back to the legacy
+    chip router so the endpoint cannot go dark. Kill switch: set app_config
+    `ai_chat.planner_enabled` to "false" to force the legacy path.
+
+    Execute: validated steps run parameter-bound inside a read-only
+    transaction, every query tenant-scoped and LIMIT'd.
+
+    Call 2 (reply): the LLM answers grounded in the fetched blocks only.
+    intent / context_data / actions — the frozen frontend contract — are
+    assembled deterministically in Python, never by the model.
+    """
+    msg   = body.message.strip()
+    chips = [c.strip() for c in body.chips if c.strip()]
+
+    if not msg and not chips:
+        return {
+            "status": "error", "reply": "Please enter a question.",
+            "intent": "general", "context_data": None, "actions": _AI_ACTIONS["general"],
+        }
+
+    planner_enabled = _get_config("ai_chat.planner_enabled").strip().lower() != "false"
+    results = None
+    if planner_enabled:
+        try:
+            plan_raw = _call_llm(
+                nexus_ai_planner.build_planner_prompt(msg, chips, body.history)
+            )
+            plan    = nexus_ai_planner.parse_plan(_parse_llm_json(plan_raw))
+            results = _execute_ai_plan(plan)
+            logger.info(
+                f"[cockpit/ai/chat] planner plan={[s.tool for s in plan]} "
+                f"executed={len(results)}"
+            )
+        except Exception as plan_err:
+            logger.warning(
+                f"[cockpit/ai/chat] planner failed → legacy fallback: {plan_err}"
+            )
+            results = None
+
+    if results is not None:
+        context_blocks = [r.context_block for r in results]
+        primary_intent, ctx_data = nexus_ai_planner.resolve_contract(results)
+    else:
+        chips, context_blocks, primary_intent, ctx_data = _legacy_ai_chat_context(msg, chips)
+
+    full_prompt = nexus_ai_planner.build_reply_prompt(msg, chips, body.history, context_blocks)
+
+    logger.info(f"[cockpit/ai/chat] chips={len(chips)} context_blocks={len(context_blocks)} "
+                f"msg_len={len(msg)} intent={primary_intent}")
+
+    # ── Call the reply LLM ────────────────────────────────────────────────────
+    # Resolve action list: try specific intent variant (e.g. sla_lead_breach),
+    # then base intent (e.g. sla_lead), then general fallback.
+    actions = (
+        _AI_ACTIONS.get(primary_intent)
+        or _AI_ACTIONS.get(primary_intent.rsplit("_", 1)[0])
+        or _AI_ACTIONS["general"]
+    )
+
+    try:
+        reply = _call_llm(full_prompt)
+        return {
+            "status":       "success",
+            "reply":        reply,
+            "intent":       primary_intent,
+            "context_data": ctx_data,
+            "actions":      actions,
+        }
+    except TimeoutError:
+        return {
+            "status": "error",
+            "reply":  "The AI took too long to respond — please try again in a moment.",
+            "intent": "general", "context_data": None, "actions": _AI_ACTIONS["general"],
+        }
+    except Exception as llm_err:
+        err_s = str(llm_err).lower()
+        if "429" in err_s or "quota" in err_s or "resource_exhausted" in err_s:
+            return {
+                "status": "error",
+                "reply":  "The AI is temporarily busy — please wait ~30 seconds and retry.",
+                "intent": "general", "context_data": None, "actions": _AI_ACTIONS["general"],
+            }
+        logger.error(f"[cockpit/ai/chat] LLM error: {llm_err}", exc_info=True)
+        return {
+            "status": "error",
+            "reply":  "Something went wrong. Please try again.",
+            "intent": "general", "context_data": None, "actions": _AI_ACTIONS["general"],
+        }
+
+
+# ── WhatsApp Draft Generator ─────────────────────────────────────────────────
+#
+# POST /api/cockpit/whatsapp/draft
+#   { person_id: str }
+#   → { status, draft, wa_phone, person_name }
+#
+# Reuses the existing Copilot infrastructure (nexus.copilot PERSONA +
+# DRAFTING_RULES + build_draft_prompt) to generate a personalised Hebrew
+# WhatsApp message.  Frontend presents this in an editable card; Erez reviews
+# and clicks "Open in WhatsApp" to pre-fill wa.me with the draft.
+
+class _WaDraftBody(BaseModel):
+    person_id: str
+
+
+@app.post("/api/cockpit/whatsapp/draft")
+def cockpit_whatsapp_draft(
+    body: _WaDraftBody,
+    user: dict = Depends(require_cockpit_user),
+):
+    """
+    Generate a personalised Hebrew WhatsApp draft for a lead, using:
+      • Person-360 (name / stage / essence / goal / tension)
+      • WhatsApp conversation thread (last 30 messages)
+      • Copilot persona + drafting rules (Israeli Hebrew, short, eye-level)
+
+    Returns the draft text + the lead's WhatsApp phone number so the frontend
+    can open wa.me/{phone}?text={draft} in a new tab.
+    """
+    person_id = body.person_id.strip()
+    if not person_id:
+        return {"status": "error", "detail": "person_id is required."}
+
+    try:
+        with get_db_conn() as conn:
+            # ── Person-360 ────────────────────────────────────────────────────
+            person = _db_person360(conn, person_id)
+            if not person:
+                return {"status": "error", "detail": "Lead not found."}
+
+            # ── WhatsApp thread (last 30 messages) ───────────────────────────
+            thread = _db_whatsapp_thread(conn, person_id, limit=30)
+
+            # ── WhatsApp phone number ─────────────────────────────────────────
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT external_id FROM person_identity "
+                    "WHERE person_id = %s AND channel = 'whatsapp' LIMIT 1",
+                    (person_id,),
+                )
+                pi_row = cur.fetchone()
+            wa_phone = pi_row[0] if pi_row else None
+
+        # ── Build the draft prompt ───────────────────────────────────────────
+        # The Copilot PERSONA + DRAFTING_RULES already mandate short Hebrew text.
+        # Re-state the language requirement in the intent instruction so Gemini
+        # can't drift to English even when person data is sparse.
+        stage_label = (person.get("stage") or "unknown stage").capitalize()
+        intent = (
+            f"WRITE IN HEBREW ONLY (עברית בלבד). "
+            f"הלקוח נמצא בשלב {stage_label} ולא הגיב זמן רב. "
+            f"כתוב הודעת מעקב קצרה (1-3 משפטים), אנושית ואישית. "
+            f"המטרה: להחזיר את הלקוח לשיחה ולקדם לשלב הבא."
+        )
+        prompt = nexus_copilot.build_draft_prompt(person, thread, intent=intent)
+
+        draft = _call_llm(prompt)
+        logger.info(
+            f"[cockpit/whatsapp/draft] person={person_id!r} "
+            f"has_phone={wa_phone is not None} draft_len={len(draft)}"
+        )
+        return {
+            "status":      "success",
+            "draft":       draft,
+            "wa_phone":    wa_phone or "",
+            "person_name": person.get("name") or "Lead",
+        }
+
+    except TimeoutError:
+        return {"status": "error", "detail": "The AI took too long — please try again."}
+    except Exception as e:
+        logger.error(f"[cockpit/whatsapp/draft] error for {person_id!r}: {e}", exc_info=True)
+        return {"status": "error", "detail": "Could not generate draft."}
+
+
+# ── WhatsApp Phone Save — data enrichment from the draft card ─────────────────
+#
+# POST /api/cockpit/whatsapp/phone
+#   { person_id: str, phone: str }
+#   → { status, wa_phone }
+#
+# Persists an operator-entered phone number into person_identity so the draft
+# card never hits "no phone on file" again for this lead. person_identity has
+# no unique constraint on (person_id, channel), so we check-then-write rather
+# than relying on ON CONFLICT.
+
+def _normalize_wa_phone(raw: str) -> Optional[str]:
+    """
+    Normalise a free-typed phone into the wa.me digit format (e.g. 972547104559).
+    Handles Israeli local (0XX…→972XX…) and bare mobile (5XXXXXXXX→972…).
+    Returns None if the result isn't a plausible international number.
+    """
+    digits = re.sub(r"\D", "", raw or "")
+    if not digits:
+        return None
+    if digits.startswith("00"):          # 00<cc> international prefix
+        digits = digits[2:]
+    if digits.startswith("0"):           # Israeli local: 054… → 97254…
+        digits = "972" + digits[1:]
+    elif len(digits) == 9 and digits.startswith("5"):  # bare IL mobile
+        digits = "972" + digits
+    if not (10 <= len(digits) <= 15):    # E.164 plausibility
+        return None
+    return digits
+
+
+class _WaPhoneBody(BaseModel):
+    person_id: str
+    phone:     str
+
+
+@app.post("/api/cockpit/whatsapp/phone")
+def cockpit_whatsapp_phone(
+    body: _WaPhoneBody,
+    user: dict = Depends(require_cockpit_user),
+):
+    """Save / update a lead's WhatsApp phone number in person_identity."""
+    person_id = body.person_id.strip()
+    if not person_id:
+        return {"status": "error", "detail": "person_id is required."}
+
+    wa_phone = _normalize_wa_phone(body.phone)
+    if not wa_phone:
+        return {
+            "status": "error",
+            "detail": "That doesn't look like a valid phone number.",
+        }
+
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                # Guard: the person must exist (FK would fail anyway, but a clean
+                # message beats a 500).
+                cur.execute("SELECT 1 FROM person WHERE id = %s", (person_id,))
+                if cur.fetchone() is None:
+                    return {"status": "error", "detail": "Lead not found."}
+
+                # Check-then-write (no unique index to ON CONFLICT on).
+                cur.execute(
+                    "SELECT id FROM person_identity "
+                    "WHERE person_id = %s AND channel = 'whatsapp' LIMIT 1",
+                    (person_id,),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    cur.execute(
+                        "UPDATE person_identity SET external_id = %s WHERE id = %s",
+                        (wa_phone, existing[0]),
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO person_identity (person_id, channel, external_id, confidence) "
+                        "VALUES (%s, 'whatsapp', %s, 'operator_entered')",
+                        (person_id, wa_phone),
+                    )
+                conn.commit()
+
+        logger.info(f"[cockpit/whatsapp/phone] saved {wa_phone} for person={person_id!r}")
+        return {"status": "success", "wa_phone": wa_phone}
+
+    except Exception as e:
+        logger.error(f"[cockpit/whatsapp/phone] error for {person_id!r}: {e}", exc_info=True)
+        return {"status": "error", "detail": "Could not save the phone number."}
+
+
+# ── WhatsApp Outreach Logging — closes the Action Loop ───────────────────────
+#
+# POST /api/cockpit/whatsapp/outreach
+#   { person_id, draft_preview? }
+#   → { status, logged }
+#
+# Fired (fire-and-forget, keepalive) when the operator clicks "Open in WhatsApp"
+# on the draft card. Logs an `outreach_click` interaction — the kind the V1 build
+# plan reserved for exactly this wa.me deep-link click, already consumed by the
+# work-queue ranker. This is the operator-touch signal that the migration-004
+# accountability SLA reads: logging it resets the lead's SLA clock to green.
+#
+# Honest boundary: `outreach_click` records *intent to reach out via wa.me* — NOT
+# a confirmed send. It does not write outbound_messages (which stays reserved for
+# confirmed sends with a real body, e.g. the Kapso API path). The system never
+# claims a message was delivered when it can only know the operator opened the link.
+
+class _WaOutreachBody(BaseModel):
+    person_id:     str
+    draft_preview: str = ""
+
+
+@app.post("/api/cockpit/whatsapp/outreach")
+def cockpit_whatsapp_outreach(
+    body: _WaOutreachBody,
+    user: dict = Depends(require_cockpit_user),
+):
+    """Log an operator outreach-click so the accountability SLA clock resets."""
+    person_id = body.person_id.strip()
+    if not person_id:
+        return {"status": "error", "detail": "person_id is required."}
+
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM person WHERE id = %s", (person_id,))
+                if cur.fetchone() is None:
+                    return {"status": "error", "detail": "Lead not found."}
+                # Resolve the open opportunity for payload context (optional).
+                cur.execute(
+                    "SELECT id FROM opportunities "
+                    "WHERE person_id = %s AND closed_at IS NULL "
+                    "ORDER BY stage_entered_at DESC NULLS LAST LIMIT 1",
+                    (person_id,),
+                )
+                opp = cur.fetchone()
+                opportunity_id = str(opp[0]) if opp else None
+
+            # Idempotent per-minute: double-clicks collapse via dedup_key
+            # (interactions_dedup_uniq partial unique index + ON CONFLICT DO NOTHING).
+            minute_bucket = int(time.time() // 60)
+            preview = (body.draft_preview or "").strip()[:120]
+            written = nexus_interactions.log_interaction(
+                conn, "outreach_click", "whatsapp",
+                person_id=person_id,
+                payload={
+                    "via": "wa.me",
+                    "by": "operator",
+                    "opportunity_id": opportunity_id,
+                    "draft_preview": preview,
+                },
+                dedup_key=f"outreach:{person_id}:{minute_bucket}",
+                source="cockpit",
+            )
+            conn.commit()
+
+        logger.info(f"[cockpit/whatsapp/outreach] person={person_id!r} logged={written}")
+        return {"status": "success", "logged": written}
+
+    except Exception as e:
+        logger.error(f"[cockpit/whatsapp/outreach] error for {person_id!r}: {e}", exc_info=True)
+        return {"status": "error", "detail": "Could not log outreach."}
 
 
 # ── Content Studio (Sprint 5, the Studio pillar) — the cockpit's first write

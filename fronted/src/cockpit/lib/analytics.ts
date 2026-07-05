@@ -30,7 +30,12 @@ export async function fetchAnalytics(token: string, signal?: AbortSignal): Promi
     signal,
   })
   if (!res.ok) throw new Error(`analytics ${res.status}`)
-  return (await res.json()) as AnalyticsData
+  const data = await res.json() as { status?: string; community?: unknown } & Partial<AnalyticsData>
+  // Backend returns HTTP 200 with {"status":"error"} on DB failures — treat as an error.
+  if (data.status === 'error' || !data.community) {
+    throw new Error('analytics returned error payload')
+  }
+  return data as AnalyticsData
 }
 
 /** Compact number for KPI tiles: 709 · 11k · 75.2k · 268k. */
@@ -60,7 +65,96 @@ export function deriveKpis(stages: Stage[]): Kpi[] {
   ]
 }
 
-// Dev-bypass sample so the Bento is populated during local UI work. Guarded by
+// ── Funnel analytics ──────────────────────────────────────────────────────────
+
+export type FunnelPair = {
+  from_stage: string
+  to_stage: string
+  transition_count: number
+  unique_leads: number
+  total_entered_from_stage: number
+  conversion_pct: number | null
+  avg_hours_in_stage: number | null
+  median_hours_in_stage: number | null
+  last_transition_at: string | null
+}
+
+export type FunnelStage = {
+  stage: string
+  ever_entered: number
+  open_now: number
+}
+
+export type FunnelData = {
+  pairs: FunnelPair[]
+  stages: FunnelStage[]
+}
+
+export type SlaStatus = 'ok' | 'warn' | 'breach' | 'unknown'
+
+/**
+ * Who the accountability clock is waiting on (migration 004):
+ *   'operator'  — the lead replied; we owe the next move ("Your move")
+ *   'lead'      — we reached out; awaiting their reply ("Their move")
+ *   'untouched' — never engaged either direction ("New")
+ */
+export type WaitingOn = 'operator' | 'lead' | 'untouched'
+
+export type SlaLead = {
+  opportunity_id: string
+  person_id: string
+  person_name: string
+  stage: string
+  stage_entered_at: string | null
+  hours_in_stage: number | null
+  target_hours: number | null
+  warn_hours: number | null
+  sla_status: SlaStatus
+  /** Hours since accountable_since — the TRUE SLA clock (resets on operator touch/inbound). */
+  hours_since_touch: number | null
+  waiting_on: WaitingOn
+}
+
+export type SlaData = {
+  leads: SlaLead[]
+  summary: { breach: number; warn: number; ok: number; unknown: number; total: number }
+}
+
+export async function fetchFunnel(
+  token: string,
+  days: number | null,
+  signal?: AbortSignal,
+): Promise<FunnelData> {
+  const url = days
+    ? `${API_BASE}/api/cockpit/analytics/funnel?days=${days}`
+    : `${API_BASE}/api/cockpit/analytics/funnel`
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, signal })
+  if (!res.ok) throw new Error(`funnel ${res.status}`)
+  const data = await res.json() as { status?: string } & Partial<FunnelData>
+  if (data.status === 'error' || !data.pairs) throw new Error('funnel returned error payload')
+  return data as FunnelData
+}
+
+export async function fetchSla(token: string, signal?: AbortSignal): Promise<SlaData> {
+  const res = await fetch(`${API_BASE}/api/cockpit/analytics/sla`, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal,
+  })
+  if (!res.ok) throw new Error(`sla ${res.status}`)
+  return (await res.json()) as SlaData
+}
+
+/** Format hours into a readable string: 2h, 1d 6h, 3d */
+export function fmtHours(h: number | null): string {
+  if (h === null) return '—'
+  if (h < 1) return '<1h'
+  if (h < 24) return `${Math.round(h)}h`
+  const d = Math.floor(h / 24)
+  const rem = Math.round(h % 24)
+  return rem > 0 ? `${d}d ${rem}h` : `${d}d`
+}
+
+// ── Dev-bypass sample so the Bento is populated during local UI work. Guarded by
 // import.meta.env.DEV → dead-code-eliminated from production builds.
 const sampleGrowth: GrowthPoint[] = import.meta.env.DEV
   ? [62, 65, 64, 70, 72, 78, 80, 88, 92, 101, 108, 120].map((followers, i) => ({

@@ -12,16 +12,18 @@
  *   - Amber left-border for 'info_requested' actions (waiting state)
  */
 
+import { useState } from 'react'
+import { triggerAgent } from '../lib/api'
 import type { AgentRun } from '../lib/useAgentRuns'
 import { relativeTime } from '../lib/pipeline'
 
 const ACTION_LABELS: Record<string, string> = {
-  stage_advanced:  'Stage advanced',
-  whatsapp_sent:   'WhatsApp sent',
-  info_requested:  'Info requested',
-  flag_set:        'Flag set',
-  note_added:      'Note added',
-  skipped:         'Skipped',
+  stage_advanced: 'Stage advanced',
+  whatsapp_sent:  'WhatsApp sent',
+  info_requested: 'Info requested',
+  flag_set:       'Flag set',
+  note_added:     'Note added',
+  skipped:        'Skipped',
 }
 
 const ACTION_GLYPH: Record<string, string> = {
@@ -34,26 +36,43 @@ const ACTION_GLYPH: Record<string, string> = {
 }
 
 const STATUS_CHIP: Record<string, { label: string; className: string }> = {
-  running:  { label: 'Running',  className: 'text-accent bg-accent/15' },
-  pending:  { label: 'Pending',  className: 'text-muted bg-raised' },
-  success:  { label: 'Done',     className: 'text-success bg-success/10' },
-  skipped:  { label: 'Skipped',  className: 'text-faint bg-raised' },
-  failed:   { label: 'Failed',   className: 'text-danger bg-danger/10' },
+  running: { label: 'Running', className: 'text-accent bg-accent/15' },
+  pending: { label: 'Pending', className: 'text-muted bg-raised' },
+  success: { label: 'Done',    className: 'text-success bg-success/10' },
+  skipped: { label: 'Skipped', className: 'text-faint bg-raised' },
+  failed:  { label: 'Failed',  className: 'text-danger bg-danger/10' },
 }
 
 const TRIGGER_LABELS: Record<string, string> = {
-  stage_change:  'stage change',
-  action_loop:   'action loop',
-  cron:          'scheduled sweep',
-  manual:        'manual trigger',
+  stage_change: 'stage change',
+  action_loop:  'action loop',
+  cron:         'scheduled sweep',
+  manual:       'manual trigger',
 }
 
 interface AgentActivityFeedProps {
   runs: AgentRun[]
   loading: boolean
+  personId: string
+  token: string | null
 }
 
-export function AgentActivityFeed({ runs, loading }: AgentActivityFeedProps) {
+export function AgentActivityFeed({ runs, loading, personId, token }: AgentActivityFeedProps) {
+  const [firing, setFiring] = useState(false)
+  const [fireResult, setFireResult] = useState<'ok' | 'err' | null>(null)
+
+  const isRunning = runs.some((r) => r.status === 'running' || r.status === 'pending')
+
+  const handleTrigger = async () => {
+    if (!token || firing || isRunning) return
+    setFiring(true)
+    setFireResult(null)
+    const { ok } = await triggerAgent(token, personId)
+    setFireResult(ok ? 'ok' : 'err')
+    setFiring(false)
+    setTimeout(() => setFireResult(null), 3000)
+  }
+
   if (loading) {
     return (
       <div className="flex items-center gap-2 py-6 text-xs text-faint">
@@ -63,24 +82,39 @@ export function AgentActivityFeed({ runs, loading }: AgentActivityFeedProps) {
     )
   }
 
-  if (runs.length === 0) {
-    return (
-      <div className="py-6 text-center">
-        <p className="font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
-          No agent activity yet
-        </p>
-        <p className="mt-1 text-xs text-muted">
-          The qualification agent will run after the next action on this lead.
-        </p>
-      </div>
-    )
-  }
-
   return (
     <div className="flex flex-col gap-3">
-      <div className="font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
-        Agent log
+      {/* Header row: label + "✦ Run agent" button */}
+      <div className="flex items-center justify-between">
+        <div className="font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
+          Agent log
+        </div>
+        {token && (
+          <button
+            type="button"
+            onClick={handleTrigger}
+            disabled={firing || isRunning}
+            title={isRunning ? 'Agent already running' : 'Manually trigger the qualification agent'}
+            className="inline-flex items-center gap-1.5 rounded-control border border-accent/30 bg-accent/10 px-2.5 py-1 font-mono text-[10px] text-accent transition-colors hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <span aria-hidden className="text-[8px]">✦</span>
+            {firing ? 'Firing…' : isRunning ? 'Running…' : 'Run agent'}
+            {fireResult === 'ok' && <span className="ml-0.5 text-success">✓</span>}
+            {fireResult === 'err' && <span className="ml-0.5 text-danger">✗</span>}
+          </button>
+        )}
       </div>
+
+      {runs.length === 0 && (
+        <div className="py-4 text-center">
+          <p className="font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
+            No agent activity yet
+          </p>
+          <p className="mt-1 text-xs text-muted">
+            Click "Run agent" above to trigger the qualification agent.
+          </p>
+        </div>
+      )}
 
       {runs.map((run) => {
         const chip = STATUS_CHIP[run.status] ?? STATUS_CHIP.skipped
@@ -88,36 +122,22 @@ export function AgentActivityFeed({ runs, loading }: AgentActivityFeedProps) {
         const agentLabel = run.agent_type.replace(/_/g, ' ')
 
         return (
-          <div
-            key={run.id}
-            className="rounded-control border border-line bg-surface"
-          >
+          <div key={run.id} className="rounded-control border border-line bg-surface">
             {/* Run header */}
             <div className="flex items-center gap-2 border-b border-line px-3 py-2">
-              <span
-                aria-hidden
-                className="text-[9px] leading-none text-glow"
-              >
-                ✦
-              </span>
+              <span aria-hidden className="text-[9px] leading-none text-glow">✦</span>
               <span className="flex-1 font-mono text-[11px] capitalize text-ink">
                 {agentLabel}
               </span>
-              <span
-                className={`rounded-control px-1.5 py-px font-mono text-[9px] uppercase tracking-wider ${chip.className}`}
-              >
+              <span className={`rounded-control px-1.5 py-px font-mono text-[9px] uppercase tracking-wider ${chip.className}`}>
                 {chip.label}
               </span>
             </div>
 
             {/* Run meta */}
             <div className="flex items-center justify-between px-3 py-1.5">
-              <span className="font-mono text-[10px] text-faint">
-                via {trigger}
-              </span>
-              <span className="font-mono text-[10px] text-faint">
-                {relativeTime(run.started_at)}
-              </span>
+              <span className="font-mono text-[10px] text-faint">via {trigger}</span>
+              <span className="font-mono text-[10px] text-faint">{relativeTime(run.started_at)}</span>
             </div>
 
             {/* Action rows */}
@@ -157,7 +177,7 @@ export function AgentActivityFeed({ runs, loading }: AgentActivityFeedProps) {
               </div>
             )}
 
-            {/* Error detail (failed runs only) */}
+            {/* Error detail */}
             {run.status === 'failed' && run.error && (
               <div className="border-t border-line px-3 py-2">
                 <span className="font-mono text-[10px] text-danger">{run.error}</span>
@@ -177,21 +197,13 @@ function _renderActionDetail(
     const from = action.payload.from as string | undefined
     const to   = action.payload.to as string | undefined
     if (from && to) {
-      return (
-        <p className="mt-0.5 font-mono text-[10px] text-muted">
-          {from} → {to}
-        </p>
-      )
+      return <p className="mt-0.5 font-mono text-[10px] text-muted">{from} → {to}</p>
     }
   }
   if (action.action_type === 'info_requested') {
     const missing = action.payload.fields_missing as string[] | undefined
     if (missing?.length) {
-      return (
-        <p className="mt-0.5 font-mono text-[10px] text-muted">
-          missing: {missing.join(', ')}
-        </p>
-      )
+      return <p className="mt-0.5 font-mono text-[10px] text-muted">missing: {missing.join(', ')}</p>
     }
   }
   if (action.action_type === 'whatsapp_sent') {
