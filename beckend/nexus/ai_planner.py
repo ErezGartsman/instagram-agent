@@ -266,12 +266,12 @@ def _t_sla_overview(cur, tenant_id, get_config, args) -> ToolResult:
         "JOIN person p ON p.id = s.person_id AND p.tenant_id = %(t)s "
         "GROUP BY s.sla_status LIMIT 10", {"t": tenant_id}))
     top = _rows(cur,
-        f"SELECT s.person_id, COALESCE(s.person_name,'Lead '||p.wa_ref_code,'Lead'), "
-        f"       s.stage, s.hours_in_stage, s.target_hours, s.sla_status "
-        f"FROM lead_sla_status s "
-        f"JOIN person p ON p.id = s.person_id AND p.tenant_id = %(t)s "
-        f"ORDER BY CASE s.sla_status WHEN 'breach' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END, "
-        f"         s.hours_in_stage DESC NULLS LAST LIMIT 5", {"t": tenant_id})
+        "SELECT s.person_id, COALESCE(s.person_name,'Lead '||p.wa_ref_code,'Lead'), "
+        "       s.stage, s.hours_in_stage, s.target_hours, s.sla_status "
+        "FROM lead_sla_status s "
+        "JOIN person p ON p.id = s.person_id AND p.tenant_id = %(t)s "
+        "ORDER BY CASE s.sla_status WHEN 'breach' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END, "
+        "         s.hours_in_stage DESC NULLS LAST LIMIT 5", {"t": tenant_id})
     wa_phones = {str(r[0]): r[1] for r in _rows(cur,
         "SELECT s3.person_id, pi.external_id FROM lead_sla_status s3 "
         "JOIN person p3 ON p3.id = s3.person_id AND p3.tenant_id = %(t)s "
