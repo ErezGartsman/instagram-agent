@@ -38,6 +38,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
+from nexus import ai_planner as nexus_ai_planner
 from nexus import bookings as nexus_bookings
 from nexus import copilot as nexus_copilot
 from nexus import db as nexus_db
@@ -2699,24 +2700,18 @@ class _AiChatBody(BaseModel):
     history: list[dict] = []
 
 
-@app.post("/api/cockpit/ai/chat")
-def cockpit_ai_chat(
-    body: _AiChatBody,
-    user: dict = Depends(require_cockpit_user),
-):
+def _legacy_ai_chat_context(
+    msg: str, chips: list[str]
+) -> tuple[list[str], list[str], str, dict | None]:
     """
-    NLP brain for the cockpit AI assistant.
+    LEGACY chip router — the original keyword-matching context builder, kept
+    byte-for-byte as the fallback path for the tool-use planner (flag
+    `ai_chat.planner_enabled`, and automatic on any plan parse/validation
+    failure). Do not extend this: new capabilities are registry entries in
+    nexus/ai_planner.py, never new elif branches here.
 
-    Parses each context chip into a targeted DB query to pull live data,
-    builds a grounded system prompt (pipeline schema + live numbers + recent
-    conversation history), then calls _call_llm for a real Gemini response.
+    Returns (chips, context_blocks, primary_intent, ctx_data).
     """
-    msg   = body.message.strip()
-    chips = [c.strip() for c in body.chips if c.strip()]
-
-    if not msg and not chips:
-        return {"status": "error", "reply": "Please enter a question."}
-
     # ── Action Chip Router ────────────────────────────────────────────────────
     # When the user clicks a follow-up action chip, the message arrives as plain
     # text with no chips[] array.  Map it to a synthetic chip so the DB query
@@ -2842,7 +2837,14 @@ def cockpit_ai_chat(
                                     f"|  Status: {row[5].upper()}"
                                 )
                                 if primary_intent == "general":
-                                    primary_intent = f"sla_lead_{row[5]}"
+                                    # Guard the dynamic intent against the frozen
+                                    # enum — an unexpected sla_status value must
+                                    # collapse to the base intent, never leak.
+                                    primary_intent = (
+                                        f"sla_lead_{row[5]}"
+                                        if row[5] in ("breach", "warn", "ok")
+                                        else "sla_lead"
+                                    )
                                     # row[6] = person_id UUID — always populated.
                                     # WA phone is a separate optional lookup.
                                     person_uuid = row[6]
@@ -3100,44 +3102,108 @@ def cockpit_ai_chat(
         logger.error(f"[cockpit/ai/chat] context build error: {db_err}")
         # Degrade gracefully — continue with whatever context was collected
 
-    # ── Build the grounded system prompt ──────────────────────────────────────
-    pipeline_ref = (
-        "Pipeline stages (in order): "
-        "Engaged (24h SLA) → Qualified (48h) → Captured (72h) → "
-        "Briefed (48h) → Booked (168h).  "
-        "'Booked' is the north-star conversion metric."
-    )
-    system = (
-        "You are Nexus AI — the analytics brain inside Erez Gartsman's private "
-        "command center (the Nexus Cockpit) for his coaching and therapy practice.\n"
-        "Speak like a sharp analyst briefing the operator: concise, data-driven, "
-        "actionable. Use the real numbers provided. Flag what needs attention. "
-        "Suggest one clear next action when relevant. "
-        "Never invent numbers that weren't given. Respond in English.\n\n"
-        f"PIPELINE: {pipeline_ref}"
-    )
+    return chips, context_blocks, primary_intent, ctx_data
 
-    if context_blocks:
-        system += (
-            "\n\nLIVE DATA pulled for this query:\n" +
-            "\n\n".join(context_blocks)
-        )
 
-    # Append recent conversation history for follow-up awareness
-    hist_lines = ""
-    for m in body.history[-6:]:
-        role = "User" if m.get("role") == "user" else "Nexus"
-        hist_lines += f"\n{role}: {m.get('content', '')[:400]}"
-    if hist_lines:
-        system += f"\n\nCONVERSATION SO FAR:{hist_lines}"
+def _execute_ai_plan(plan: list) -> list:
+    """
+    Run validated planner steps against ONE pooled connection inside a
+    read-only sub-transaction (same guard as the raw-SQL endpoint at
+    _run_readonly_query, minus the nexus_reader role drop — planner SQL is
+    ours, parameter-bound, and needs the lead tables that role blocks).
+    Postgres itself rejects any write while the guard savepoint is active.
+    A failing tool rolls back only its own step savepoint so later steps
+    still run on a clean state.
+    """
+    results: list = []
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SAVEPOINT _ai_plan_guard")
+            cur.execute("SET LOCAL transaction_read_only = on")
+            try:
+                for step in plan:
+                    cur.execute("SAVEPOINT _ai_plan_step")
+                    try:
+                        results.append(nexus_ai_planner.run_tool(
+                            step, cur,
+                            nexus_ai_planner.DEFAULT_TENANT_ID, _get_config,
+                        ))
+                        cur.execute("RELEASE SAVEPOINT _ai_plan_step")
+                    except Exception as tool_err:
+                        cur.execute("ROLLBACK TO SAVEPOINT _ai_plan_step")
+                        cur.execute("RELEASE SAVEPOINT _ai_plan_step")
+                        logger.error(
+                            f"[cockpit/ai/chat] tool '{step.tool}' failed: {tool_err}"
+                        )
+            finally:
+                # Restores transaction_read_only to its pre-savepoint value and
+                # leaves the pooled connection clean.
+                cur.execute("ROLLBACK TO SAVEPOINT _ai_plan_guard")
+                cur.execute("RELEASE SAVEPOINT _ai_plan_guard")
+    return results
 
-    user_turn = msg or "(No text — the user attached the context chips above. Analyse and provide insight.)"
-    full_prompt = f"{system}\n\nUser: {user_turn}\n\nNexus:"
+
+@app.post("/api/cockpit/ai/chat")
+def cockpit_ai_chat(
+    body: _AiChatBody,
+    user: dict = Depends(require_cockpit_user),
+):
+    """
+    NLP brain for the cockpit AI assistant — tool-use query planner.
+
+    Call 1 (plan): the LLM sees the nexus.ai_planner tool catalog and returns a
+    strict-JSON plan — tool names + typed args only, never SQL. The plan is
+    parsed defensively and validated; ANY failure falls back to the legacy
+    chip router so the endpoint cannot go dark. Kill switch: set app_config
+    `ai_chat.planner_enabled` to "false" to force the legacy path.
+
+    Execute: validated steps run parameter-bound inside a read-only
+    transaction, every query tenant-scoped and LIMIT'd.
+
+    Call 2 (reply): the LLM answers grounded in the fetched blocks only.
+    intent / context_data / actions — the frozen frontend contract — are
+    assembled deterministically in Python, never by the model.
+    """
+    msg   = body.message.strip()
+    chips = [c.strip() for c in body.chips if c.strip()]
+
+    if not msg and not chips:
+        return {
+            "status": "error", "reply": "Please enter a question.",
+            "intent": "general", "context_data": None, "actions": _AI_ACTIONS["general"],
+        }
+
+    planner_enabled = _get_config("ai_chat.planner_enabled").strip().lower() != "false"
+    results = None
+    if planner_enabled:
+        try:
+            plan_raw = _call_llm(
+                nexus_ai_planner.build_planner_prompt(msg, chips, body.history)
+            )
+            plan    = nexus_ai_planner.parse_plan(_parse_llm_json(plan_raw))
+            results = _execute_ai_plan(plan)
+            logger.info(
+                f"[cockpit/ai/chat] planner plan={[s.tool for s in plan]} "
+                f"executed={len(results)}"
+            )
+        except Exception as plan_err:
+            logger.warning(
+                f"[cockpit/ai/chat] planner failed → legacy fallback: {plan_err}"
+            )
+            results = None
+
+    if results is not None:
+        context_blocks = [r.context_block for r in results]
+        primary_intent, ctx_data = nexus_ai_planner.resolve_contract(results)
+    else:
+        chips, context_blocks, primary_intent, ctx_data = _legacy_ai_chat_context(msg, chips)
+
+    full_prompt = nexus_ai_planner.build_reply_prompt(msg, chips, body.history, context_blocks)
 
     logger.info(f"[cockpit/ai/chat] chips={len(chips)} context_blocks={len(context_blocks)} "
-                f"msg_len={len(msg)}")
+                f"msg_len={len(msg)} intent={primary_intent}")
 
-    # ── Call Gemini ───────────────────────────────────────────────────────────
+    # ── Call the reply LLM ────────────────────────────────────────────────────
     # Resolve action list: try specific intent variant (e.g. sla_lead_breach),
     # then base intent (e.g. sla_lead), then general fallback.
     actions = (
