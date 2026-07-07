@@ -42,6 +42,7 @@ from nexus import ai_planner as nexus_ai_planner
 from nexus import bookings as nexus_bookings
 from nexus import copilot as nexus_copilot
 from nexus import db as nexus_db
+from nexus import dossier as nexus_dossier
 from nexus import erasure as nexus_erasure
 from nexus import hooks as nexus_hooks
 from nexus import identity as nexus_identity
@@ -1952,6 +1953,184 @@ def cockpit_thread(person_id: str, user: dict = Depends(require_cockpit_user)):
         return {"status": "error", "detail": "Could not load conversation."}
 
 
+# ── Phase 3 — the proactive layer (Morning Briefing + Person Dossier) ────────
+# Deterministic diffs and narratives over data the spine already records:
+# no LLM call per view. The shaping brains live in nexus.dossier (pure,
+# unit-tested); these endpoints only gather rows.
+
+# Interaction kinds that represent the PERSON acting (vs. system/operator
+# bookkeeping like formation_run / alert_sent / crm_synced) — the only kinds
+# that count as "they came back" for the reopen diff.
+_PERSON_ACTIVITY_KINDS = [
+    "session_started", "icebreaker_hit", "trigger_hit", "captured",
+    "context_provided", "qualified", "outreach_click", "booking_created",
+]
+
+
+@app.get("/api/cockpit/briefing")
+def cockpit_briefing(user: dict = Depends(require_cockpit_user)):
+    """
+    The Morning Briefing — "what changed overnight", as a deterministic diff of
+    the last 24h: people who reopened after ≥7 days of silence, new leads that
+    arrived, and SLA warn/breach accountability. Items shape = the frontend
+    MorningBriefing contract ({tone, headline, detail, href, cta}); an empty
+    items list means a quiet night (the card simply doesn't render).
+    """
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. Reopened after silence: first person-activity event in the
+                #    window, measured against their last activity BEFORE it.
+                cur.execute(
+                    "WITH recent AS ("
+                    "  SELECT person_id, MIN(occurred_at) AS returned_at"
+                    "  FROM interactions"
+                    "  WHERE occurred_at >= NOW() - interval '24 hours'"
+                    "    AND person_id IS NOT NULL AND kind = ANY(%(kinds)s)"
+                    "  GROUP BY person_id"
+                    "), prior AS ("
+                    "  SELECT r.person_id, r.returned_at, MAX(i.occurred_at) AS last_before"
+                    "  FROM recent r"
+                    "  JOIN interactions i ON i.person_id = r.person_id"
+                    "   AND i.occurred_at < r.returned_at AND i.kind = ANY(%(kinds)s)"
+                    "  GROUP BY r.person_id, r.returned_at"
+                    ") "
+                    "SELECT p.id, COALESCE(p.display_name, 'Lead '||p.wa_ref_code, 'Lead'), "
+                    "       EXTRACT(EPOCH FROM (pr.returned_at - pr.last_before))/86400.0 "
+                    "FROM prior pr JOIN person p ON p.id = pr.person_id "
+                    "WHERE pr.last_before < pr.returned_at - make_interval(days => %(gap)s) "
+                    "ORDER BY 3 DESC LIMIT 5",
+                    {"kinds": _PERSON_ACTIVITY_KINDS,
+                     "gap": nexus_dossier.REOPEN_GAP_DAYS},
+                )
+                reopened = [
+                    {"person_id": str(r[0]), "name": r[1], "gap_days": float(r[2])}
+                    for r in cur.fetchall()
+                ]
+
+                # 2. New leads: opportunities opened in the window.
+                cur.execute(
+                    "SELECT COALESCE(p.display_name, 'Lead '||p.wa_ref_code, 'Lead') "
+                    "FROM opportunities o JOIN person p ON p.id = o.person_id "
+                    "WHERE o.opened_at >= NOW() - interval '24 hours' "
+                    "ORDER BY o.opened_at DESC LIMIT 10"
+                )
+                new_leads = [r[0] for r in cur.fetchall()]
+
+                # 3. Accountability: current warn/breach roster (migration 004 view).
+                cur.execute(
+                    "SELECT s.sla_status, "
+                    "       COALESCE(s.person_name, 'Lead '||p.wa_ref_code, 'Lead') "
+                    "FROM lead_sla_status s JOIN person p ON p.id = s.person_id "
+                    "WHERE s.sla_status IN ('warn','breach') "
+                    "ORDER BY s.hours_since_touch DESC NULLS LAST LIMIT 20"
+                )
+                warn_names, breach_names = [], []
+                for status, nm in cur.fetchall():
+                    (breach_names if status == "breach" else warn_names).append(nm)
+
+        items = nexus_dossier.build_briefing_items(
+            reopened=reopened, new_leads=new_leads,
+            warn_names=warn_names, breach_names=breach_names)
+        return {
+            "status": "success",
+            "compiled_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "items": items,
+        }
+    except Exception as e:
+        logger.error(f"[cockpit/briefing] query failed: {e}")
+        return {"status": "error", "detail": "Could not compile the briefing."}
+
+
+@app.get("/api/cockpit/person/{person_id}/dossier")
+def cockpit_person_dossier(person_id: str, user: dict = Depends(require_cockpit_user)):
+    """
+    The Person Dossier — the "held, not filed" deep-memory view in ONE payload:
+      person   — identity + Person-360 header (essence / goal / tension, stage,
+                 held-since, live memory-item count)
+      chapters — AI-summarized story chapters (nexus.dossier over the formed
+                 session_summaries; silences become "Went quiet" chapters)
+      trajectory — urgency-derived relationship line, calm positive
+      timeline — the raw signal log (person_timeline), latest 30
+    """
+    try:
+        pid = str(uuid.UUID(person_id))
+    except ValueError:
+        return {"status": "error", "detail": "Person not found."}
+    try:
+        with get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT p.display_name, p.wa_ref_code, p.first_seen_at, "
+                    "       pp.summary, pp.attributes, pp.facts, "
+                    "       o.stage, o.source_channel, ss.emotional_state "
+                    "FROM person p "
+                    "LEFT JOIN person_profile pp ON pp.person_id = p.id "
+                    "LEFT JOIN LATERAL (SELECT stage, source_channel FROM opportunities "
+                    "                   WHERE person_id = p.id AND closed_at IS NULL "
+                    "                   ORDER BY opened_at DESC LIMIT 1) o ON TRUE "
+                    "LEFT JOIN LATERAL (SELECT emotional_state FROM session_summaries "
+                    "                   WHERE person_id = p.id "
+                    "                   ORDER BY created_at DESC LIMIT 1) ss ON TRUE "
+                    "WHERE p.id = %s",
+                    (pid,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return {"status": "error", "detail": "Person not found."}
+                (display_name, wa_ref, first_seen_at, summary, attributes,
+                 facts, stage, source_channel, emotional_state) = row
+
+                cur.execute(
+                    "SELECT summary, topic, emotional_state, urgency, sensitive, created_at "
+                    "FROM session_summaries WHERE person_id = %s "
+                    "ORDER BY created_at ASC LIMIT 100",
+                    (pid,),
+                )
+                summaries = [
+                    {"summary": r[0], "topic": r[1], "emotional_state": r[2],
+                     "urgency": r[3], "sensitive": r[4], "created_at": r[5]}
+                    for r in cur.fetchall()
+                ]
+
+                cur.execute(
+                    "SELECT kind, occurred_at FROM interactions "
+                    "WHERE person_id = %s ORDER BY occurred_at DESC LIMIT 30",
+                    (pid,),
+                )
+                timeline = [
+                    {"kind": k, "label": nexus_work_queue.label_for_kind(k),
+                     "at": t.isoformat() if t else None}
+                    for (k, t) in cur.fetchall()
+                ]
+
+        attrs = attributes if isinstance(attributes, dict) else {}
+        facts_list = facts if isinstance(facts, list) else []
+        name = display_name or (f"Lead {wa_ref}" if wa_ref else "Lead")
+        return {
+            "status": "success",
+            "person": {
+                "id": pid,
+                "name": name,
+                "initials": nexus_work_queue.initials(name),
+                "channel": source_channel or "whatsapp",
+                "handle": wa_ref,
+                "stage": stage,
+                "held_since": first_seen_at.isoformat() if first_seen_at else None,
+                "essence": summary,
+                "goal": attrs.get("goal"),
+                "tension": attrs.get("tension") or emotional_state,
+                "memory_count": len(facts_list) + len(summaries),
+            },
+            "chapters": nexus_dossier.build_chapters(summaries),
+            "trajectory": nexus_dossier.build_trajectory(summaries),
+            "timeline": timeline,
+        }
+    except Exception as e:
+        logger.error(f"[cockpit/dossier] query failed for {person_id}: {e}")
+        return {"status": "error", "detail": "Could not load the dossier."}
+
+
 # ── P2 WS2 + WS4 — Copilot Reasoning Core (Gemini) ──────────────────────────
 # Drafting brain for the cockpit. The context endpoint returns the Person-360 +
 # thread so WS4 can inspect it. The stream endpoint calls the existing Gemini
@@ -2691,6 +2870,9 @@ _AI_ACTIONS: dict[str, list[str]] = {
     "general":         ["SLA dashboard",               "Pipeline overview", "Community metrics"],
     "sla_overview":    ["Show pipeline overview",      "Community metrics",  "Show velocity analysis"],
     "top_posts":       ["Show pipeline overview",      "Community metrics",  "Growth trend"],
+    "content_stats":   ["Show top posts",              "Growth trend",       "Community metrics"],
+    "growth_trend":    ["Content stats",               "Show top posts",     "Community metrics"],
+    "themes":          ["SLA dashboard",               "Pipeline overview",  "View all open leads"],
 }
 
 

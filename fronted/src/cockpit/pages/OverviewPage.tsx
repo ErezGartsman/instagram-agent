@@ -208,8 +208,7 @@ export function OverviewPage() {
       )}
 
       {/* The proactive layer: speaks first, before the operator asks anything.
-          Renders only while its mock (or, later, the briefing endpoint) has
-          content — prod stays clean until the backend ships. */}
+          Live on GET /api/cockpit/briefing; renders nothing on a quiet night. */}
       {state.kind === 'ready' && <MorningBriefing />}
 
       {state.kind === 'ready' && (

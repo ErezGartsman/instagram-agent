@@ -42,7 +42,7 @@ _FIELD_CAP = 120
 FORMATION_PROMPT = """\
 You are keeping a private pre-call memory note for Erez Gartsman, a relationships
 & dating coach, about ONE person he is in contact with. Read what we already know
-and a new conversation, then return an UPDATED understanding in HEBREW — the way a
+and a new conversation, then return an UPDATED understanding — the way a
 thoughtful coach jots notes before a call.
 
 === WHAT WE KNOW SO FAR (may be empty) ===
@@ -56,8 +56,8 @@ Return ONLY a strict JSON object, nothing else:
   "topic": "<2-5 Hebrew words>",
   "emotional_state": "<2-4 Hebrew words>",
   "urgency": <integer 1-5>,
-  "profile_summary": "<2-4 Hebrew sentences: who this person is, their situation, and what they seem to need — integrate prior knowledge WITH this conversation>",
-  "attributes": {{"relationship_status": "<value or null>", "core_concern": "<value or null>", "goal": "<value or null>", "communication_style": "<value or null>"}},
+  "profile_summary": "<2-4 ENGLISH sentences: who this person is, their situation, and what they seem to need — integrate prior knowledge WITH this conversation>",
+  "attributes": {{"relationship_status": "<value or null>", "core_concern": "<value or null>", "goal": "<ENGLISH value or null>", "tension": "<ENGLISH value or null>", "communication_style": "<value or null>"}},
   "facts": ["<short durable Hebrew fact grounded in their words>"]}}
 
 Rules:
@@ -66,11 +66,17 @@ Rules:
 - attributes: include a key's value only if the conversation supports it; else null.
 - attributes.core_concern: the PROBLEM weighing on them (e.g. "חוסר תקשורת בזוגיות").
 - attributes.goal: the ONE outcome they are working toward, in their own framing
-  (e.g. "להחליט אם להישאר", "לשקם אמון אחרי בגידה", "להבין אם שווה להמשיך מרחוק").
+  (e.g. "decide whether to stay before the anniversary", "rebuild trust after the affair").
   Capture it whenever the conversation makes it reasonably clear — null only when
   there is genuinely no signal. Do NOT invent a goal they did not express.
+- attributes.tension: the emotional tug-of-war underneath the goal, as two poles
+  (e.g. "guilt vs. relief", "pride vs. need"). Null when there is no clear signal.
+- LANGUAGE — this is a hard rule: output the summaries for Goal, Tension, and
+  Essence (the profile_summary) ONLY in English, regardless of the input language.
+  These three fields power an English-only operator dashboard. Everything else
+  (session_summary, topic, emotional_state, facts) stays in HEBREW.
 - facts: 0-4 concrete, durable facts. Nothing the person did not actually say.
-- HEBREW for all values. No markdown, no commentary, nothing outside the JSON.
+- No markdown, no commentary, nothing outside the JSON.
 """
 
 

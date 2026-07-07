@@ -237,6 +237,9 @@ HAPPY = {
                               ("972555000",)], {"name": "dana"}),
     "recent_outbound":      ([[("Dana Levi", "whatsapp", "hi", "erez", NOW)]], {"name": "dana"}),
     "recent_conversations": ([[("Dana Levi", "user", "hello", NOW)]], {"name": "dana"}),
+    "content_stats":        ([(10,), (250,), (40,)], {}),
+    "growth_trend":         ([[("2026-06-15", 4), ("2026-06-22", 6), ("2026-06-29", 10)]], {}),
+    "themes":               ([[("guilt vs. relief", 3), ("rebuild trust", 2)]], {}),
 }
 
 # Tables that carry tenant_id — any tool SQL touching them must bind it.
@@ -285,6 +288,10 @@ def test_frozen_context_data_shapes():
         "follower_growth":   ("growth", {"type", "community_size", "weekly"}),
         "top_posts":         ("top_posts", {"type", "posts"}),
         "post_engagement":   ("post", {"type", "shortcode", "likes", "comments"}),
+        "content_stats":     ("content_stats", {"type", "posts", "likes", "comments",
+                                                "avg_likes", "avg_comments"}),
+        "growth_trend":      ("growth_trend", {"type", "series", "delta_pct"}),
+        "themes":            ("themes", {"type", "themes"}),
     }
     for name, (intent, keys) in expect.items():
         script, args = HAPPY[name]
@@ -313,6 +320,51 @@ def test_person_tools_render_as_general_text():
     assert "Dana Levi" in res.context_block
     assert "SESSION SUMMARIES" in res.context_block
     assert "[sensitive]" in res.context_block         # Option B: operator sees everything
+
+
+def test_content_stats_math_and_zero_posts_omits_averages():
+    res, _ = run("content_stats", [(10,), (250,), (40,)])
+    assert res.ctx_data["avg_likes"] == 25.0
+    assert res.ctx_data["avg_comments"] == 4.0
+    # Zero posts: averages OMITTED (not null) so the widget renders '—'.
+    res, _ = run("content_stats", [(0,), (0,), (0,)])
+    assert res.intent == "content_stats"
+    assert "avg_likes" not in res.ctx_data and "avg_comments" not in res.ctx_data
+    assert "averages unavailable" in res.context_block
+
+
+def test_growth_trend_cumulative_series_and_delta():
+    res, _ = run("growth_trend", [[("2026-06-15", 4), ("2026-06-22", 6), ("2026-06-29", 10)]])
+    assert res.ctx_data["series"] == [
+        {"week": "2026-06-15", "followers": 4},
+        {"week": "2026-06-22", "followers": 10},
+        {"week": "2026-06-29", "followers": 20},
+    ]
+    assert res.ctx_data["delta_pct"] == 100.0            # 10 → 20
+    # weeks arg trims the window from the LEFT (most recent weeks kept).
+    res, _ = run("growth_trend",
+                 [[("2026-06-15", 4), ("2026-06-22", 6), ("2026-06-29", 10)]],
+                 {"weeks": 2})
+    assert [p["week"] for p in res.ctx_data["series"]] == ["2026-06-22", "2026-06-29"]
+    # A single week can't produce a delta.
+    res, _ = run("growth_trend", [[("2026-06-29", 10)]])
+    assert res.ctx_data["delta_pct"] is None
+
+
+def test_themes_shape_sensitivity_guard_and_empty_case():
+    res, cur = run("themes", [[("guilt vs. relief", 3), ("rebuild trust", 2)]])
+    assert res.intent == "themes"
+    assert res.ctx_data["themes"] == [
+        {"theme": "guilt vs. relief", "count": 3},
+        {"theme": "rebuild trust", "count": 2},
+    ]
+    sql, params = cur.data_sql[0]
+    assert "sensitive = FALSE" in sql                    # M4: crisis topics never surface
+    assert params["n"] == 6                              # default limit
+    # Nothing formed yet → honest text block, NO intent claimed (no empty widget).
+    res, _ = run("themes", [[]])
+    assert res.intent is None and res.ctx_data is None
+    assert "no Person-360" in res.context_block
 
 
 def test_resolve_contract_first_intent_wins_else_general():

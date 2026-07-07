@@ -182,6 +182,45 @@ doesn't render and the dossier route shows its "no dossier formed yet" state.
 - Mock story kept coherent with SAMPLE_QUEUE's Maya (p1: essence/goal/tension
   verbatim; silence arc explains the briefing headline).
 
+## Phase 3 — The Brain & Integration (2026-07-08)
+Backend + wiring for the proactive layer; the Phase 2 mocks are GONE.
+1. **Planner expansion** (`nexus/ai_planner.py`): 3 new registry tools powering
+   the Phase 2 NLP-bridge widgets — `content_stats` (post/like/comment totals +
+   per-post averages; averages OMITTED not null at 0 posts), `growth_trend`
+   (weekly CUMULATIVE tracked-follows series + last-week delta %, weeks arg
+   2-24), `themes` (person_profile goals/tensions/core_concerns ∪ session
+   topics, `sensitive = FALSE` guard, count-ranked). Intents added to
+   FROZEN_INTENTS (renderers shipped 2026-07-06); `_AI_ACTIONS` entries added.
+2. **English system memory** (`nexus/memory.py` FORMATION_PROMPT): profile_summary
+   (essence), attributes.goal and the NEW attributes.tension are English-only
+   regardless of input language; session_summary/topic/emotional_state/facts
+   stay Hebrew (they feed the Hebrew recall block + copilot drafts). Existing
+   Hebrew formations remain until the cron re-forms a profile — the queue's
+   LTR pins (2026-07-06 hotfix) still cover legacy rows.
+3. **Proactive endpoints** (`main.py` + new pure module `nexus/dossier.py`):
+   - `GET /api/cockpit/briefing` — deterministic 24h diff, zero LLM tokens:
+     reopens after ≥7d silence (person-activity kinds only, not formation_run/
+     alert_sent bookkeeping), new leads, SLA warn/breach roster. Item shape =
+     the MorningBriefing contract; empty items = quiet night.
+   - `GET /api/cockpit/person/{id}/dossier` — one payload: Person-360 header
+     (essence/goal/tension, stage, held-since, memory_count), weekly chapters
+     from session_summaries with synthetic "Went quiet" chapters (≥14d gaps),
+     urgency→[-1,+1] trajectory (calm positive — the only longitudinal affect
+     signal the spine records), raw signal timeline (30).
+4. **Frontend live** (`lib/dossier.ts` new): MorningBriefing fetches the
+   briefing (silent on load/failure/quiet night); PersonDossierPage fetches
+   the dossier (loading/error/empty states, dir=auto for Hebrew memory);
+   scoped chat = the LIVE planner seam (`/api/cockpit/ai/chat` + `Person: X`
+   chip). All DEV mocks deleted.
+Verified: ruff + pytest green (25 test_main fails pre-exist on clean HEAD —
+env/legacy; copilot stream fail = local COPILOT_DEMO_MOCK=1); tsc GREEN;
+END-TO-END against the real DB via minted HS256 token on a spare port
+(briefing = 1 new lead + 20 breaches live; dossier = full payload incl.
+Hebrew legacy memory; unknown person → clean empty state); preview verified
+graceful degradation (401 → briefing silent, dossier error+retry, zero
+console errors). NOTE: the local dev backend on 8012 runs pre-Phase-3 code —
+restart it to pick up the new endpoints.
+
 ## Known follow-ups (not blocking)
 - framer-motion dev warning: `motion() is deprecated → motion.create()` (pre-existing,
   from `motion(Link)` in StatCard/OverviewPage; harmless, fix opportunistically).
