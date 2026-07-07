@@ -105,7 +105,7 @@ export function WorkQueuePage() {
   const commit = useCallback(
     async (id: string, type: ActionType, message?: string) => {
       if (devBypass || !token) {
-        console.log(`[action] ${type} → ${id} (dev mock — backend not called)`)
+        // dev mock — backend not called
         if (DEV_SIMULATE_FAILURE) throw new Error('simulated failure')
         return
       }
@@ -428,7 +428,6 @@ function Board({
     suppressRef.current = false  // undone — polling safe to resume
     setItems((prev) => insertAt(prev, p.index, p.item))
     setSelectedId(p.item.id)
-    console.log(`[action] ⤺ undo ${p.type} → ${p.item.id} (canceled before commit)`)
     setToast(null)
   }, [suppressRef])
 
