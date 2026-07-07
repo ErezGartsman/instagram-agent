@@ -208,7 +208,9 @@ export function ContentStudioPage() {
 
         <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
           {items.length === 0 ? (
-            <p className="px-2 py-6 text-center text-xs text-muted">No pieces yet — start one.</p>
+            <p className="px-2 py-6 text-center text-xs text-muted">
+              No pieces yet — themes extracted from live conversations will seed them.
+            </p>
           ) : (
             STATUS_ORDER.map((status) => {
               const group = items.filter((i) => i.status === status)
@@ -240,9 +242,26 @@ export function ContentStudioPage() {
             <span className="mb-4 grid h-12 w-12 place-items-center rounded-control border border-line bg-raised text-accent">
               <Icon name="sparkle" size={22} />
             </span>
-            <h3 className="text-base font-semibold text-ink">The Studio</h3>
+            <h3 className="text-base font-semibold text-ink">Automated insights &amp; themes</h3>
             <p className="mt-2 max-w-sm text-sm text-muted">
-              Select a piece, or start a new one. This is where the magic gets written.
+              Nexus reads the live conversations and surfaces what your audience keeps
+              reaching for — recurring themes, tensions, and questions — each one
+              anonymized and ready to become a piece.
+            </p>
+            {/* The insight classes the extraction engine will fill — declared now
+                so the surface reads as an instrument, not a blank notepad. */}
+            <div className="mt-6 flex flex-wrap items-center justify-center gap-1.5" aria-hidden>
+              {['Recurring themes', 'Tensions', 'Asked-again questions'].map((t) => (
+                <span
+                  key={t}
+                  className="rounded-full border border-line bg-surface px-2.5 py-1 font-mono text-[9px] uppercase tracking-wider text-faint"
+                >
+                  {t}
+                </span>
+              ))}
+            </div>
+            <p className="mt-4 font-mono text-[9px] uppercase tracking-[0.2em] text-faint">
+              extraction engine · arriving with the copilot
             </p>
           </div>
         ) : (

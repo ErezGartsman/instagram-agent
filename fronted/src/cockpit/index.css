@@ -1,18 +1,25 @@
 /* ─────────────────────────────────────────────────────────────────────────────
-   NEXUS Cockpit — Neon Glassmorphism Engine
-   Pivoted 2026-06-22 from Graphite Atelier (warm obsidian) on Erez's directive.
+   NEXUS Cockpit — Midnight Instrument
+   Re-based 2026-07-05 on Erez's directive: deep-navy void + electric-blue neon
+   (Vision UI reference family). Supersedes the violet Neon Glassmorphism tokens
+   and reverts the warm-gold drift.
 
-   Three-layer depth system:
-   1. Void + ambient dual-glow — dark gold crown (top) + warm amber depth (bottom-right),
-      pure CSS radial gradients on .cockpit-root, no images.
-   2. Glass panels — backdrop-blur-xl + rgba(255,235,180,0.05) champagne surfaces. Section-level
-      containers only (Sidebar, Topbar, StatCard, feature cards). List rows stay flat rgba
-      for GPU safety.
-   3. Warm signatures — dark gold (#b8860b) fills; #d4a843 amber-gold for glow text + pip.
+   Three-layer depth system (unchanged architecture):
+   1. Void + ambient glow — electric-blue crown (top), abyssal blue pool
+      (bottom-right), violet whisper (bottom-left). Pure CSS radial gradients
+      on .cockpit-root, no images, no canvas.
+   2. Glass panels — backdrop-blur-xl + cool rgba surfaces. Section-level
+      containers only (Sidebar, Topbar, StatCard, feature cards). List rows
+      stay flat rgba for GPU safety.
+   3. Neon signatures — electric blue #3b82f6 fills; #60a5fa glow for pips,
+      confidence, active states. One neon box-shadow per active element.
 
    Typography: Inter (machine UI) · JetBrains Mono (data/numerals).
-   Fraunces (serif) is reserved EXCLUSIVELY for the Overview "Good afternoon." greeting —
-   the single human voice in the machine. No exceptions.
+   Fraunces (serif) is reserved EXCLUSIVELY for the Overview greeting and the
+   lead "essence" line — the single human voice in the machine. No exceptions.
+
+   Motion: signature boot on entry (GSAP, once per session, skippable), then
+   quiet — the whisper budget below. Everything killed by reduced-motion.
 
    Tailwind v4 loaded WITHOUT preflight; cockpit scoped to .cockpit-root.
    ──────────────────────────────────────────────────────────────────────────── */
@@ -25,47 +32,44 @@
 @source "../landing/**/*.{ts,tsx}";
 
 @theme {
-  /* ── Void base — Warm Charcoal ──────────────────────────────────────────── */
-  --color-bg: #0e0b08;          /* warm charcoal — premium dark tone           */
+  /* ── Void base — deep navy-black ────────────────────────────────────────── */
+  --color-bg: #04070f;
 
-  /* ── Glass surfaces — RGBA warm tone, not cool white ─────────────────────── */
-  --color-surface: rgba(255, 235, 180, 0.05);   /* champagne glass: elegant   */
-  --color-raised:  rgba(255, 235, 180, 0.08);   /* hover / active glass layer */
+  /* ── Glass surfaces — cool blue-tinted rgba ─────────────────────────────── */
+  --color-surface: rgba(148, 186, 255, 0.055);
+  --color-raised:  rgba(148, 186, 255, 0.09);
 
-  /* ── Text hierarchy ─────────────────────────────────────────────────────── */
-  --color-ink:   #ffffff;   /* pure white — primary text  */
-  --color-muted: #a1a1aa;   /* zinc-400   — secondary     */
-  --color-faint: #52525b;   /* zinc-600   — hints/labels  */
+  /* ── Text hierarchy — cool-white ink ────────────────────────────────────── */
+  --color-ink:   #f2f6ff;
+  --color-muted: #9aa7bd;
+  --color-faint: #55617a;
 
-  /* ── Glass borders — warm gold hairlines ──────────────────────────────────── */
-  --color-line: rgba(255, 235, 180, 0.06);
+  /* ── Glass borders — cool hairlines ─────────────────────────────────────── */
+  --color-line: rgba(148, 186, 255, 0.08);
 
-  /* ── Accent system — Dark Gold & Champagne (warm luxury) ──────────────────── */
-  --color-accent: #b8860b;   /* dark gold — primary fills & badges          */
-  --color-glow:   #d4a843;   /* amber-gold — warm glow & highlights         */
-  --color-sage:   #8fbc8f;   /* sage green — calm, therapeutic accent      */
+  /* ── Accent system — electric blue neon ─────────────────────────────────── */
+  --color-accent: #3b82f6;   /* electric blue — primary fills & badges        */
+  --color-glow:   #60a5fa;   /* light electric — glow text, pips, confidence  */
+  --color-sage:   #2dd4bf;   /* teal — the calm counter-accent                */
 
-  /* ── Status palette — warm-tuned, attention not alarm ───────────────────── */
-  --color-success: #7fa97f;
-  --color-warn:    #d8a657;
-  --color-danger:  #d08770;
+  /* ── Status palette — attention, not alarm ──────────────────────────────── */
+  --color-success: #34d399;
+  --color-warn:    #d9a94e;
+  --color-danger:  #e0705c;
 
   /* ── Radius ─────────────────────────────────────────────────────────────── */
   --radius-control: 9px;
   --radius-card:    14px;
 
-  /* ── Glass elevation system — Warm Gold ──────────────────────────────────── */
-  /* Card: ambient gold glow + inset champagne top-edge */
-  --shadow-card: 0 0 24px rgba(180, 134, 11, 0.15), inset 0 1px 0 rgba(255, 235, 180, 0.08);
-  /* Pip: warm gold filament — for active nav and elegant accents */
-  --shadow-glow: 0 0 8px rgba(212, 168, 67, 0.85), 0 0 16px rgba(184, 134, 11, 0.40);
-  /* Search focus: gold ring + calm champagne glow (static) */
-  --shadow-search-focus: 0 0 0 1px rgba(184, 134, 11, 0.35), 0 0 22px rgba(184, 134, 11, 0.18), 0 0 36px rgba(212, 168, 67, 0.10);
+  /* ── Glass elevation — blue-glow based, no flat black shadows ───────────── */
+  --shadow-card: 0 0 24px rgba(59, 130, 246, 0.14), inset 0 1px 0 rgba(190, 214, 255, 0.09);
+  --shadow-glow: 0 0 8px rgba(96, 165, 250, 0.90), 0 0 16px rgba(59, 130, 246, 0.50);
+  --shadow-search-focus: 0 0 0 1px rgba(59, 130, 246, 0.35), 0 0 22px rgba(59, 130, 246, 0.18), 0 0 36px rgba(96, 165, 250, 0.10);
 
-  /* ── Type voices ─────────────────────────────────────────────────────────── */
+  /* ── Type voices ────────────────────────────────────────────────────────── */
   --font-sans:  "Inter",          system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono:  "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
-  --font-serif: "Fraunces",       "Iowan Old Style", Georgia, serif; /* greeting ONLY */
+  --font-serif: "Fraunces",       "Iowan Old Style", Georgia, serif; /* greeting + essence ONLY */
 
   /* ── Landing marketing surface — shadcn-family tokens (light) ──────────────
      ADDITIVE ONLY: these names are NOT used in the cockpit. */
@@ -91,37 +95,36 @@
   /* Scoped reset — only inside the Cockpit subtree. */
   .cockpit-root {
     font-family: var(--font-sans);
-    /* Three-layer ambient void (Warm Luxury):
-       Gold crown bleeds above viewport (top) →
-       Warm amber depth pool (bottom-right) →
-       Soft champagne wrap (bottom-left) →
-       warm charcoal base */
+    /* Three-layer ambient void (Midnight Instrument):
+       Electric-blue crown bleeds above viewport (top) →
+       abyssal blue depth pool (bottom-right) →
+       violet whisper (bottom-left) →
+       deep navy-black base */
     background:
-      radial-gradient(ellipse 80% 60% at 50% -10%,  rgba(184, 134, 11, 0.22) 0%, transparent 70%),
-      radial-gradient(ellipse 50% 50% at 92% 105%,  rgba(212, 168, 67, 0.15) 0%, transparent 70%),
-      radial-gradient(ellipse 40% 40% at  5%  90%,  rgba(184, 134, 11, 0.08) 0%, transparent 70%),
-      #0e0b08;
+      radial-gradient(ellipse 80% 60% at 50% -10%,  rgba(59, 130, 246, 0.28) 0%, transparent 70%),
+      radial-gradient(ellipse 50% 50% at 92% 105%,  rgba(37, 99, 235, 0.18) 0%, transparent 70%),
+      radial-gradient(ellipse 40% 40% at  5%  90%,  rgba(109, 40, 217, 0.10) 0%, transparent 70%),
+      #04070f;
     color: var(--color-ink);
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
-    /* Firefox — thin warm-gold scrollbar on all scrollable children */
+    /* Firefox — thin electric-blue scrollbar on all scrollable children */
     scrollbar-width: thin;
-    scrollbar-color: rgba(184, 134, 11, 0.22) transparent;
+    scrollbar-color: rgba(59, 130, 246, 0.25) transparent;
   }
 
   /* ── Custom scrollbars — Webkit (Chrome / Safari / Edge) ─────────────────
-     3 × 3 px warm-gold thumb. Covers every scrollable surface in the cockpit:
-     the main content area (vertical), Studio rail (vertical), Pipeline Kanban
-     (horizontal). Near-invisible at rest, brightens on hover. */
+     3 × 3 px electric thumb. Covers every scrollable surface in the cockpit.
+     Near-invisible at rest, brightens on hover. */
   .cockpit-root ::-webkit-scrollbar       { width: 3px; height: 3px; }
   .cockpit-root ::-webkit-scrollbar-track { background: transparent; }
   .cockpit-root ::-webkit-scrollbar-thumb {
-    background: rgba(184, 134, 11, 0.22);
+    background: rgba(59, 130, 246, 0.25);
     border-radius: 2px;
   }
   .cockpit-root ::-webkit-scrollbar-thumb:hover {
-    background: rgba(184, 134, 11, 0.45);
+    background: rgba(59, 130, 246, 0.5);
   }
   .cockpit-root *,
   .cockpit-root *::before,
@@ -150,7 +153,53 @@
   }
 }
 
-/* ── Landing surface reset — scoped to .landing-root ────────────────────────── */
+/* ── Landing (Midnight manifesto) reset — scoped to .landing-midnight ─────────
+   The public face of Nexus shares the cockpit's soul: #04070f void, electric
+   blue, cool glass. Same fonts, same discipline — so entering /app feels like
+   stepping deeper into the same room. */
+@layer base {
+  .landing-midnight {
+    font-family: var(--font-sans);
+    background: #04070f;
+    color: #f2f6ff;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(59, 130, 246, 0.25) transparent;
+  }
+  .landing-midnight *,
+  .landing-midnight *::before,
+  .landing-midnight *::after {
+    box-sizing: border-box;
+    border-width: 0;
+    border-style: solid;
+    border-color: rgba(148, 186, 255, 0.08);
+  }
+  .landing-midnight h1,
+  .landing-midnight h2,
+  .landing-midnight h3,
+  .landing-midnight p { margin: 0; }
+  .landing-midnight a { text-decoration: none; }
+  /* Kill native button chrome — anchors must be bare text on glass. */
+  .landing-midnight button {
+    font: inherit;
+    color: inherit;
+    background: none;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+  }
+  .landing-midnight ::selection {
+    background: rgba(59, 130, 246, 0.35);
+    color: #f2f6ff;
+  }
+  .landing-midnight :focus-visible {
+    outline: 2px solid #60a5fa;
+    outline-offset: 2px;
+  }
+}
+
+/* ── Legacy landing surface reset — scoped to .landing-root ──────────────────── */
 @layer base {
   .landing-root {
     font-family: var(--font-sans);
@@ -171,9 +220,8 @@
   .landing-root p { margin: 0; }
 }
 
-/* ── Skeleton shimmer — warm-gold sweep for loading states ───────────────────
-   A champagne-gold highlight sweeps left-to-right across skeleton blocks.
-   The pseudo-element keeps the base surface color separate from the animation.
+/* ── Skeleton shimmer — cool electric sweep for loading states ───────────────
+   A pale-blue highlight sweeps left-to-right across skeleton blocks.
    Killed globally by the prefers-reduced-motion guard below. */
 @keyframes cq-shimmer {
   from { transform: translateX(-100%); }
@@ -183,7 +231,7 @@
 .cockpit-root .cq-shimmer-block {
   position: relative;
   overflow: hidden;
-  background-color: rgba(255, 235, 180, 0.04);
+  background-color: rgba(148, 186, 255, 0.04);
 }
 .cockpit-root .cq-shimmer-block::after {
   content: '';
@@ -192,15 +240,16 @@
   background: linear-gradient(
     90deg,
     transparent 0%,
-    rgba(255, 235, 180, 0.07) 50%,
+    rgba(148, 186, 255, 0.08) 50%,
     transparent 100%
   );
   animation: cq-shimmer 1.8s ease-in-out infinite;
 }
 
 /* ── Motion — the whisper budget ─────────────────────────────────────────────
-   CSS-only keyframes. Framer Motion handles component entrances in TSX.
-   cq-grow is the single draw-once exception; it never loops. */
+   CSS-only keyframes. Framer Motion handles component entrances in TSX;
+   GSAP owns the one-time boot sequence. cq-grow is the single draw-once
+   exception; it never loops. */
 @keyframes cq-rise {
   from { opacity: 0; transform: translateY(8px); }
   to   { opacity: 1; transform: translateY(0); }
@@ -217,6 +266,62 @@
 .cockpit-root .cq-rise-slow { animation: cq-rise-slow 0.42s ease both; }
 .cockpit-root .cq-grow      { animation: cq-grow 0.7s cubic-bezier(0.22, 1, 0.36, 1) both; }
 
+/* ── Widget crystallization — generative UI assembling as thought lands ─────
+   A clip-path wipe + rise: the widget "solidifies" top-to-bottom in 320ms.
+   Applied to AI widget containers on mount; draw-once, never loops. */
+@keyframes cq-crystallize {
+  from {
+    opacity: 0.4;
+    transform: translateY(5px) scale(0.985);
+    clip-path: inset(0 0 92% 0);
+  }
+  60% { opacity: 1; }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    clip-path: inset(0 0 0 0);
+  }
+}
+.cockpit-root .cq-crystallize {
+  animation: cq-crystallize 0.32s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* ── Thought shimmer — the assistant's "thinking" state ──────────────────────
+   Three ghost lines of prose-to-be, each sweeping. Reads as composition,
+   not as a spinner. Removed the moment the reply crystallizes. */
+@keyframes cq-thought {
+  0%   { background-position: -180px 0; }
+  100% { background-position: 180px 0; }
+}
+.cockpit-root .cq-thought-line {
+  height: 8px;
+  border-radius: 4px;
+  background-image: linear-gradient(
+    90deg,
+    rgba(148, 186, 255, 0.07) 0%,
+    rgba(96, 165, 250, 0.22) 50%,
+    rgba(148, 186, 255, 0.07) 100%
+  );
+  background-size: 180px 100%;
+  background-repeat: no-repeat;
+  background-color: rgba(148, 186, 255, 0.06);
+  animation: cq-thought 1.3s ease-in-out infinite;
+}
+
+/* ── Orb breathing — the assistant at rest ───────────────────────────────────
+   The ONE ambient exception Erez approved with the morphing-orb decision:
+   a slow glow swell on the idle orb only. Composited (box-shadow via
+   pseudo-opacity), 4s cycle, killed by reduced motion. */
+/* Opacity-only: a transform here warps the halo's box-shadow into an ellipse
+   on some zoom levels — the orb must stay a perfect circle. */
+@keyframes cq-breathe {
+  0%, 100% { opacity: 0.4; }
+  50%      { opacity: 1; }
+}
+.cockpit-root .cq-orb-halo {
+  animation: cq-breathe 4s ease-in-out infinite;
+}
+
 @keyframes pop-in {
   0%   { opacity: 0; transform: scale(0.82) translateY(16px); }
   100% { opacity: 1; transform: scale(1)    translateY(0); }
@@ -229,14 +334,22 @@
   50%       { transform: scaleY(1);   }
 }
 
-/* ── Glass input focus (Topbar & Login) — warm gold glow, no motion ────────────
-   Scoped CSS (not a JIT focus utility) so it's reliable; the reduced-motion guard
-   flattens the transition. */
+/* ── SLA breach pulse — the accountability clock, visceral but quiet ─────────
+   A 2-step opacity beat on the breach filament. Draw cost: opacity only. */
+@keyframes cq-sla-pulse {
+  0%, 100% { opacity: 0.45; }
+  50%      { opacity: 1; }
+}
+.cockpit-root .cq-sla-pulse { animation: cq-sla-pulse 2.2s ease-in-out infinite; }
+
+/* ── Glass input focus (Topbar & Login) — electric ring, no motion ───────────
+   Scoped CSS (not a JIT focus utility) so it's reliable; the reduced-motion
+   guard flattens the transition. */
 .cockpit-root .cq-search,
 .cockpit-root .cq-field { transition: border-color 0.3s ease, box-shadow 0.3s ease; }
 .cockpit-root .cq-search:focus-within,
 .cockpit-root .cq-field:focus-within {
-  border-color: rgba(184, 134, 11, 0.6);
+  border-color: rgba(59, 130, 246, 0.6);
   box-shadow: var(--shadow-search-focus);
 }
 .cockpit-root .cq-search:focus-within svg,

@@ -8,6 +8,7 @@ import { AuthProvider } from './cockpit/auth/AuthProvider'
 import { RequireAuth } from './cockpit/auth/RequireAuth'
 import { AppShell } from './cockpit/shell/AppShell'
 import { OverviewPage } from './cockpit/pages/OverviewPage'
+import { PersonDossierPage } from './cockpit/pages/PersonDossierPage'
 import { WorkQueuePage } from './cockpit/pages/WorkQueuePage'
 import { PipelinePage } from './cockpit/pages/PipelinePage'
 import { InboxPage } from './cockpit/pages/InboxPage'
@@ -43,7 +44,7 @@ const router = createBrowserRouter([
   {
     path: '/',
     element: (
-      <Suspense fallback={<div className="min-h-screen w-full bg-[#100c0a]" />}>
+      <Suspense fallback={<div className="min-h-screen w-full bg-[#04070f]" />}>
         <LandingPage />
       </Suspense>
     ),
@@ -62,6 +63,7 @@ const router = createBrowserRouter([
       ...(FEATURES.analytics
         ? [{ path: 'analytics', element: <Suspense fallback={null}><AnalyticsPage /></Suspense> }]
         : []),
+      { path: 'person/:id', element: <PersonDossierPage /> },
       { path: 'pipeline', element: <PipelinePage /> },
       { path: 'inbox', element: <InboxPage /> },
       ...(FEATURES.content ? [{ path: 'content', element: <ContentStudioPage /> }] : []),

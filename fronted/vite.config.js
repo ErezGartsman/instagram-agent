@@ -14,4 +14,13 @@ export default defineConfig({
     // second optimized copy in dev, breaking its hooks ("Invalid hook call").
     dedupe: ['react', 'react-dom'],
   },
+  server: {
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8012',
+        changeOrigin: true,
+        secure: false,
+      }
+    }
+  }
 })

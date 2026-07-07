@@ -1,5 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#6366f1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-  <line x1="18" y1="20" x2="18" y2="10"/>
-  <line x1="12" y1="20" x2="12" y2="4"/>
-  <line x1="6" y1="20" x2="6" y2="14"/>
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Nexus "Plumb" favicon — dark chip so the mark reads on light and dark tab strips -->
+  <defs>
+    <radialGradient id="b" cx="0.35" cy="0.28" r="0.85">
+      <stop offset="0" stop-color="#ecd08a"/>
+      <stop offset="0.45" stop-color="#c9a24a"/>
+      <stop offset="1" stop-color="#7a5c1c"/>
+    </radialGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#04070f"/>
+  <path d="M32 6 V46" stroke="#dbe7ff" stroke-width="2.6"/>
+  <path d="M22 22 V40" stroke="#dbe7ff" stroke-width="2.6"/>
+  <path d="M42 25 V43" stroke="#dbe7ff" stroke-width="2.6"/>
+  <path d="M22 22 L42 43" stroke="#dbe7ff" stroke-width="2.6"/>
+  <circle cx="32" cy="52" r="6.5" fill="url(#b)"/>
 </svg>

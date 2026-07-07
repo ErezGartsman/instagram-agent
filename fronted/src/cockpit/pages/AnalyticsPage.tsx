@@ -14,8 +14,8 @@ import {
   type AnalyticsData, type FunnelData, type SlaData, type SlaStatus, type WaitingOn,
 } from '../lib/analytics'
 
-const BRONZE  = '#d4a843'
-const SAGE    = '#8fbc8f'
+const ELECTRIC = '#60a5fa'
+const TEAL     = '#2dd4bf'
 const REDUCED = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
 const PIPELINE = ['engaged', 'qualified', 'captured', 'briefed', 'booked'] as const
 
@@ -556,16 +556,30 @@ function LeadsTab({ token }: { token: string | null }) {
                     className="group border-b border-line/50 transition-colors last:border-0 hover:bg-raised"
                   >
                     <td
-                      className="cursor-pointer px-4 py-3 font-medium text-ink"
+                      className="relative cursor-pointer px-4 py-3 font-medium text-ink"
                       onClick={() => navigate(`/app/queue?focus=${lead.opportunity_id}`)}
                     >
+                      {/* Breach filament — a quiet pulse on the rows that owe a move */}
+                      {lead.sla_status === 'breach' && (
+                        <span
+                          aria-hidden
+                          className="cq-sla-pulse absolute left-0 top-1/2 h-6 w-0.5 -translate-y-1/2 rounded-full bg-danger [box-shadow:0_0_8px_rgba(224,112,92,0.8)]"
+                        />
+                      )}
                       {lead.person_name}
                     </td>
                     <td className="px-4 py-3 font-mono text-[11px] text-muted">
                       {STAGE_LABELS[lead.stage] ?? lead.stage}
                     </td>
                     <td className="px-4 py-3">
-                      <span className={`whitespace-nowrap rounded-control px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider ${moveChip.cls}`}>
+                      <span className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-control px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider ${moveChip.cls}`}>
+                        {/* "Your move" carries a live pip — the ball is in Erez's court */}
+                        {lead.waiting_on === 'operator' && (
+                          <span
+                            aria-hidden
+                            className="cq-sla-pulse inline-block h-1 w-1 rounded-full bg-glow [box-shadow:0_0_6px_rgba(96,165,250,0.9)]"
+                          />
+                        )}
                         {moveChip.label}
                       </span>
                     </td>
@@ -672,11 +686,11 @@ function Bento({ data }: { data: AnalyticsData }) {
           <ResponsiveContainer width="100%" height="100%">
             <AreaChart data={community.growth} margin={{ top: 6, right: 2, bottom: 0, left: 2 }}>
               <YAxis domain={['dataMin * 0.95', 'dataMax * 1.02']} hide />
-              <Area type="monotone" dataKey="followers" stroke={BRONZE} strokeWidth={1.6}
-                fill={BRONZE} fillOpacity={0.07} dot={false}
+              <Area type="monotone" dataKey="followers" stroke={ELECTRIC} strokeWidth={1.6}
+                fill={ELECTRIC} fillOpacity={0.07} dot={false}
                 isAnimationActive={!REDUCED} animationDuration={900} />
               <Tooltip
-                cursor={{ stroke: 'rgba(242,235,224,0.15)' }}
+                cursor={{ stroke: 'rgba(190,214,255,0.18)' }}
                 contentStyle={{
                   background: 'var(--color-bg)',
                   border: '1px solid var(--color-line)',
@@ -746,7 +760,7 @@ function Bento({ data }: { data: AnalyticsData }) {
                 <span className="block h-full rounded-full transition-[width] duration-700"
                   style={{
                     width: `${(s.count / pipeMax) * 100}%`,
-                    background: s.stage === 'booked' ? BRONZE : SAGE,
+                    background: s.stage === 'booked' ? ELECTRIC : TEAL,
                   }} />
               </span>
               <span className="w-5 shrink-0 text-right font-mono text-[10px] tabular-nums text-muted">
@@ -786,8 +800,8 @@ function Spark({ data }: { data: AnalyticsData['community']['growth'] }) {
       <ResponsiveContainer width="100%" height="100%">
         <AreaChart data={data} margin={{ top: 2, right: 0, bottom: 0, left: 0 }}>
           <YAxis domain={['dataMin * 0.95', 'dataMax * 1.02']} hide />
-          <Area type="monotone" dataKey="followers" stroke={BRONZE} strokeWidth={1.4}
-            fill={BRONZE} fillOpacity={0.08} dot={false}
+          <Area type="monotone" dataKey="followers" stroke={ELECTRIC} strokeWidth={1.4}
+            fill={ELECTRIC} fillOpacity={0.08} dot={false}
             isAnimationActive={!REDUCED} animationDuration={900} />
         </AreaChart>
       </ResponsiveContainer>
