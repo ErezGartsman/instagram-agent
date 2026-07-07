@@ -30,7 +30,7 @@ export function AgentPip({ runs }: AgentPipProps) {
       <span
         aria-label="Agent running"
         title="Qualification agent running"
-        className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-accent [box-shadow:0_0_4px_rgba(124,58,237,0.8)]"
+        className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-accent [box-shadow:0_0_4px_rgba(96,165,250,0.8)]"
       />
     )
   }

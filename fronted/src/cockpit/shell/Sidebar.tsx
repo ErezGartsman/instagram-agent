@@ -2,9 +2,11 @@ import { useState } from 'react'
 import { NavLink } from 'react-router-dom'
 import { motion, useReducedMotion } from 'framer-motion'
 import type { LucideIcon } from 'lucide-react'
-import { Hexagon, LogOut, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import { LogOut, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import { NexusLogo } from '../../components/ui/nexus-logo'
 import { useAuth } from '../auth/AuthProvider'
-import { NAV_SECTIONS } from './nav'
+import { useNavSignals } from '../lib/navSignals'
+import { FOOTER_NAV, NAV_SECTIONS } from './nav'
 
 const W_EXPANDED = 240
 const W_COLLAPSED = 76
@@ -20,6 +22,7 @@ const EASE: [number, number, number, number] = [0.25, 0.4, 0.25, 1]
 export function Sidebar() {
   const { signOut } = useAuth()
   const reduce = useReducedMotion()
+  const { yourMove, breach } = useNavSignals()
   const [collapsed, setCollapsed] = useState<boolean>(() => {
     try {
       return localStorage.getItem(STORAGE_KEY) === '1'
@@ -52,8 +55,8 @@ export function Sidebar() {
           collapsed ? 'justify-center px-0' : 'px-5'
         }`}
       >
-        <span className="grid h-7 w-7 shrink-0 place-items-center rounded-control bg-accent text-bg [box-shadow:0_0_16px_rgba(184,134,11,0.45)]">
-          <Hexagon size={15} strokeWidth={2} aria-hidden />
+        <span className="grid h-8 w-7 shrink-0 place-items-center text-ink">
+          <NexusLogo size={30} />
         </span>
         <motion.div
           initial={false}
@@ -94,7 +97,7 @@ export function Sidebar() {
                     collapsed ? 'justify-center px-0' : 'px-3'
                   } ${
                     isActive
-                      ? 'bg-raised font-semibold text-ink [box-shadow:inset_0_0_16px_rgba(184,134,11,0.10)]'
+                      ? 'bg-raised font-semibold text-ink [box-shadow:inset_0_0_16px_rgba(59,130,246,0.12)]'
                       : 'text-muted hover:bg-surface hover:text-ink'
                   }`
                 }
@@ -133,6 +136,21 @@ export function Sidebar() {
                       {item.label}
                     </motion.span>
 
+                    {/* Accountability badge — the sidebar answers "do I need to go there?" */}
+                    {item.to === '/app/queue' && yourMove > 0 && !collapsed && (
+                      <span className="ml-auto flex items-center gap-1.5">
+                        {breach > 0 && (
+                          <span
+                            aria-label={`${breach} breached`}
+                            className="cq-sla-pulse h-1.5 w-1.5 rounded-full bg-danger [box-shadow:0_0_6px_rgba(224,112,92,0.8)]"
+                          />
+                        )}
+                        <span className="rounded-full bg-accent/15 px-1.5 py-px font-mono text-[10px] tabular-nums text-glow">
+                          {yourMove}
+                        </span>
+                      </span>
+                    )}
+
                     {/* Glass tooltip — only when collapsed */}
                     {collapsed && (
                       <span className="pointer-events-none absolute left-full z-50 ml-3 -translate-x-1 whitespace-nowrap rounded-control border border-line bg-raised px-2.5 py-1.5 text-xs font-medium text-ink opacity-0 backdrop-blur-xl transition-all duration-150 [box-shadow:var(--shadow-card)] group-hover:translate-x-0 group-hover:opacity-100">
@@ -147,8 +165,41 @@ export function Sidebar() {
         ))}
       </nav>
 
-      {/* Footer — collapse toggle + sign out */}
+      {/* Footer — quiet destinations + collapse toggle + sign out */}
       <div className="flex flex-col gap-1 border-t border-line p-3">
+        {FOOTER_NAV.map((item) => (
+          <NavLink
+            key={item.to}
+            to={item.to}
+            aria-label={item.label}
+            className={({ isActive }) =>
+              `group relative flex items-center rounded-control py-2 text-sm transition-colors ${
+                collapsed ? 'justify-center px-0' : 'px-3'
+              } ${isActive ? 'bg-raised text-ink' : 'text-faint hover:bg-surface hover:text-muted'}`
+            }
+          >
+            <span className="grid shrink-0 place-items-center">
+              <item.icon size={16} strokeWidth={1.8} aria-hidden />
+            </span>
+            <motion.span
+              initial={false}
+              animate={{
+                maxWidth: collapsed ? 0 : 160,
+                opacity: collapsed ? 0 : 1,
+                marginLeft: collapsed ? 0 : 12,
+              }}
+              transition={reduce ? { duration: 0 } : { duration: 0.2, ease: EASE }}
+              className="overflow-hidden whitespace-nowrap"
+            >
+              {item.label}
+            </motion.span>
+            {collapsed && (
+              <span className="pointer-events-none absolute left-full z-50 ml-3 -translate-x-1 whitespace-nowrap rounded-control border border-line bg-raised px-2.5 py-1.5 text-xs font-medium text-ink opacity-0 backdrop-blur-xl transition-all duration-150 [box-shadow:var(--shadow-card)] group-hover:translate-x-0 group-hover:opacity-100">
+                {item.label}
+              </span>
+            )}
+          </NavLink>
+        ))}
         <FooterAction
           collapsed={collapsed}
           reduce={reduce}

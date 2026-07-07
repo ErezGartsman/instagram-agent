@@ -204,6 +204,9 @@ function Board({
   const draftAbortRef = useRef<AbortController | null>(null)
   // Track the last live signature we applied so we don't re-apply the same data.
   const liveSigRef = useRef(liveItems.map((i) => i.id).join(','))
+  // Rows that climbed in the last live re-rank — flashed so the move explains itself.
+  const [risenIds, setRisenIds] = useState<ReadonlySet<string>>(new Set())
+  const risenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Agent runs for the selected person — Realtime-subscribed via Supabase.
   const selectedPersonId = useMemo(
@@ -217,14 +220,35 @@ function Board({
 
   // Live-sync: apply server updates from background polls when safe.
   // Skips if an action is in flight (suppressRef.current) or data is unchanged.
+  // Rows glide to their new rank (layout FLIP on QueueRow); rows that climbed
+  // get a 1.4s glow flash so the operator sees WHY the order changed.
   useEffect(() => {
     if (suppressRef.current) return
     const sig = liveItems.map((i) => i.id).join(',')
     if (sig === liveSigRef.current) return
+    const prevOrder = liveSigRef.current.split(',')
     liveSigRef.current = sig
+    const risen = liveItems
+      .filter((it, idx) => {
+        const prevIdx = prevOrder.indexOf(it.id)
+        return prevIdx !== -1 && idx < prevIdx
+      })
+      .map((it) => it.id)
+    if (risen.length > 0) {
+      setRisenIds(new Set(risen))
+      if (risenTimerRef.current) clearTimeout(risenTimerRef.current)
+      risenTimerRef.current = setTimeout(() => setRisenIds(new Set()), 1400)
+    }
     setItems(liveItems)
     setSelectedId((prev) => liveItems.find((i) => i.id === prev)?.id ?? liveItems[0]?.id ?? null)
   }, [liveItems, suppressRef])
+
+  useEffect(
+    () => () => {
+      if (risenTimerRef.current) clearTimeout(risenTimerRef.current)
+    },
+    [],
+  )
 
   const selected = useMemo(
     () => items.find((i) => i.id === selectedId) ?? items[0],
@@ -462,6 +486,7 @@ function Board({
                     item={item}
                     isSelected={item.id === selected.id}
                     isTop={item.id === topId}
+                    hasRisen={risenIds.has(item.id)}
                     reduce={!!reduce}
                     onSelect={() => setSelectedId(item.id)}
                     onAct={act}
@@ -709,12 +734,14 @@ function Board({
                 </div>
               </div>
 
+              {/* System memory is English-first: dir=ltr + text-left pin the
+                  layout even if legacy rows still carry Hebrew formations. */}
               {selected.essence ? (
-                <p className="border-l-2 border-accent pl-3.5 font-serif text-[17px] font-light leading-snug text-ink">
+                <p dir="ltr" className="border-l-2 border-accent pl-3.5 text-left font-serif text-[17px] font-light leading-snug text-ink">
                   {selected.essence}
                 </p>
               ) : (
-                <p className="border-l-2 border-line pl-3.5 font-serif text-[15px] font-light italic leading-snug text-faint">
+                <p dir="ltr" className="border-l-2 border-line pl-3.5 text-left font-serif text-[15px] font-light italic leading-snug text-faint">
                   No memory summary yet.
                 </p>
               )}
@@ -782,6 +809,7 @@ function QueueRow({
   item,
   isSelected,
   isTop,
+  hasRisen,
   reduce,
   onSelect,
   onAct,
@@ -790,6 +818,8 @@ function QueueRow({
   item: QueueItem
   isSelected: boolean
   isTop: boolean
+  /** True for ~1.4s after this row climbed in a live re-rank. */
+  hasRisen: boolean
   reduce: boolean
   onSelect: () => void
   onAct: (id: string, type: ActionType) => void
@@ -821,11 +851,12 @@ function QueueRow({
 
   return (
     <motion.div
+      layout={!reduce}
       variants={variants}
       initial="initial"
       animate="animate"
       exit="exit"
-      transition={{ duration: 0.26, ease: EASE }}
+      transition={{ duration: 0.26, ease: EASE, layout: { duration: 0.32, ease: EASE } }}
       role="button"
       tabIndex={-1}
       onClick={onSelect}
@@ -840,6 +871,16 @@ function QueueRow({
           isSelected ? 'opacity-100' : 'opacity-0'
         }`}
       />
+      {/* Re-rank flash — a brief glow wash when this row climbed the queue */}
+      {hasRisen && !reduce && (
+        <motion.span
+          aria-hidden
+          initial={{ opacity: 0 }}
+          animate={{ opacity: [0, 1, 0] }}
+          transition={{ duration: 1.3, times: [0, 0.18, 1], ease: 'easeOut' }}
+          className="pointer-events-none absolute inset-0 rounded-control bg-glow/12"
+        />
+      )}
       <span className="min-w-0 flex-1">
         <span className="flex items-center gap-2">
           <span className="truncate text-sm font-medium text-ink">{item.name}</span>
@@ -925,9 +966,9 @@ function ActionButton({
 
 function Fact({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
   return (
-    <div className="mt-3">
+    <div className="mt-3" dir="ltr">
       <div className="font-mono text-[10px] uppercase tracking-[0.13em] text-faint">{label}</div>
-      <div className={`mt-1 text-sm leading-relaxed text-ink ${mono ? 'font-mono text-[13px]' : ''}`}>{value}</div>
+      <div className={`mt-1 text-left text-sm leading-relaxed text-ink ${mono ? 'font-mono text-[13px]' : ''}`}>{value}</div>
     </div>
   )
 }

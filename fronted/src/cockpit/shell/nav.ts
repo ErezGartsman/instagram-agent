@@ -8,15 +8,19 @@ export type NavItem = { to: string; label: string; icon: LucideIcon }
 export type NavSection = { label?: string; items: NavItem[] }
 
 /**
- * The Cockpit nav, grouped by mode of work so it never reads as a flat
- * corporate list: Overview pinned on top, then Work (act) · Studio (create) ·
- * Insight (measure). Feature-flagged surfaces stay dark until ready.
+ * The Cockpit nav — restructured 2026-07-06 (Erez's IA directive):
+ *   Command (the unified dense dashboard, index) →
+ *   Work: Work queue (carries the live "your move" badge) · People (the board;
+ *   "Pipeline" was CRM-speak — the product's soul is people) →
+ *   Intelligence: Analytics.
+ * Content is demoted out of the primary groups into the Sidebar footer
+ * (FOOTER_NAV): the anonymized content engine stays a strategic pillar, but a
+ * solo practitioner's daily nav doesn't spend a top-level slot on it.
  *
- * Icons are lucide-react components (the shell icon system) — the Sidebar renders
- * `<item.icon />` directly, so swapping a glyph means swapping the import here.
+ * Icons are lucide-react components — the Sidebar renders `<item.icon />`.
  */
 export const NAV_SECTIONS: NavSection[] = [
-  { items: [{ to: '/app', label: 'Today', icon: LayoutGrid }] },
+  { items: [{ to: '/app', label: 'Command', icon: LayoutGrid }] },
   {
     label: 'Work',
     items: [
@@ -32,14 +36,6 @@ export const NAV_SECTIONS: NavSection[] = [
     ],
   },
   {
-    label: 'Studio',
-    items: [
-      ...(FEATURES.content
-        ? [{ to: '/app/content', label: 'Content', icon: Sparkles }]
-        : []),
-    ],
-  },
-  {
     label: 'Intelligence',
     items: [
       ...(FEATURES.analytics
@@ -49,5 +45,10 @@ export const NAV_SECTIONS: NavSection[] = [
   },
 ]
 
+/** Quiet footer destinations — present, never loud. */
+export const FOOTER_NAV: NavItem[] = FEATURES.content
+  ? [{ to: '/app/content', label: 'Content', icon: Sparkles }]
+  : []
+
 /** Flattened view — for title lookups (Topbar) and route checks. */
-export const NAV: NavItem[] = NAV_SECTIONS.flatMap((s) => s.items)
+export const NAV: NavItem[] = [...NAV_SECTIONS.flatMap((s) => s.items), ...FOOTER_NAV]

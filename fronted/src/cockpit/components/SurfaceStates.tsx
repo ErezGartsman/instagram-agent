@@ -3,7 +3,7 @@ import { Icon } from './Icon'
 import type { IconName } from './Icon'
 
 // ── Bone ──────────────────────────────────────────────────────────────────────
-// The atom of every skeleton: a warm-gold shimmer block. Geometry comes
+// The atom of every skeleton: a cool electric shimmer block. Geometry comes
 // from the parent variant; this just applies the shimmer class + radius.
 function Bone({ className = '' }: { className?: string }) {
   return <div className={`cq-shimmer-block rounded-control ${className}`} aria-hidden />
@@ -202,7 +202,7 @@ export function SurfaceError({
     <div
       className={`flex flex-col items-center rounded-card border border-line bg-surface px-8 py-16 text-center [box-shadow:var(--shadow-card)] ${className}`}
     >
-      <span className="mb-5 grid h-12 w-12 place-items-center rounded-control border border-[rgba(208,135,112,0.25)] bg-raised text-danger">
+      <span className="mb-5 grid h-12 w-12 place-items-center rounded-control border border-[rgba(224,112,92,0.25)] bg-raised text-danger">
         <Icon name="alert" size={22} />
       </span>
 

@@ -6,11 +6,11 @@ import {
   CircleAlert,
   Eye,
   EyeOff,
-  Hexagon,
   LoaderCircle,
   Lock,
   Mail,
 } from 'lucide-react'
+import { NexusLogo } from '../../components/ui/nexus-logo'
 import { useAuth } from './AuthProvider'
 import { isSupabaseConfigured } from '../lib/supabase'
 
@@ -72,46 +72,41 @@ export function LoginScreen() {
     // On success the browser redirects to Google's consent screen.
   }
 
+  const fieldCls =
+    'flex items-center gap-2.5 rounded-lg border border-[rgba(148,186,255,0.12)] bg-[#04070f] px-3 transition-[border-color,box-shadow] duration-200 ' +
+    'focus-within:border-[rgba(59,130,246,0.65)] focus-within:[box-shadow:0_0_0_1px_rgba(59,130,246,0.35)]'
+
   return (
     <div className="relative flex min-h-screen items-center justify-center px-6">
-      {/* Ambient gold glow — a soft champagne pool behind the card for warmth. */}
-      <div
-        aria-hidden
-        className="pointer-events-none absolute left-1/2 top-1/2 h-[460px] w-[460px] -translate-x-1/2 -translate-y-1/2 rounded-full"
-        style={{ background: 'radial-gradient(circle, rgba(184,134,11,0.12) 0%, transparent 70%)' }}
-      />
-
       <motion.div
-        initial={reduce ? false : { opacity: 0, y: 14, scale: 0.985 }}
-        animate={{ opacity: 1, y: 0, scale: 1 }}
-        transition={{ duration: 0.42, ease: EASE }}
+        initial={reduce ? false : { opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.36, ease: EASE }}
         className="relative w-[380px] max-w-full"
       >
-        {/* Brand — Warm Gold Hexagon */}
-        <div className="mb-7 flex items-center justify-center gap-3">
-          <span className="grid h-9 w-9 place-items-center rounded-control bg-accent text-bg [box-shadow:0_0_18px_rgba(184,134,11,0.45)]">
-            <Hexagon size={18} strokeWidth={2} aria-hidden />
-          </span>
-          <div className="flex flex-col leading-tight">
-            <span className="text-base font-semibold text-ink">Nexus</span>
-            <span className="text-xs text-faint">Cockpit</span>
-          </div>
+        {/* Brand — the Plumb */}
+        <div className="mb-8 flex flex-col items-center gap-3">
+          <NexusLogo size={52} className="text-ink" />
+          <span className="font-mono text-[10px] uppercase tracking-[0.45em] text-faint">Nexus</span>
         </div>
 
-        <div className="rounded-card border border-line bg-surface p-8 backdrop-blur-xl [box-shadow:var(--shadow-card)]">
+        <div
+          className="rounded-xl border border-[rgba(148,186,255,0.10)] bg-[#070b16] p-7"
+          style={{ boxShadow: 'inset 0 1px 0 rgba(190,214,255,0.05), 0 24px 48px -24px rgba(0,0,0,0.7)' }}
+        >
           {!isSupabaseConfigured ? (
             <ConfigError />
           ) : (
             <>
-              <h1 className="text-xl font-semibold text-ink">Enter the Cockpit</h1>
-              <p className="mt-1.5 text-sm text-muted">Sign in to your command center.</p>
+              <h1 className="text-[17px] font-semibold tracking-tight text-ink">Sign in to Nexus</h1>
+              <p className="mt-1 text-[13px] text-muted">Your command center is waiting.</p>
 
               <form onSubmit={onSubmit} className="mt-6">
-                <label htmlFor="cockpit-email" className="mb-1.5 block text-xs text-muted">
+                <label htmlFor="cockpit-email" className="mb-1.5 block text-[11px] font-medium text-muted">
                   Email
                 </label>
-                <div className="cq-field flex items-center gap-2.5 rounded-control border border-line bg-bg/70 px-3.5">
-                  <Mail size={16} strokeWidth={1.8} aria-hidden className="shrink-0 text-faint" />
+                <div className={fieldCls}>
+                  <Mail size={14} strokeWidth={1.8} aria-hidden className="shrink-0 text-faint" />
                   <input
                     id="cockpit-email"
                     type="email"
@@ -124,11 +119,11 @@ export function LoginScreen() {
                   />
                 </div>
 
-                <label htmlFor="cockpit-password" className="mb-1.5 mt-4 block text-xs text-muted">
+                <label htmlFor="cockpit-password" className="mb-1.5 mt-4 block text-[11px] font-medium text-muted">
                   Password
                 </label>
-                <div className="cq-field flex items-center gap-2.5 rounded-control border border-line bg-bg/70 px-3.5">
-                  <Lock size={16} strokeWidth={1.8} aria-hidden className="shrink-0 text-faint" />
+                <div className={fieldCls}>
+                  <Lock size={14} strokeWidth={1.8} aria-hidden className="shrink-0 text-faint" />
                   <input
                     id="cockpit-password"
                     type={showPw ? 'text' : 'password'}
@@ -144,7 +139,7 @@ export function LoginScreen() {
                     aria-label={showPw ? 'Hide password' : 'Show password'}
                     className="shrink-0 text-faint transition-colors hover:text-muted"
                   >
-                    {showPw ? <EyeOff size={16} strokeWidth={1.8} /> : <Eye size={16} strokeWidth={1.8} />}
+                    {showPw ? <EyeOff size={15} strokeWidth={1.8} /> : <Eye size={15} strokeWidth={1.8} />}
                   </button>
                 </div>
 
@@ -152,48 +147,45 @@ export function LoginScreen() {
                   <motion.p
                     initial={reduce ? false : { opacity: 0, y: -4 }}
                     animate={{ opacity: 1, y: 0 }}
-                    className="mt-3 flex items-center gap-2 text-sm text-danger"
+                    className="mt-3 flex items-center gap-2 text-[13px] text-danger"
                   >
-                    <CircleAlert size={15} strokeWidth={1.8} aria-hidden /> {error}
+                    <CircleAlert size={14} strokeWidth={1.8} aria-hidden /> {error}
                   </motion.p>
                 )}
 
-                <motion.button
+                <button
                   type="submit"
                   disabled={busy !== false}
-                  whileHover={reduce || busy ? undefined : { scale: 1.02 }}
-                  whileTap={reduce || busy ? undefined : { scale: 0.98 }}
-                  className="mt-6 flex w-full items-center justify-center gap-2 rounded-control bg-accent py-2.5 text-sm font-semibold text-bg transition-all hover:opacity-90 disabled:opacity-60 [box-shadow:var(--shadow-glow)]"
+                  className="mt-6 flex w-full items-center justify-center gap-2 rounded-lg bg-accent py-2.5 text-sm font-medium text-white transition-colors duration-200 hover:bg-[#2f74e8] active:bg-[#2861c9] disabled:opacity-60"
                 >
                   {busy === 'password' ? (
                     <>
-                      <LoaderCircle size={16} className="animate-spin" aria-hidden /> Entering…
+                      <LoaderCircle size={15} className="animate-spin" aria-hidden /> Signing in…
                     </>
                   ) : (
                     <>
-                      Enter Cockpit <ArrowRight size={15} strokeWidth={2} aria-hidden />
+                      Sign in <ArrowRight size={14} strokeWidth={2} aria-hidden />
                     </>
                   )}
-                </motion.button>
+                </button>
               </form>
 
-              {/* Glass divider */}
               <div className="my-5 flex items-center gap-3">
-                <span className="h-px flex-1 bg-line" />
-                <span className="text-[11px] uppercase tracking-[0.14em] text-faint">or</span>
-                <span className="h-px flex-1 bg-line" />
+                <span className="h-px flex-1 bg-[rgba(148,186,255,0.08)]" />
+                <span className="text-[10px] uppercase tracking-[0.14em] text-faint">or</span>
+                <span className="h-px flex-1 bg-[rgba(148,186,255,0.08)]" />
               </div>
 
               <button
                 type="button"
                 onClick={onGoogle}
                 disabled={busy !== false}
-                className="flex w-full items-center justify-center gap-2.5 rounded-control border border-line bg-raised py-2.5 text-sm font-medium text-ink backdrop-blur-xl transition-colors hover:bg-surface disabled:opacity-60"
+                className="flex w-full items-center justify-center gap-2.5 rounded-lg border border-[rgba(148,186,255,0.12)] bg-transparent py-2.5 text-sm font-medium text-ink transition-colors duration-200 hover:bg-[rgba(148,186,255,0.05)] disabled:opacity-60"
               >
                 {busy === 'google' ? (
-                  <LoaderCircle size={16} className="animate-spin" aria-hidden />
+                  <LoaderCircle size={15} className="animate-spin" aria-hidden />
                 ) : (
-                  <GoogleMark size={16} />
+                  <GoogleMark size={15} />
                 )}
                 Continue with Google
               </button>

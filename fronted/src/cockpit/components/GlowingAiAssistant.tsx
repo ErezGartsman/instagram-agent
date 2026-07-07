@@ -17,8 +17,11 @@
  */
 
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { Paperclip, Link2, Code2, Mic, Send, Info, Bot, X } from 'lucide-react'
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
+import { useLocation } from 'react-router-dom'
+import { Paperclip, Link2, Code2, Mic, Send, Pin, PinOff, X } from 'lucide-react'
 import { useAuth } from '../auth/AuthProvider'
+import { setAiDockPinned, useAiDockPinned } from '../lib/aiDock'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
@@ -301,6 +304,85 @@ function TopPostsWidget({ data }: { data: ContextData }) {
   )
 }
 
+// ── NLP-bridge widgets — renderers for the planner's NEXT tool generation ─────
+// These activate the moment the backend planner ships the matching intents
+// (unknown intents render null today, so they are inert until then). The data
+// contracts are documented on each widget — they ARE the backend spec.
+
+/** intent 'content_stats' — { posts, likes, comments, avg_likes, avg_comments } */
+function ContentStatsWidget({ data }: { data: ContextData }) {
+  if (!data) return null
+  const d = data as { posts: number; likes: number; comments: number; avg_likes?: number; avg_comments?: number }
+  const fmt = (n?: number) => n === undefined ? '—' : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(Math.round(n))
+  const cells = [
+    { label: 'Posts', value: fmt(d.posts) },
+    { label: 'Likes', value: fmt(d.likes) },
+    { label: 'Comments', value: fmt(d.comments) },
+    { label: 'Avg ♥ / post', value: fmt(d.avg_likes) },
+  ]
+  return (
+    <div className="mt-2.5 grid grid-cols-4 gap-1.5 rounded-control border border-line p-2.5"
+      style={{ background: 'color-mix(in srgb, var(--color-bg) 80%, transparent)' }}>
+      {cells.map(c => (
+        <div key={c.label} className="rounded border border-line/50 p-1.5 text-center">
+          <div className="font-mono text-sm tabular-nums text-ink">{c.value}</div>
+          <div className="mt-0.5 font-mono text-[8px] text-faint">{c.label}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/** intent 'growth_trend' — { series: {week, followers}[], delta_pct: number|null } */
+function GrowthTrendWidget({ data }: { data: ContextData }) {
+  if (!data) return null
+  const d = data as { series: { week: string; followers: number }[]; delta_pct: number | null }
+  const pts = (d.series ?? []).map(s => s.followers)
+  if (pts.length < 2) return null
+  const min = Math.min(...pts), max = Math.max(...pts)
+  const path = pts
+    .map((p, i) => `${i ? 'L' : 'M'}${((i / (pts.length - 1)) * 100).toFixed(1)},${(max === min ? 50 : 92 - ((p - min) / (max - min)) * 84).toFixed(1)}`)
+    .join(' ')
+  return (
+    <div className="mt-2.5 rounded-control border border-line p-3"
+      style={{ background: 'color-mix(in srgb, var(--color-bg) 80%, transparent)' }}>
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-[9px] uppercase tracking-wider text-faint">Follower trend</span>
+        {d.delta_pct !== null && (
+          <span className={`font-mono text-[9px] tabular-nums ${d.delta_pct >= 0 ? 'text-success' : 'text-danger'}`}>
+            {d.delta_pct >= 0 ? '+' : ''}{d.delta_pct}%
+          </span>
+        )}
+      </div>
+      <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="mt-2 h-12 w-full" aria-hidden>
+        <path d={`${path} L100,100 L0,100 Z`} fill="rgba(59,130,246,0.10)" />
+        <path d={path} fill="none" stroke="#60a5fa" strokeWidth="1.6" vectorEffect="non-scaling-stroke" />
+      </svg>
+    </div>
+  )
+}
+
+/** intent 'themes' — { themes: { theme, count, sample?: string }[] } */
+function ThemesWidget({ data }: { data: ContextData }) {
+  if (!data) return null
+  const d = data as { themes: { theme: string; count: number; sample?: string }[] }
+  const max = Math.max(...(d.themes ?? []).map(t => t.count), 1)
+  return (
+    <div className="mt-2.5 space-y-1.5 rounded-control border border-line p-3"
+      style={{ background: 'color-mix(in srgb, var(--color-bg) 80%, transparent)' }}>
+      {(d.themes ?? []).slice(0, 6).map(t => (
+        <div key={t.theme} className="flex items-center gap-2" dir="ltr">
+          <span className="w-28 shrink-0 truncate font-mono text-[9px] text-muted">{t.theme}</span>
+          <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-raised">
+            <div className="h-full rounded-full bg-sage" style={{ width: `${(t.count / max) * 100}%`, opacity: 0.85 }} />
+          </div>
+          <span className="w-5 shrink-0 text-right font-mono text-[9px] tabular-nums text-ink">{t.count}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function WidgetRenderer({ intent, data }: { intent?: string; data: ContextData }) {
   if (!intent || !data) return null
   if (intent.startsWith('sla_lead'))    return <SlaWidget data={data} />
@@ -310,6 +392,9 @@ function WidgetRenderer({ intent, data }: { intent?: string; data: ContextData }
   if (intent === 'post')                return <PostWidget data={data} />
   if (intent === 'top_posts')           return <TopPostsWidget data={data} />
   if (intent === 'community')           return <CommunityWidget data={data} />
+  if (intent === 'content_stats')       return <ContentStatsWidget data={data} />
+  if (intent === 'growth_trend')        return <GrowthTrendWidget data={data} />
+  if (intent === 'themes')              return <ThemesWidget data={data} />
   return null
 }
 
@@ -537,18 +622,25 @@ function ActionChips({ actions, onAction, contextData }: {
 
 // ── Message bubble ─────────────────────────────────────────────────────────────
 function Bubble({ msg, onAction }: { msg: Message; onAction: (a: string, ctx?: ContextData) => void }) {
-  // Typing indicator
+  // Thinking state — not a spinner: ghost lines of the reply being composed.
+  // They shimmer while the model grounds itself, then the real prose
+  // crystallizes in their place.
   if (msg.role === 'assistant' && msg.content === '__thinking__') {
     return (
       <div className="flex justify-start">
-        <div className="flex items-center gap-2 rounded-2xl rounded-bl-sm border border-glow/15 bg-raised px-3.5 py-3">
-          <span className="font-mono text-[9px] leading-none text-glow">✦</span>
-          {[0, 1, 2].map(i => (
-            <div key={i}
-              className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted"
-              style={{ animationDelay: `${i * 0.15}s` }}
-            />
-          ))}
+        <div className="w-[78%] rounded-2xl rounded-bl-sm border border-glow/15 bg-raised px-3.5 py-3">
+          <div className="flex items-center gap-1.5">
+            <span className="animate-pulse font-mono text-[9px] leading-none text-glow">✦</span>
+            <span className="font-mono text-[8px] uppercase tracking-wider text-glow/70">
+              Nexus is thinking
+            </span>
+          </div>
+          <div className="mt-2.5 space-y-1.5">
+            <div className="cq-thought-line w-[92%]" />
+            <div className="cq-thought-line w-[71%]" style={{ animationDelay: '0.12s' }} />
+            <div className="cq-thought-line w-[46%]" style={{ animationDelay: '0.24s' }} />
+          </div>
+          <div className="mt-2 font-mono text-[8px] text-faint">grounding in live data…</div>
         </div>
       </div>
     )
@@ -583,15 +675,21 @@ function Bubble({ msg, onAction }: { msg: Message; onAction: (a: string, ctx?: C
           <span className="text-[9px] leading-none text-glow">✦</span>
           <span className="font-mono text-[8px] uppercase tracking-wider text-glow">Nexus</span>
         </div>
-        {/* WhatsApp draft card (special bubble) */}
+        {/* WhatsApp draft card (special bubble) — crystallizes on arrival */}
         {msg.waDraft ? (
-          <WhatsAppDraftCard state={msg.waDraft} />
+          <div className="cq-crystallize">
+            <WhatsAppDraftCard state={msg.waDraft} />
+          </div>
         ) : (
           <>
             {/* Formatted prose */}
             <ReplyText text={msg.content} />
-            {/* Generative widget (intent-driven) */}
-            <WidgetRenderer intent={msg.intent} data={msg.context_data ?? null} />
+            {/* Generative widget (intent-driven) — assembles as thought lands */}
+            {msg.intent && msg.context_data ? (
+              <div className="cq-crystallize">
+                <WidgetRenderer intent={msg.intent} data={msg.context_data ?? null} />
+              </div>
+            ) : null}
           </>
         )}
         {/* Action chips — context_data bound so WA draft has person_id at click time */}
@@ -661,6 +759,30 @@ async function fetchAiReply(
 
 const MAX_CHARS = 2000
 
+// ── Spatial memory — the assistant remembers where it lives, per route ────────
+// localStorage map: pathname → { open, pinned }. Pinning on the queue and
+// closing on analytics are both remembered; navigation restores each surface's
+// last arrangement, so the panel feels anchored in space rather than modal.
+type SpatialState = { open: boolean; pinned: boolean }
+const SPATIAL_KEY = 'nexus.ai.spatial.v1'
+
+function readSpatial(): Record<string, SpatialState> {
+  try {
+    return JSON.parse(localStorage.getItem(SPATIAL_KEY) ?? '{}') as Record<string, SpatialState>
+  } catch {
+    return {}
+  }
+}
+function writeSpatial(path: string, s: SpatialState) {
+  try {
+    const map = readSpatial()
+    map[path] = s
+    localStorage.setItem(SPATIAL_KEY, JSON.stringify(map))
+  } catch {
+    /* storage unavailable — spatial memory is session-only */
+  }
+}
+
 // ── Main component ─────────────────────────────────────────────────────────────
 export function GlowingAiAssistant() {
   const [open, setOpen]                 = useState(false)
@@ -673,6 +795,9 @@ export function GlowingAiAssistant() {
   const [isRecording, setIsRecording]   = useState(false)
   const [recordingTime, setRecordingTime] = useState(0)
   const { session }                     = useAuth()
+  const { pathname }                    = useLocation()
+  const pinned                          = useAiDockPinned()
+  const reduce                          = useReducedMotion()
 
   const chatRef       = useRef<HTMLDivElement>(null)
   const textareaRef   = useRef<HTMLTextAreaElement>(null)
@@ -705,9 +830,9 @@ export function GlowingAiAssistant() {
     return () => clearInterval(id)
   }, [isRecording])
 
-  // ── Close panel on outside click ────────────────────────────────────────────
+  // ── Close panel on outside click — never while pinned (it's a dock) ────────
   useEffect(() => {
-    if (!open) return
+    if (!open || pinned) return
     const h = (e: MouseEvent) => {
       const t = e.target as Element
       if (chatRef.current && !chatRef.current.contains(t) && !t.closest('[data-ai-btn]'))
@@ -715,15 +840,50 @@ export function GlowingAiAssistant() {
     }
     document.addEventListener('mousedown', h)
     return () => document.removeEventListener('mousedown', h)
-  }, [open])
+  }, [open, pinned])
 
-  // ── Escape to close ─────────────────────────────────────────────────────────
+  // ── Escape to close (also releases the dock) ────────────────────────────────
   useEffect(() => {
     if (!open) return
-    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    const h = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setOpen(false)
+        setAiDockPinned(false)
+      }
+    }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
   }, [open])
+
+  // ── ⌘J / Ctrl+J — summon or dismiss from anywhere (keyboard-first) ─────────
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'j' || e.key === 'J')) {
+        e.preventDefault()
+        setOpen(v => !v)
+        setTimeout(() => textareaRef.current?.focus(), 150)
+      }
+    }
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  }, [])
+
+  // ── Spatial memory: restore this route's arrangement, persist changes ──────
+  const spatialReadyRef = useRef(false)
+  useEffect(() => {
+    spatialReadyRef.current = false
+    const s = readSpatial()[pathname]
+    setOpen(s?.open ?? false)
+    setAiDockPinned(s?.pinned ?? false)
+    // Persisting resumes on the next open/pinned change, after this restore.
+    const id = requestAnimationFrame(() => { spatialReadyRef.current = true })
+    return () => cancelAnimationFrame(id)
+  }, [pathname])
+
+  useEffect(() => {
+    if (!spatialReadyRef.current) return
+    writeSpatial(pathname, { open, pinned })
+  }, [pathname, open, pinned])
 
   // ── Send message — real Gemini call via /api/cockpit/ai/chat ────────────────
   const handleSend = useCallback(async () => {
@@ -937,40 +1097,69 @@ export function GlowingAiAssistant() {
   const hasHistory = messages.length > 0
 
   return (
-    <div className="fixed bottom-6 right-6 z-50">
-      {/* ── Trigger button ──────────────────────────────────────────────────── */}
-      <button
-        data-ai-btn
-        aria-label={open ? 'Close Nexus AI' : 'Open Nexus AI'}
-        onClick={() => setOpen(v => !v)}
-        className="relative flex h-14 w-14 items-center justify-center rounded-full transition-all duration-200 hover:scale-105 active:scale-95"
-        style={{
-          background: 'linear-gradient(135deg, var(--color-accent) 0%, var(--color-glow) 100%)',
-          boxShadow: open
-            ? '0 0 10px color-mix(in srgb, var(--color-glow) 35%, transparent)'
-            : '0 0 18px color-mix(in srgb, var(--color-glow) 50%, transparent), 0 0 36px color-mix(in srgb, var(--color-accent) 28%, transparent)',
-          border: '1px solid color-mix(in srgb, var(--color-glow) 22%, transparent)',
-        }}
-      >
-        <div className="pointer-events-none absolute inset-0 rounded-full"
-          style={{ background: 'linear-gradient(to bottom, rgba(255,255,255,0.15), transparent)' }} />
-        <span className="relative z-10 text-white transition-transform duration-200"
-          style={{ transform: open ? 'rotate(90deg)' : 'none' }}>
-          {open ? <X className="h-5 w-5" /> : <Bot className="h-6 w-6" />}
-        </span>
-      </button>
+    <>
+      {/* ── The orb — a living presence that breathes at rest ────────────────── */}
+      {!pinned && (
+        <div className="fixed bottom-6 right-6 z-50">
+          <button
+            data-ai-btn
+            aria-label={open ? 'Close Nexus AI' : 'Open Nexus AI'}
+            onClick={() => setOpen(v => !v)}
+            className="group relative grid h-14 w-14 shrink-0 place-items-center overflow-visible rounded-full transition-transform duration-200 hover:scale-105 active:scale-95"
+            style={{
+              aspectRatio: '1 / 1',
+              background:
+                'radial-gradient(circle at 32% 28%, #60a5fa 0%, #3b82f6 38%, #1d4ed8 78%, #0b2a6b 100%)',
+              border: '1px solid rgba(96,165,250,0.35)',
+              boxShadow: open
+                ? '0 0 10px rgba(96,165,250,0.35)'
+                : '0 0 18px rgba(96,165,250,0.5), 0 0 36px rgba(59,130,246,0.28)',
+            }}
+          >
+            {/* Breathing halo — opacity-only so the circle never warps */}
+            {!reduce && !open && (
+              <span
+                aria-hidden
+                className="cq-orb-halo pointer-events-none absolute -inset-0.5 rounded-full"
+                style={{ boxShadow: '0 0 24px rgba(59,130,246,0.55), 0 0 48px rgba(59,130,246,0.25)' }}
+              />
+            )}
+            <span className="pointer-events-none absolute inset-0 rounded-full"
+              style={{ background: 'linear-gradient(to bottom, rgba(255,255,255,0.22), transparent 55%)' }} />
+            <span className="relative z-10 text-white transition-transform duration-200"
+              style={{ transform: open ? 'rotate(90deg)' : 'none' }}>
+              {open ? <X className="h-5 w-5" /> : <span className="text-lg leading-none">✦</span>}
+            </span>
+          </button>
+        </div>
+      )}
 
-      {/* ── Chat panel ──────────────────────────────────────────────────────── */}
+      {/* ── The panel — floats above the orb, or docks as a full-height rail ─── */}
+      <AnimatePresence>
       {open && (
-        <div ref={chatRef} className="absolute bottom-20 right-0 w-[420px] ai-pop-in">
+        <motion.div
+          key={pinned ? 'dock' : 'float'}
+          ref={chatRef}
+          initial={reduce ? { opacity: 0 } : pinned ? { x: 36, opacity: 0 } : { opacity: 0, scale: 0.9, y: 16 }}
+          animate={pinned ? { x: 0, opacity: 1 } : { opacity: 1, scale: 1, y: 0 }}
+          exit={reduce ? { opacity: 0 } : pinned ? { x: 36, opacity: 0 } : { opacity: 0, scale: 0.94, y: 10 }}
+          transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
+          className={pinned
+            ? 'fixed right-0 top-0 z-50 h-full w-[400px]'
+            : 'fixed bottom-24 right-6 z-50 w-[440px]'}
+          style={pinned ? undefined : { transformOrigin: '100% 100%' }}
+        >
           <div
-            className="relative flex flex-col overflow-hidden rounded-2xl border border-line"
+            className={`relative flex flex-col overflow-hidden border-line ${
+              pinned ? 'h-full border-l' : 'rounded-2xl border'
+            }`}
             style={{
               background: 'color-mix(in srgb, var(--color-bg) 90%, transparent)',
-              backdropFilter: 'blur(10px)',
-              boxShadow: '0 8px 32px rgba(0,0,0,0.4), var(--shadow-card)',
-              minHeight: hasHistory ? 440 : 'auto',
-              maxHeight: 560,
+              backdropFilter: 'blur(12px)',
+              boxShadow: pinned
+                ? 'var(--shadow-card)'
+                : '0 8px 32px rgba(0,0,0,0.45), var(--shadow-card)',
+              ...(pinned ? {} : { minHeight: hasHistory ? 460 : undefined, maxHeight: 620 }),
             }}
           >
             {/* Header */}
@@ -987,8 +1176,18 @@ export function GlowingAiAssistant() {
                 <span className="rounded-full border border-line px-2 py-0.5 font-mono text-[9px] text-faint">
                   Preview
                 </span>
-                <button type="button" onClick={() => setOpen(false)}
-                  className="ml-1 grid h-6 w-6 place-items-center rounded-control text-faint transition-colors hover:bg-raised hover:text-ink">
+                <button type="button"
+                  onClick={() => setAiDockPinned(!pinned)}
+                  title={pinned ? 'Unpin — float above the page' : 'Pin as a side panel'}
+                  aria-label={pinned ? 'Unpin assistant' : 'Pin assistant as side panel'}
+                  className={`ml-1 grid h-6 w-6 place-items-center rounded-control transition-colors hover:bg-raised ${
+                    pinned ? 'text-glow' : 'text-faint hover:text-ink'
+                  }`}>
+                  {pinned ? <PinOff className="h-3.5 w-3.5" /> : <Pin className="h-3.5 w-3.5" />}
+                </button>
+                <button type="button"
+                  onClick={() => { setOpen(false); setAiDockPinned(false) }}
+                  className="grid h-6 w-6 place-items-center rounded-control text-faint transition-colors hover:bg-raised hover:text-ink">
                   <X className="h-3.5 w-3.5" />
                 </button>
               </div>
@@ -998,9 +1197,27 @@ export function GlowingAiAssistant() {
             {hasHistory && (
               <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4" style={{ scrollbarWidth: 'none' }}>
                 <div className="flex flex-col gap-3">
-                  {messages.map((msg, i) => <Bubble key={i} msg={msg} onAction={handleAction} />)}
+                  {messages.map((msg, i) => (
+                    <motion.div
+                      key={i}
+                      initial={reduce ? false : { opacity: 0, y: 6 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ duration: 0.18, ease: 'easeOut' }}
+                    >
+                      <Bubble msg={msg} onAction={handleAction} />
+                    </motion.div>
+                  ))}
                 </div>
                 <div ref={messagesEndRef} />
+              </div>
+            )}
+
+            {/* Docked + empty — an invitation instead of dead space */}
+            {pinned && !hasHistory && (
+              <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-8 text-center">
+                <span className="text-xl text-glow/60">✦</span>
+                <p className="text-sm text-muted">Ask about leads, pipeline health, or community insights.</p>
+                <p className="font-mono text-[9px] text-faint">⌘J toggles · unpin to float</p>
               </div>
             )}
 
@@ -1115,11 +1332,8 @@ export function GlowingAiAssistant() {
                   </div>
                 </div>
 
-                {/* Char count + send */}
-                <div className="flex items-center gap-3">
-                  <span className="font-mono text-[10px] text-faint">
-                    {message.length}<span className="text-faint/40">/{MAX_CHARS}</span>
-                  </span>
+                {/* Send */}
+                <div className="flex items-center">
                   <button type="button" onClick={handleSend} disabled={!canSend || isRecording}
                     className="grid h-9 w-9 place-items-center rounded-control text-white transition-all hover:scale-105 active:scale-95 disabled:cursor-not-allowed disabled:opacity-30"
                     style={{
@@ -1131,28 +1345,15 @@ export function GlowingAiAssistant() {
                 </div>
               </div>
 
-              {/* Footer */}
-              <div className="mt-3 flex items-center justify-between border-t border-line pt-3 font-mono text-[9px] text-faint">
-                <div className="flex items-center gap-1.5">
-                  <Info className="h-3 w-3" />
-                  <span>
-                    <kbd className="rounded border border-line bg-raised px-1 py-0.5 font-mono text-[9px]">Shift+Enter</kbd>
-                    {' '}new line
-                  </span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <div className="h-1.5 w-1.5 rounded-full bg-glow" />
-                  <span>NLP engine · P2 Copilot</span>
-                </div>
-              </div>
             </div>
 
             {/* Ambient tint */}
-            <div className="pointer-events-none absolute inset-0 rounded-2xl"
+            <div className="pointer-events-none absolute inset-0"
               style={{ background: 'linear-gradient(135deg, color-mix(in srgb, var(--color-accent) 3%, transparent), transparent)' }} />
           </div>
-        </div>
+        </motion.div>
       )}
-    </div>
+      </AnimatePresence>
+    </>
   )
 }
