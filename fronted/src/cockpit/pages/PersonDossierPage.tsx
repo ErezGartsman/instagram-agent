@@ -1,154 +1,84 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { Icon } from '../components/Icon'
+import { SurfaceLoading, SurfaceError } from '../components/SurfaceStates'
+import { useAuth } from '../auth/AuthProvider'
+import {
+  askScopedMemory, DossierNotFound, fetchDossier, fmtDay,
+  type DossierChapter, type DossierData, type DossierTimelineEvent,
+  type ScopedChatTurn, type TrajectoryPoint,
+} from '../lib/dossier'
 
 /**
- * Person Dossier — the deep memory view (2026-07-07). "Held, not filed."
+ * Person Dossier — the deep memory view (live since Phase 3). "Held, not filed."
  *
  * The Work Queue answers "what's my next move"; this route answers "who is
- * this person, really". Three instruments:
- *   1. Relationship trajectory — one sentiment line across the whole arc,
- *      chapter markers included (inline SVG, no chart lib on this route).
- *   2. Timeline chapters — the AI-summarized story ("Week 1: reached out
- *      about trust…"), not a raw event log. Chapters are the memory spine's
- *      narrative summaries, one glance per era.
- *   3. Scoped chat — ask the memory questions about THIS person only.
- *
- * FRONTEND-ONLY for now. The dossier below is a DEV-gated mock (dead-code-
- * eliminated from prod, same discipline as SAMPLE_QUEUE); in production the
- * route shows the "no dossier formed yet" state until the backend ships
- *   GET /api/cockpit/person/:id/dossier
- * The scoped chat renders the full layout with a canned reply — the live
- * planner (ai_planner.py) will take the seam over unchanged.
+ * this person, really". One payload (GET /api/cockpit/person/:id/dossier):
+ *   1. Relationship trajectory — session urgency mapped to [-1, +1], calm
+ *      positive (inline SVG, no chart lib on this route).
+ *   2. Timeline chapters — the story the formation cron has already written
+ *      (session_summaries grouped into weekly chapters; silences become
+ *      "Went quiet" chapters — assembled in nexus/dossier.py).
+ *   3. Signal log — the raw interaction timeline.
+ *   4. Scoped chat — the live planner seam (/api/cockpit/ai/chat) with a
+ *      person chip, so answers are grounded in THIS person's held memory.
  */
 
-// ── Types (the intended API contract, verbatim) ────────────────────────────────
-
-type Chapter = {
-  id: string
-  range: string
-  title: string
-  summary: string
-  signals: string[]
-  /** Index into `sentiment` where this chapter begins — anchors the marker. */
-  at: number
-}
-
-type SentimentPoint = { label: string; value: number } // value ∈ [-1, 1]
-
-type ChatMsg = { role: 'user' | 'ai'; text: string; cite?: string }
-
-type Dossier = {
-  personId: string
-  name: string
-  initials: string
-  channel: string
-  handle: string
-  heldSince: string
-  stage: string
-  memoryCount: number
-  essence: string
-  goal: string
-  tension: string
-  sentiment: SentimentPoint[]
-  chapters: Chapter[]
-  seedChat: ChatMsg[]
-}
-
-// ── Mock: Maya's dossier (DEV-only, mirrors SAMPLE_QUEUE p1) ───────────────────
-
-const DOSSIERS: Record<string, Dossier> = import.meta.env.DEV
-  ? {
-      p1: {
-        personId: 'p1',
-        name: 'Maya Goren',
-        initials: 'MG',
-        channel: 'whatsapp',
-        handle: 'BR-1188',
-        heldSince: 'Jun 8',
-        stage: 'Ready to book',
-        memoryCount: 42,
-        essence: "She isn't afraid of leaving. She's afraid of being the one who broke it.",
-        goal: 'Decide before the anniversary, Jul 2',
-        tension: 'Guilt vs. relief',
-        sentiment: [
-          { label: 'Jun 8', value: 0.15 },
-          { label: 'Jun 12', value: 0.3 },
-          { label: 'Jun 16', value: 0.55 },
-          { label: 'Jun 20', value: 0.6 },
-          { label: 'Jun 24', value: 0.2 },
-          { label: 'Jun 29', value: -0.15 },
-          { label: 'Jul 3', value: -0.2 },
-          { label: 'Jul 6', value: 0.62 },
-        ],
-        chapters: [
-          {
-            id: 'c1',
-            range: 'Week 1 · Jun 8–14',
-            title: 'Reached out about trust',
-            summary:
-              'First contact through the WhatsApp line. The fights had stopped and the silence had started — and she named the anniversary, Jul 2, as her deadline for deciding.',
-            signals: ['Started a conversation', 'Shared her context'],
-            at: 0,
-          },
-          {
-            id: 'c2',
-            range: 'Week 2 · Jun 15–21',
-            title: 'Named the real fear',
-            summary:
-              "Moved past logistics to the actual question: not whether to leave, but whether she could live with being the one who broke it. Saying it out loud lifted her — sentiment climbed all week. Qualified.",
-            signals: ['Qualified', 'Sentiment rising'],
-            at: 2,
-          },
-          {
-            id: 'c3',
-            range: 'Weeks 3–5 · Jun 22 – Jul 5',
-            title: 'Went quiet',
-            summary:
-              'Three weeks of silence — the anniversary itself passed inside it. Two gentle nudges went unanswered. The trajectory drifted, but never dropped to cold: she read everything.',
-            signals: ['2 nudges · no reply', 'Anniversary passed Jul 2'],
-            at: 4,
-          },
-          {
-            id: 'c4',
-            range: 'Last night · Jul 6, 23:40',
-            title: 'Reopened',
-            summary:
-              'Returned unprompted four days after the deadline she set for herself. Clicked the outreach link and re-read the booking page twice. The deadline expired; the decision didn’t. The move is yours.',
-            signals: ['Outreach click', 'Booking page × 2'],
-            at: 7,
-          },
-        ],
-        seedChat: [
-          { role: 'user', text: 'What changed while she was quiet?' },
-          {
-            role: 'ai',
-            text:
-              'Nothing inbound for 21 days — but she never disengaged. The anniversary she set as her deadline (Jul 2) passed during the silence, and she came back four days after it. The deadline expired; the decision didn’t.',
-            cite: 'Weeks 3–5 · 2 signals',
-          },
-        ],
-      },
-    }
-  : {}
-
-// The canned reply keeps the layout honest about what's live in preview.
-const CANNED_REPLY: ChatMsg = {
-  role: 'ai',
-  text:
-    'Scoped memory is mocked in this preview — once the dossier endpoint ships, this chat answers from her held items only, with citations into the chapters above.',
-  cite: 'Preview',
-}
-
-// ── Page ───────────────────────────────────────────────────────────────────────
+type State =
+  | { kind: 'loading' }
+  | { kind: 'error' }
+  | { kind: 'empty' }
+  | { kind: 'ready'; data: DossierData }
 
 export function PersonDossierPage() {
   const { id } = useParams()
-  const dossier = id ? DOSSIERS[id] : undefined
+  const { session } = useAuth()
+  const token = session?.access_token
+  const [state, setState] = useState<State>({ kind: 'loading' })
+  const [retryNonce, setRetryNonce] = useState(0)
+  const retry = useCallback(() => {
+    setState({ kind: 'loading' })
+    setRetryNonce((x) => x + 1)
+  }, [])
 
-  if (!dossier) return <DossierEmpty />
+  useEffect(() => {
+    if (!id || !token) {
+      setState({ kind: 'empty' })
+      return
+    }
+    const ctrl = new AbortController()
+    setState({ kind: 'loading' })
+    fetchDossier(token, id, ctrl.signal)
+      .then((data) => setState({ kind: 'ready', data }))
+      .catch((err: unknown) => {
+        if ((err as { name?: string } | null)?.name === 'AbortError') return
+        setState(err instanceof DossierNotFound ? { kind: 'empty' } : { kind: 'error' })
+      })
+    return () => ctrl.abort()
+  }, [id, token, retryNonce])
 
+  if (state.kind === 'loading') {
+    return (
+      <div className="mx-auto max-w-[1360px]">
+        <SurfaceLoading variant="grid" />
+      </div>
+    )
+  }
+  if (state.kind === 'error') {
+    return (
+      <div className="mx-auto max-w-[1360px]">
+        <SurfaceError
+          title="Couldn't open the dossier"
+          body="The memory spine couldn't be reached. Check your connection and try again."
+          onRetry={retry}
+        />
+      </div>
+    )
+  }
+  if (state.kind === 'empty') return <DossierEmpty />
+
+  const { person, chapters, trajectory, timeline } = state.data
   return (
     <div className="mx-auto max-w-[1360px]">
       <Link
@@ -162,44 +92,55 @@ export function PersonDossierPage() {
       {/* ── Identity header ─────────────────────────────────────────────────── */}
       <header className="cq-rise mb-6 flex flex-wrap items-start gap-4">
         <span className="grid h-12 w-12 shrink-0 place-items-center rounded-full bg-accent/12 font-mono text-sm font-medium text-glow">
-          {dossier.initials}
+          {person.initials}
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2.5">
-            <h2 className="text-2xl font-medium leading-tight text-ink">{dossier.name}</h2>
-            <span className="rounded-full bg-accent/15 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-glow">
-              {dossier.stage}
-            </span>
+            <h2 className="text-2xl font-medium leading-tight text-ink">{person.name}</h2>
+            {person.stage && (
+              <span className="rounded-full bg-accent/15 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-glow">
+                {person.stage}
+              </span>
+            )}
           </div>
           <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-faint">
-            {dossier.channel} · {dossier.handle} <span className="mx-1">·</span> held since {dossier.heldSince}
+            {person.channel ?? '—'}{person.handle ? ` · ${person.handle}` : ''}
+            <span className="mx-1">·</span> held since {fmtDay(person.held_since)}
           </p>
           {/* font-serif = the sanctioned lead-essence voice (same object as the
               queue essence line — the one human line in the machine). */}
-          <p className="mt-3 max-w-xl border-l-2 border-accent/60 pl-3 font-serif text-[17px] font-light italic leading-snug text-muted">
-            {dossier.essence}
-          </p>
+          {person.essence && (
+            <p
+              dir="ltr"
+              className="mt-3 max-w-xl border-l-2 border-accent/60 pl-3 text-left font-serif text-[17px] font-light italic leading-snug text-muted"
+            >
+              {person.essence}
+            </p>
+          )}
         </div>
       </header>
 
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
         {/* ── Left: trajectory + chapters ─────────────────────────────────────── */}
         <div className="flex flex-col gap-4 xl:col-span-8">
-          <TrajectoryPanel sentiment={dossier.sentiment} chapters={dossier.chapters} />
-          <ChaptersPanel chapters={dossier.chapters} />
+          {trajectory.length >= 2 && (
+            <TrajectoryPanel trajectory={trajectory} chapters={chapters} />
+          )}
+          <ChaptersPanel chapters={chapters} />
         </div>
 
-        {/* ── Right: the held facts + scoped chat ─────────────────────────────── */}
+        {/* ── Right: the held facts + signal log + scoped chat ────────────────── */}
         <div className="flex flex-col gap-4 xl:col-span-4">
-          <FactsPanel dossier={dossier} />
-          <ScopedChat dossier={dossier} />
+          <FactsPanel data={state.data} />
+          {timeline.length > 0 && <SignalLogPanel timeline={timeline} />}
+          <ScopedChat token={token!} personName={person.name} />
         </div>
       </div>
     </div>
   )
 }
 
-// ── Empty state (prod until the backend ships; unknown ids in dev) ─────────────
+// ── Empty state (unknown person / no dossier formed yet) ───────────────────────
 
 function DossierEmpty() {
   return (
@@ -242,19 +183,33 @@ function Panel({ label, right, children }: { label: string; right?: ReactNode; c
 }
 
 // ── 1. Relationship trajectory ─────────────────────────────────────────────────
+// Backend semantics (nexus/dossier.py): session urgency → [-1, +1], calm
+// positive. A rising line = the person is settling; falling = strain.
 
 const W = 100
 const H = 44
 const MID = H / 2
-const AMP = 17 // px of half-height a full |1.0| sentiment reaches
+const AMP = 17 // px of half-height a full |1.0| reading reaches
 
-function TrajectoryPanel({ sentiment, chapters }: { sentiment: SentimentPoint[]; chapters: Chapter[] }) {
-  const x = (i: number) => (i / (sentiment.length - 1)) * W
-  const y = (v: number) => MID - v * AMP
-  const coords = sentiment.map((p, i) => [x(i), y(p.value)] as const)
+function TrajectoryPanel({ trajectory, chapters }: {
+  trajectory: TrajectoryPoint[]
+  chapters: DossierChapter[]
+}) {
+  const x = (i: number) => (i / (trajectory.length - 1)) * W
+  const y = (v: number) => MID - Math.max(-1, Math.min(1, v)) * AMP
+  const coords = trajectory.map((p, i) => [x(i), y(p.value)] as const)
   const line = coords.map(([cx, cy], i) => `${i ? 'L' : 'M'}${cx.toFixed(1)},${cy.toFixed(1)}`).join(' ')
   const last = coords[coords.length - 1]
-  const current = sentiment[sentiment.length - 1]
+  const current = trajectory[trajectory.length - 1]
+
+  // Anchor each dated chapter to the first trajectory point at/after it.
+  const markers = chapters
+    .map((c) => {
+      if (!c.at) return null
+      const idx = trajectory.findIndex((p) => p.at !== null && p.at >= c.at!)
+      return idx === -1 ? null : coords[idx]
+    })
+    .filter((m): m is readonly [number, number] => m !== null)
 
   return (
     <Panel
@@ -265,7 +220,7 @@ function TrajectoryPanel({ sentiment, chapters }: { sentiment: SentimentPoint[];
             current.value >= 0 ? 'bg-success/10 text-success' : 'bg-danger/10 text-danger'
           }`}
         >
-          {current.value >= 0 ? 'warming' : 'cooling'} · {current.value >= 0 ? '+' : ''}
+          {current.value >= 0 ? 'settling' : 'strained'} · {current.value >= 0 ? '+' : ''}
           {current.value.toFixed(2)}
         </span>
       }
@@ -279,20 +234,19 @@ function TrajectoryPanel({ sentiment, chapters }: { sentiment: SentimentPoint[];
           {/* the arc itself */}
           <path d={line} fill="none" stroke="#60a5fa" strokeWidth="1.8" strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
           {/* chapter markers */}
-          {chapters.map((c) => {
-            const [cx, cy] = coords[Math.min(c.at, coords.length - 1)]
-            return <circle key={c.id} cx={cx} cy={cy} r="1.6" fill="#04070f" stroke="#60a5fa" strokeWidth="1.1" vectorEffect="non-scaling-stroke" />
-          })}
+          {markers.map(([cx, cy], i) => (
+            <circle key={i} cx={cx} cy={cy} r="1.6" fill="#04070f" stroke="#60a5fa" strokeWidth="1.1" vectorEffect="non-scaling-stroke" />
+          ))}
           {/* now: the single sanctioned glow */}
           <circle cx={last[0]} cy={last[1]} r="2.2" fill="#60a5fa" style={{ filter: 'drop-shadow(0 0 3px rgba(96,165,250,0.9))' }} />
         </svg>
         <div className="mt-1.5 flex justify-between font-mono text-[9px] tabular-nums text-faint">
-          {sentiment.map((p, i) =>
+          {trajectory.map((p, i) =>
             // first, last, and every other label — keeps the axis quiet
-            i === 0 || i === sentiment.length - 1 || i % 2 === 0 ? (
-              <span key={p.label}>{p.label}</span>
+            i === 0 || i === trajectory.length - 1 || i % 2 === 0 ? (
+              <span key={`${p.label}-${i}`}>{p.label}</span>
             ) : (
-              <span key={p.label} aria-hidden className="opacity-0">·</span>
+              <span key={`${p.label}-${i}`} aria-hidden className="opacity-0">·</span>
             ),
           )}
         </div>
@@ -303,9 +257,22 @@ function TrajectoryPanel({ sentiment, chapters }: { sentiment: SentimentPoint[];
 
 // ── 2. Timeline chapters ───────────────────────────────────────────────────────
 
-function ChaptersPanel({ chapters }: { chapters: Chapter[] }) {
+function ChaptersPanel({ chapters }: { chapters: DossierChapter[] }) {
+  if (chapters.length === 0) {
+    return (
+      <Panel label="The story so far">
+        <p className="mt-3 text-sm leading-relaxed text-muted">
+          No chapters yet — the memory cron writes the first one after their
+          first real conversation settles.
+        </p>
+      </Panel>
+    )
+  }
   return (
-    <Panel label="The story so far" right={<span className="font-mono text-[10px] tabular-nums text-faint">{chapters.length} chapters</span>}>
+    <Panel
+      label="The story so far"
+      right={<span className="font-mono text-[10px] tabular-nums text-faint">{chapters.length} chapters</span>}
+    >
       <ol className="relative mt-4 flex list-none flex-col">
         {/* the thread */}
         <span aria-hidden className="absolute bottom-3 left-[5px] top-2 w-px bg-line" />
@@ -322,8 +289,14 @@ function ChaptersPanel({ chapters }: { chapters: Chapter[] }) {
                 }`}
               />
               <p className="font-mono text-[10px] uppercase tracking-wider text-faint">{c.range}</p>
-              <h3 className={`mt-1 text-[15px] font-medium ${isNow ? 'text-glow' : 'text-ink'}`}>{c.title}</h3>
-              <p className="mt-1.5 max-w-prose text-sm leading-relaxed text-muted">{c.summary}</p>
+              <h3 dir="auto" className={`mt-1 text-[15px] font-medium ${isNow ? 'text-glow' : 'text-ink'}`}>
+                {c.title}
+              </h3>
+              {c.summary && (
+                <p dir="auto" className="mt-1.5 max-w-prose text-sm leading-relaxed text-muted">
+                  {c.summary}
+                </p>
+              )}
               <div className="mt-2 flex flex-wrap gap-1.5">
                 {c.signals.map((s) => (
                   <span key={s} className="rounded-full border border-line bg-raised px-2 py-0.5 font-mono text-[9px] text-faint">
@@ -341,17 +314,22 @@ function ChaptersPanel({ chapters }: { chapters: Chapter[] }) {
 
 // ── 3. The held facts ──────────────────────────────────────────────────────────
 
-function FactsPanel({ dossier }: { dossier: Dossier }) {
+function FactsPanel({ data }: { data: DossierData }) {
+  const { person } = data
   return (
     <Panel label="Person 360">
       <dl className="mt-3 flex flex-col gap-3" dir="ltr">
-        <Fact term="Goal" detail={dossier.goal} />
-        <Fact term="Tension" detail={dossier.tension} />
-        <Fact term="Channel" detail={`${dossier.channel} · ${dossier.handle}`} mono />
-        <Fact term="Held since" detail={dossier.heldSince} mono />
+        <Fact term="Goal" detail={person.goal ?? '—'} />
+        <Fact term="Tension" detail={person.tension ?? '—'} />
+        <Fact
+          term="Channel"
+          detail={person.channel ? `${person.channel}${person.handle ? ` · ${person.handle}` : ''}` : '—'}
+          mono
+        />
+        <Fact term="Held since" detail={fmtDay(person.held_since)} mono />
       </dl>
       <p className="mt-4 border-t border-line pt-3 font-mono text-[10px] text-faint">
-        Held, not filed — {dossier.memoryCount} items in living memory.
+        Held, not filed — {person.memory_count} {person.memory_count === 1 ? 'item' : 'items'} in living memory.
       </p>
     </Panel>
   )
@@ -361,21 +339,42 @@ function Fact({ term, detail, mono = false }: { term: string; detail: string; mo
   return (
     <div className="text-left">
       <dt className="font-mono text-[9px] uppercase tracking-wider text-faint">{term}</dt>
-      <dd className={`mt-0.5 text-sm text-ink ${mono ? 'font-mono text-[12px] tabular-nums' : ''}`}>{detail}</dd>
+      <dd dir="auto" className={`mt-0.5 text-sm text-ink ${mono ? 'font-mono text-[12px] tabular-nums' : ''}`}>
+        {detail}
+      </dd>
     </div>
   )
 }
 
-// ── 4. Scoped AI chat ──────────────────────────────────────────────────────────
+// ── 3b. Signal log — the raw interaction timeline ──────────────────────────────
 
-function ScopedChat({ dossier }: { dossier: Dossier }) {
-  const [messages, setMessages] = useState<ChatMsg[]>(dossier.seedChat)
+function SignalLogPanel({ timeline }: { timeline: DossierTimelineEvent[] }) {
+  return (
+    <Panel
+      label="Signal log"
+      right={<span className="font-mono text-[10px] tabular-nums text-faint">{timeline.length} signals</span>}
+    >
+      <ul className="mt-3 flex list-none flex-col gap-2">
+        {timeline.slice(0, 8).map((e, i) => (
+          <li key={`${e.kind}-${e.at ?? i}`} className="flex items-baseline justify-between gap-3">
+            <span className="min-w-0 truncate text-xs text-muted">{e.label}</span>
+            <span className="shrink-0 font-mono text-[9px] tabular-nums text-faint">{fmtDay(e.at)}</span>
+          </li>
+        ))}
+      </ul>
+    </Panel>
+  )
+}
+
+// ── 4. Scoped AI chat — live planner seam, person-scoped ───────────────────────
+
+function ScopedChat({ token, personName }: { token: string; personName: string }) {
+  const [messages, setMessages] = useState<ScopedChatTurn[]>([])
   const [input, setInput] = useState('')
   const [thinking, setThinking] = useState(false)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const firstName = personName.split(' ')[0]
 
-  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current) }, [])
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
   }, [messages, thinking])
@@ -384,13 +383,17 @@ function ScopedChat({ dossier }: { dossier: Dossier }) {
     e.preventDefault()
     const text = input.trim()
     if (!text || thinking) return
+    const history = messages
     setMessages((m) => [...m, { role: 'user', text }])
     setInput('')
     setThinking(true)
-    timerRef.current = setTimeout(() => {
-      setMessages((m) => [...m, CANNED_REPLY])
-      setThinking(false)
-    }, 650)
+    askScopedMemory(token, personName, text, history)
+      .then((reply) => setMessages((m) => [...m, { role: 'ai', text: reply }]))
+      .catch(() => setMessages((m) => [
+        ...m,
+        { role: 'ai', text: "The memory couldn't be reached just now — try again in a moment." },
+      ]))
+      .finally(() => setThinking(false))
   }
 
   return (
@@ -404,11 +407,16 @@ function ScopedChat({ dossier }: { dossier: Dossier }) {
           <PanelLabel>Ask the memory</PanelLabel>
         </div>
         <span className="rounded-full bg-accent/12 px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-glow">
-          scoped to {dossier.name.split(' ')[0]}
+          scoped to {firstName}
         </span>
       </div>
 
       <div ref={scrollRef} className="flex max-h-72 flex-1 flex-col gap-3 overflow-y-auto px-4 py-4">
+        {messages.length === 0 && !thinking && (
+          <p className="self-start text-xs leading-relaxed text-faint">
+            Ask anything about {firstName} — answers come from their held memory only.
+          </p>
+        )}
         {messages.map((m, i) =>
           m.role === 'user' ? (
             <p key={i} className="ml-8 self-end rounded-card rounded-br-sm bg-accent/15 px-3 py-2 text-sm text-ink">
@@ -416,12 +424,9 @@ function ScopedChat({ dossier }: { dossier: Dossier }) {
             </p>
           ) : (
             <div key={i} className="cq-crystallize mr-4 self-start">
-              <p className="rounded-card rounded-bl-sm bg-raised px-3 py-2 text-sm leading-relaxed text-ink">{m.text}</p>
-              {m.cite && (
-                <span className="mt-1.5 inline-block rounded-full border border-line px-2 py-0.5 font-mono text-[9px] text-faint">
-                  {m.cite}
-                </span>
-              )}
+              <p dir="auto" className="whitespace-pre-wrap rounded-card rounded-bl-sm bg-raised px-3 py-2 text-sm leading-relaxed text-ink">
+                {m.text}
+              </p>
             </div>
           ),
         )}
@@ -437,7 +442,7 @@ function ScopedChat({ dossier }: { dossier: Dossier }) {
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder={`Ask about ${dossier.name.split(' ')[0]}…`}
+          placeholder={`Ask about ${firstName}…`}
           className="min-w-0 flex-1 rounded-control border border-line bg-raised px-3 py-2 text-sm text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
         />
         <button

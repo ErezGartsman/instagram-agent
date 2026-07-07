@@ -146,6 +146,20 @@ class TestFormationPrompt:
         assert "goal" in memory.FORMATION_PROMPT
         assert "attributes.goal" in memory.FORMATION_PROMPT
 
+    def test_prompt_requests_tension_attribute(self):
+        # Phase 3: tension is extracted explicitly (the queue's emotional_state
+        # fallback stays, but the attribute is the first-class source).
+        assert "attributes.tension" in memory.FORMATION_PROMPT
+
+    def test_prompt_mandates_english_goal_tension_essence(self):
+        # Phase 3 directive: Goal / Tension / Essence (profile_summary) are
+        # English-only regardless of input language — they power the English
+        # cockpit. The episodic fields stay Hebrew for the recall block.
+        assert "ONLY in English" in memory.FORMATION_PROMPT
+        assert "regardless of the input language" in memory.FORMATION_PROMPT
+        assert "ENGLISH sentences" in memory.FORMATION_PROMPT   # profile_summary
+        assert "Hebrew sentences" in memory.FORMATION_PROMPT    # session_summary stays
+
 
 # ─── render helpers ──────────────────────────────────────────────────────────
 

@@ -57,14 +57,16 @@ HISTORY_TURNS = 6
 PIPELINE_STAGES = ("engaged", "qualified", "captured", "briefed", "booked")
 
 # The frozen intent enum. GlowingAiAssistant.tsx renders widgets for
-# sla_lead_* / sla_overview / funnel / velocity / post / top_posts / community;
-# growth / pipeline / general are valid intents without a widget. Do not add
-# values here without shipping a frontend renderer first.
+# sla_lead_* / sla_overview / funnel / velocity / post / top_posts / community
+# and (since the 2026-07-06 NLP-bridge widgets) content_stats / growth_trend /
+# themes; growth / pipeline / general are valid intents without a widget. Do
+# not add values here without shipping a frontend renderer first.
 FROZEN_INTENTS = frozenset(
     {
         "sla_lead_breach", "sla_lead_warn", "sla_lead_ok", "sla_lead",
         "sla_overview", "funnel", "velocity", "pipeline",
         "post", "top_posts", "community", "growth", "general",
+        "content_stats", "growth_trend", "themes",
     }
 )
 
@@ -407,6 +409,94 @@ def _t_bookings_summary(cur, tenant_id, get_config, args) -> ToolResult:
     return ToolResult("bookings_summary", block)      # intent stays general (no widget)
 
 
+def _t_content_stats(cur, tenant_id, get_config, args) -> ToolResult:
+    """Aggregate content performance over the posts table (+ likers/comments).
+    ctx_data mirrors ContentStatsWidget's contract:
+    { posts, likes, comments, avg_likes?, avg_comments? } — averages are OMITTED
+    (not null) when there are no posts, so the widget renders '—'."""
+    # Social tables carry no tenant_id (single-tenant by schema).
+    posts = _one(cur, "SELECT COUNT(*) FROM posts")[0]
+    likes = _one(cur, "SELECT COUNT(*) FROM likers")[0]
+    comments = _one(cur, "SELECT COUNT(*) FROM comments")[0]
+    ctx: dict = {"type": "content_stats", "posts": posts, "likes": likes, "comments": comments}
+    avg_line = "  (no posts tracked yet — averages unavailable)"
+    if posts:
+        ctx["avg_likes"] = round(likes / posts, 1)
+        ctx["avg_comments"] = round(comments / posts, 1)
+        avg_line = (f"  Avg per post: {ctx['avg_likes']:,} likes, "
+                    f"{ctx['avg_comments']:,} comments")
+    block = (f"CONTENT STATS (all tracked posts):\n"
+             f"  Posts: {posts:,}  |  Likes: {likes:,}  |  Comments: {comments:,}\n"
+             f"{avg_line}")
+    return ToolResult("content_stats", block, "content_stats", ctx)
+
+
+def _t_growth_trend(cur, tenant_id, get_config, args) -> ToolResult:
+    """Weekly follower-growth series — CUMULATIVE tracked follows per week plus
+    the last-week delta %. ctx_data mirrors GrowthTrendWidget's contract:
+    { series: [{week, followers}], delta_pct: number|null }."""
+    # Cumulative needs the full weekly history; bounded for safety (~6 years).
+    rows = _rows(cur,
+        "SELECT to_char(date_trunc('week', followed_at), 'YYYY-MM-DD'), COUNT(*) "
+        "FROM followers WHERE followed_at IS NOT NULL "
+        "GROUP BY 1 ORDER BY 1 LIMIT 320")
+    running, series = 0, []
+    for wk, n in rows:
+        running += n
+        series.append({"week": wk, "followers": running})
+    series = series[-args["weeks"]:]
+    delta_pct = None
+    if len(series) >= 2 and series[-2]["followers"]:
+        delta_pct = round(
+            (series[-1]["followers"] - series[-2]["followers"])
+            / series[-2]["followers"] * 100, 1)
+    lines = [f"  {p['week']}: {p['followers']:,} cumulative tracked followers" for p in series]
+    block = ("FOLLOWER GROWTH TREND (weekly, cumulative tracked follows):\n" +
+             ("\n".join(lines) if lines else "  No weekly data available") +
+             (f"\n  Last week vs. prior: {'+' if delta_pct >= 0 else ''}{delta_pct}%"
+              if delta_pct is not None else ""))
+    return ToolResult("growth_trend", block, "growth_trend",
+                      {"type": "growth_trend", "series": series, "delta_pct": delta_pct})
+
+
+# Themes: what the whole caseload is ABOUT — Person-360 goals/tensions/concerns
+# (person_profile.attributes) unioned with conversation topics (session_summaries).
+# Sensitive (crisis) sessions are excluded at the SQL level — M4 governance.
+_THEMES_SQL = (
+    "SELECT theme, COUNT(*) AS c FROM ("
+    "  SELECT NULLIF(lower(trim(attributes->>'goal')), '') AS theme"
+    "  FROM person_profile WHERE tenant_id = %(t)s"
+    "  UNION ALL"
+    "  SELECT NULLIF(lower(trim(attributes->>'tension')), '')"
+    "  FROM person_profile WHERE tenant_id = %(t)s"
+    "  UNION ALL"
+    "  SELECT NULLIF(lower(trim(attributes->>'core_concern')), '')"
+    "  FROM person_profile WHERE tenant_id = %(t)s"
+    "  UNION ALL"
+    "  SELECT NULLIF(lower(trim(topic)), '')"
+    "  FROM session_summaries WHERE tenant_id = %(t)s AND sensitive = FALSE"
+    ") src WHERE theme IS NOT NULL "
+    "GROUP BY theme ORDER BY c DESC, theme LIMIT %(n)s"
+)
+
+
+def _t_themes(cur, tenant_id, get_config, args) -> ToolResult:
+    """Recurring themes across the caseload. ctx_data mirrors ThemesWidget's
+    contract: { themes: [{theme, count}] } (sample is optional and omitted)."""
+    rows = _rows(cur, _THEMES_SQL, {"t": tenant_id, "n": args["limit"]})
+    if not rows:
+        # No intent claimed — mirrors the empty-lookup pattern (sla_lead_lookup):
+        # the honest "nothing formed yet" line grounds the reply, no widget.
+        return ToolResult("themes",
+                          "THEMES: no Person-360 goals/tensions or conversation "
+                          "topics formed yet (memory formation may not have run).")
+    lines = [f"  {r[0]}: {r[1]} {'people' if r[1] != 1 else 'person'}" for r in rows]
+    block = "RECURRING THEMES (Person-360 goals/tensions + conversation topics):\n" + "\n".join(lines)
+    return ToolResult("themes", block, "themes",
+                      {"type": "themes",
+                       "themes": [{"theme": r[0], "count": r[1]} for r in rows]})
+
+
 # ── Tools — Person-360 (Option B, ratified 2026-07-05: the operator sees the
 #    unvarnished view, including sensitive session summaries — the `sensitive`
 #    flag gates OUTWARD channels, not the private cockpit). Rendered as plain
@@ -586,6 +676,20 @@ TOOLS: dict[str, Tool] = {
         Tool("bookings_summary",
              "Consultation bookings: all-time total, leads in Booked stage, next upcoming.",
              _t_bookings_summary),
+        Tool("content_stats",
+             "Content performance aggregate: post/like/comment totals + per-post averages. "
+             "Use for 'how is my content doing' style questions.",
+             _t_content_stats),
+        Tool("growth_trend",
+             "Weekly cumulative follower-growth series + last-week delta %. "
+             "Use for growth-over-time / trend questions. Args: weeks (2-24, default 12).",
+             _t_growth_trend,
+             {"weeks": ArgSpec("int", min_val=2, max_val=24, default=12)}),
+        Tool("themes",
+             "Recurring themes across the caseload: Person-360 goals/tensions/concerns "
+             "+ conversation topics, ranked by frequency. Args: limit (3-10, default 6).",
+             _t_themes,
+             {"limit": ArgSpec("int", min_val=3, max_val=10, default=6)}),
         Tool("person_360",
              "Everything known about one person: profile summary, facts, session summaries "
              "(incl. emotional state), recent activity, WhatsApp number. Args: name fragment.",
