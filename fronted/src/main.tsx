@@ -14,6 +14,7 @@ import { PipelinePage } from './cockpit/pages/PipelinePage'
 import { InboxPage } from './cockpit/pages/InboxPage'
 import { ContentStudioPage } from './cockpit/pages/ContentStudioPage'
 import { NotFoundPage } from './cockpit/pages/NotFoundPage'
+import { RouteErrorBoundary } from './cockpit/components/RouteErrorBoundary'
 import { FEATURES } from './cockpit/lib/flags'
 
 // Legacy Nexus app — preserved at /legacy, code-split so it never ships with the
@@ -48,6 +49,7 @@ const router = createBrowserRouter([
         <LandingPage />
       </Suspense>
     ),
+    errorElement: <RouteErrorBoundary />,
   },
   // The cockpit (CRM) — behind Supabase auth at /app. index = the Overview pulse.
   {
@@ -57,6 +59,8 @@ const router = createBrowserRouter([
         <AppShell />
       </RequireAuth>
     ),
+    // Render errors anywhere in the cockpit land here instead of white-screening.
+    errorElement: <RouteErrorBoundary />,
     children: [
       { index: true, element: <OverviewPage /> },
       ...(FEATURES.workQueue ? [{ path: 'queue', element: <WorkQueuePage /> }] : []),
