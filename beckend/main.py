@@ -2022,8 +2022,10 @@ def cockpit_briefing(user: dict = Depends(require_cockpit_user)):
                     "SELECT s.sla_status, "
                     "       COALESCE(s.person_name, 'Lead '||p.wa_ref_code, 'Lead') "
                     "FROM lead_sla_status s JOIN person p ON p.id = s.person_id "
+                    "  AND p.tenant_id = %(t)s "
                     "WHERE s.sla_status IN ('warn','breach') "
-                    "ORDER BY s.hours_since_touch DESC NULLS LAST LIMIT 20"
+                    "ORDER BY s.hours_since_touch DESC NULLS LAST LIMIT 20",
+                    {"t": nexus_ai_planner.DEFAULT_TENANT_ID},
                 )
                 warn_names, breach_names = [], []
                 for status, nm in cur.fetchall():
@@ -2776,10 +2778,11 @@ def cockpit_analytics_sla(user: dict = Depends(require_cockpit_user)):
                     "       s.target_hours, s.warn_hours, s.sla_status, "
                     "       s.hours_since_touch, s.waiting_on "
                     "FROM lead_sla_status s "
-                    "JOIN person p ON p.id = s.person_id "
+                    "JOIN person p ON p.id = s.person_id AND p.tenant_id = %(t)s "
                     "ORDER BY "
                     "  CASE s.sla_status WHEN 'breach' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END, "
-                    "  s.hours_since_touch DESC NULLS LAST"
+                    "  s.hours_since_touch DESC NULLS LAST",
+                    {"t": nexus_ai_planner.DEFAULT_TENANT_ID},
                 )
                 rows = cur.fetchall()
 
