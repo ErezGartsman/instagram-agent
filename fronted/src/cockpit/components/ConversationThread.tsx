@@ -48,7 +48,10 @@ const SAMPLE_THREAD: ThreadData = import.meta.env.DEV
           status: 'sent',
         },
       ],
-      channels: { whatsapp: { eligible: true, reason: null, window_expires_at: null } },
+      channels: {
+        whatsapp: { eligible: true, reason: null, window_expires_at: null },
+        instagram: { eligible: false, reason: 'window_expired', window_expires_at: null },
+      },
       default_channel: 'whatsapp',
     }
   : { messages: [], channels: {}, default_channel: 'whatsapp' }
@@ -59,12 +62,31 @@ const EMPTY_THREAD: ThreadData = { messages: [], channels: {}, default_channel: 
 
 const GROUP_WINDOW_MS = 3 * 60_000
 
+// Channels One Thread can send on. Matches the backend's _SUPPORTED_SEND_CHANNELS.
+const SUPPORTED_SEND_CHANNELS = new Set(['whatsapp', 'instagram', 'telegram'])
+
 // Short, tiny-chip labels — distinct from the full CHANNEL_LABELS used in page
 // headers (lib/pipeline.ts). A per-message inline chip needs to stay unobtrusive.
 const SHORT_CHANNEL: Record<string, string> = {
   whatsapp: 'WA',
   instagram: 'IG',
   telegram: 'TG',
+}
+
+function channelLabel(channel: string): string {
+  return SHORT_CHANNEL[channel] ?? channel.slice(0, 2).toUpperCase()
+}
+
+function ineligibleReason(channel: string, reason: string | null): string | null {
+  if (!reason) return null
+  const label = channelLabel(channel)
+  if (reason === 'no_inbound_yet') {
+    return `This lead hasn't messaged on ${label} yet — nothing to reply to.`
+  }
+  if (reason === 'window_expired') {
+    return `The 24-hour ${label} window has closed — they'll need to message again first.`
+  }
+  return `Sending on ${label} isn't available right now.`
 }
 
 function formatTime(iso: string): string {
@@ -100,7 +122,7 @@ function DateSeparator({ at }: { at: string }) {
 }
 
 function ChannelChip({ channel }: { channel: string | null | undefined }) {
-  const label = channel ? (SHORT_CHANNEL[channel] ?? channel.slice(0, 2).toUpperCase()) : null
+  const label = channel ? channelLabel(channel) : null
   if (!label) return null
   return (
     <span className="rounded-full border border-line/70 bg-raised/60 px-1.5 py-px font-mono text-[8px] uppercase tracking-wider text-faint">
@@ -250,11 +272,53 @@ function ActivityTimeline({ timeline }: { timeline: TimelineEvent[] }) {
   )
 }
 
-// ── Composer — One Thread Phase 2, WhatsApp only ──────────────────────────────
+// ── Composer — One Thread, send-from-cockpit ──────────────────────────────────
 // Docked at the bottom via `sticky` (the scroll container is the parent panel in
 // WorkQueuePage, not this component — sticky works within any scrolling ancestor
 // without needing to own the scroll itself). Disabled + explained, never a bare
-// failure, when the channel isn't sendable yet or the 24h window has closed.
+// failure, when the channel isn't sendable yet or its window has closed.
+//
+// The channel picker only appears once a person's thread actually spans more
+// than one channel (docs/ONE_THREAD_PRD.md §4.1: explicit pick > reply-to-
+// last-inbound > origin) — the common single-channel lead stays clutter-free.
+
+function ChannelPicker({
+  channels,
+  resolvedChannel,
+  eligibilityByChannel,
+  onSelect,
+}: {
+  channels: string[]
+  resolvedChannel: string
+  eligibilityByChannel: Record<string, ChannelEligibility | undefined>
+  onSelect: (channel: string) => void
+}) {
+  return (
+    <div className="mb-2 flex items-center gap-1.5">
+      {channels.map((ch) => {
+        const isSelected = ch === resolvedChannel
+        const isEligible = eligibilityByChannel[ch]?.eligible ?? false
+        return (
+          <button
+            key={ch}
+            type="button"
+            onClick={() => onSelect(ch)}
+            title={!isEligible ? ineligibleReason(ch, eligibilityByChannel[ch]?.reason ?? null) ?? undefined : undefined}
+            className={`rounded-full border px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider transition-colors ${
+              isSelected
+                ? 'border-accent/50 bg-accent/15 text-accent'
+                : isEligible
+                  ? 'border-line text-muted hover:border-line/70 hover:text-ink'
+                  : 'border-line/50 text-faint'
+            }`}
+          >
+            {channelLabel(ch)}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
 
 function Composer({
   draft,
@@ -263,6 +327,10 @@ function Composer({
   sending,
   blockedReason,
   channelSupported,
+  resolvedChannel,
+  availableChannels,
+  eligibilityByChannel,
+  onSelectChannel,
 }: {
   draft: string
   onDraftChange: (v: string) => void
@@ -270,6 +338,10 @@ function Composer({
   sending: boolean
   blockedReason: string | null
   channelSupported: boolean
+  resolvedChannel: string
+  availableChannels: string[]
+  eligibilityByChannel: Record<string, ChannelEligibility | undefined>
+  onSelectChannel: (channel: string) => void
 }) {
   const canSend = channelSupported && !blockedReason && draft.trim().length > 0 && !sending
 
@@ -282,6 +354,14 @@ function Composer({
 
   return (
     <div className="sticky bottom-0 -mx-6 mt-4 border-t border-line bg-bg px-6 pt-3">
+      {availableChannels.length > 1 && (
+        <ChannelPicker
+          channels={availableChannels}
+          resolvedChannel={resolvedChannel}
+          eligibilityByChannel={eligibilityByChannel}
+          onSelect={onSelectChannel}
+        />
+      )}
       {blockedReason && (
         <p className="mb-2 font-mono text-[10px] text-faint">{blockedReason}</p>
       )}
@@ -293,7 +373,7 @@ function Composer({
           onChange={(e) => onDraftChange(e.target.value)}
           onKeyDown={handleKeyDown}
           disabled={!channelSupported}
-          placeholder={channelSupported ? 'Reply on WhatsApp… (⌘/Ctrl+Enter to send)' : "Sending here isn't available yet"}
+          placeholder={channelSupported ? `Reply on ${channelLabel(resolvedChannel)}… (⌘/Ctrl+Enter to send)` : "Sending here isn't available yet"}
           className="max-h-32 min-h-[38px] flex-1 resize-none rounded-control border border-line bg-surface px-3 py-2 text-sm text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none disabled:opacity-50"
         />
         <button
@@ -319,10 +399,12 @@ function Composer({
 // actually spans more than one. Falls back to the Activity timeline when no
 // messages are persisted yet.
 //
-// Phase 2 adds the bottom-docked composer: send-from-cockpit, WhatsApp only for
-// now (docs/ONE_THREAD_PRD.md). The composer stays visible even for an empty/
-// loading thread so the operator always sees *why* they can or can't reply yet,
-// rather than the affordance appearing and disappearing.
+// The bottom-docked composer sends from the cockpit on WhatsApp, Instagram, or
+// Telegram (docs/ONE_THREAD_PRD.md). It stays visible even for an empty/
+// loading thread so the operator always sees *why* they can or can't reply
+// yet, rather than the affordance appearing and disappearing. The channel
+// picker only shows once a person's history actually spans multiple channels —
+// otherwise the resolved channel (reply-to-last-inbound) is implicit.
 
 export function ConversationThread({
   personId,
@@ -338,12 +420,14 @@ export function ConversationThread({
   const [thread, setThread] = useState<ThreadData | null>(null)
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
+  const [selectedChannel, setSelectedChannel] = useState<string | null>(null)
   const clientTokenRef = useRef<string>(crypto.randomUUID())
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     setThread(null)
     setDraft('')
+    setSelectedChannel(null)   // a new person resets any explicit channel override
     if (devBypass) {
       const t = setTimeout(() => setThread(SAMPLE_THREAD), 180)
       return () => clearTimeout(t)
@@ -361,28 +445,28 @@ export function ConversationThread({
     }
   }, [msgs])
 
-  // Only surface the per-bubble channel chip once a person's history actually
-  // crosses channels — a single-channel lead (the common case) stays clutter-free.
-  const spansMultipleChannels = useMemo(() => {
-    if (!msgs) return false
-    const channels = new Set(msgs.map((m) => m.channel).filter(Boolean))
-    return channels.size > 1
+  // The distinct channels this person's history actually touches — drives both
+  // the per-bubble channel chip and the composer's channel picker. A single-
+  // channel lead (the common case) never sees either.
+  const availableChannels = useMemo(() => {
+    if (!msgs) return []
+    return Array.from(new Set(msgs.map((m) => m.channel).filter((c): c is string => Boolean(c))))
   }, [msgs])
+  const spansMultipleChannels = availableChannels.length > 1
 
+  // Resolution order (§4.1): explicit operator pick > reply-to-last-inbound.
   const defaultChannel = thread?.default_channel ?? 'whatsapp'
-  const eligibility: ChannelEligibility | undefined = thread?.channels?.[defaultChannel]
-  // Phase 2 only sends on WhatsApp — Instagram/Telegram sending lands in Phase 3.
-  const channelSupported = defaultChannel === 'whatsapp'
+  const resolvedChannel = selectedChannel ?? defaultChannel
+  const eligibility: ChannelEligibility | undefined = thread?.channels?.[resolvedChannel]
+  const channelSupported = SUPPORTED_SEND_CHANNELS.has(resolvedChannel)
 
   const blockedReason = !channelSupported
-    ? `Replies on ${SHORT_CHANNEL[defaultChannel] ?? defaultChannel} aren't supported yet — WhatsApp only for now.`
-    : eligibility && !eligibility.eligible
-      ? (eligibility.reason === 'no_inbound_yet'
-          ? "This lead hasn't messaged on WhatsApp yet — nothing to reply to."
-          : "The 24-hour WhatsApp window has closed — they'll need to message again first.")
+    ? `Sending on ${channelLabel(resolvedChannel)} isn't available yet.`
+    : (eligibility && !eligibility.eligible)
+      ? ineligibleReason(resolvedChannel, eligibility.reason)
       : null
 
-  const attemptSend = async (text: string, tempId: string) => {
+  const attemptSend = async (text: string, tempId: string, channel: string) => {
     setSending(true)
 
     if (devBypass) {
@@ -399,7 +483,7 @@ export function ConversationThread({
     }
     if (!token) { setSending(false); return }
 
-    const result = await sendThreadMessage(token, personId, text, clientTokenRef.current, defaultChannel)
+    const result = await sendThreadMessage(token, personId, text, clientTokenRef.current, channel)
     setSending(false)
     if (result.status === 'success' && result.message) {
       clientTokenRef.current = crypto.randomUUID()
@@ -420,13 +504,14 @@ export function ConversationThread({
     const text = draft.trim()
     if (!text || sending) return
     const tempId = crypto.randomUUID()
+    const channel = resolvedChannel
     const optimistic: ThreadMessage = {
       id: tempId, role: 'operator', body: text, at: new Date().toISOString(),
-      channel: defaultChannel, status: 'sending',
+      channel, status: 'sending',
     }
     setThread((prev) => prev && { ...prev, messages: [...prev.messages, optimistic] })
     setDraft('')
-    void attemptSend(text, tempId)
+    void attemptSend(text, tempId, channel)
   }
 
   const handleRetry = (msg: ThreadMessage) => {
@@ -435,7 +520,9 @@ export function ConversationThread({
       ...prev,
       messages: prev.messages.map((m) => (m.id === msg.id ? { ...m, status: 'sending' } : m)),
     })
-    void attemptSend(msg.body, msg.id)
+    // Retry on the SAME channel it originally failed on — not whatever channel
+    // is currently selected in the composer, which may have changed since.
+    void attemptSend(msg.body, msg.id, msg.channel ?? resolvedChannel)
   }
 
   let body: ReactNode
@@ -495,6 +582,10 @@ export function ConversationThread({
           sending={sending}
           blockedReason={blockedReason}
           channelSupported={channelSupported}
+          resolvedChannel={resolvedChannel}
+          availableChannels={availableChannels}
+          eligibilityByChannel={thread.channels}
+          onSelectChannel={setSelectedChannel}
         />
       )}
     </>
