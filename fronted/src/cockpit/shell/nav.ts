@@ -1,5 +1,5 @@
 import type { LucideIcon } from 'lucide-react'
-import { LayoutGrid, ListChecks, Columns3, Inbox, Sparkles, ChartColumn } from 'lucide-react'
+import { LayoutGrid, ListChecks, Columns3, Sparkles, ChartColumn } from 'lucide-react'
 import { FEATURES } from '../lib/flags'
 
 export type NavItem = { to: string; label: string; icon: LucideIcon }
@@ -28,11 +28,8 @@ export const NAV_SECTIONS: NavSection[] = [
         ? [{ to: '/app/queue', label: 'Work queue', icon: ListChecks }]
         : []),
       { to: '/app/pipeline', label: 'Pipeline', icon: Columns3 },
-      // Inbox hidden until P2 builds the full WhatsApp thread view (B2 decision).
-      // Route /app/inbox stays registered; VITE_FEATURE_INBOX=1 to preview locally.
-      ...(FEATURES.inbox
-        ? [{ to: '/app/inbox', label: 'Inbox', icon: Inbox }]
-        : []),
+      // Inbox RETIRED (E1 §A7, SYSTEM_ELEVATION_PRD.md): One Thread inside the
+      // dossier IS the inbox. /app/inbox deep-links redirect to the queue.
     ],
   },
   {

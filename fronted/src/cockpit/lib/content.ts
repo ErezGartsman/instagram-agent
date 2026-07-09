@@ -1,4 +1,4 @@
-import { API_BASE } from './api'
+import { apiFetch } from './http'
 
 // The Content Studio — the Studio pillar. Video scripts + content themes managed
 // in the same OS as the CRM, so the "magic" (content) sits beside the "logic"
@@ -27,17 +27,8 @@ export type ContentPiece = {
   published_at: string | null
 }
 
-function authHeaders(token: string): HeadersInit {
-  return { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
-}
-
 export async function fetchContent(token: string, signal?: AbortSignal): Promise<ContentPiece[]> {
-  const res = await fetch(`${API_BASE}/api/cockpit/content`, {
-    headers: authHeaders(token),
-    signal,
-  })
-  if (!res.ok) throw new Error(`content ${res.status}`)
-  const data = (await res.json()) as { items?: ContentPiece[] }
+  const data = await apiFetch<{ items?: ContentPiece[] }>('/api/cockpit/content', token, { signal })
   return data.items ?? []
 }
 
@@ -45,13 +36,11 @@ export async function createContent(
   token: string,
   draft: Partial<Pick<ContentPiece, 'title' | 'body' | 'status' | 'theme_tags'>>,
 ): Promise<ContentPiece> {
-  const res = await fetch(`${API_BASE}/api/cockpit/content`, {
+  const data = await apiFetch<{ item: ContentPiece }>('/api/cockpit/content', token, {
     method: 'POST',
-    headers: authHeaders(token),
     body: JSON.stringify(draft),
   })
-  if (!res.ok) throw new Error(`content create ${res.status}`)
-  return ((await res.json()) as { item: ContentPiece }).item
+  return data.item
 }
 
 export async function updateContent(
@@ -59,21 +48,15 @@ export async function updateContent(
   id: string,
   patch: Partial<Pick<ContentPiece, 'title' | 'body' | 'status' | 'theme_tags' | 'leads_attributed'>>,
 ): Promise<ContentPiece> {
-  const res = await fetch(`${API_BASE}/api/cockpit/content/${id}`, {
+  const data = await apiFetch<{ item: ContentPiece }>(`/api/cockpit/content/${id}`, token, {
     method: 'PATCH',
-    headers: authHeaders(token),
     body: JSON.stringify(patch),
   })
-  if (!res.ok) throw new Error(`content update ${res.status}`)
-  return ((await res.json()) as { item: ContentPiece }).item
+  return data.item
 }
 
 export async function deleteContent(token: string, id: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/cockpit/content/${id}`, {
-    method: 'DELETE',
-    headers: authHeaders(token),
-  })
-  if (!res.ok) throw new Error(`content delete ${res.status}`)
+  await apiFetch(`/api/cockpit/content/${id}`, token, { method: 'DELETE' })
 }
 
 function ago(secs: number): string {

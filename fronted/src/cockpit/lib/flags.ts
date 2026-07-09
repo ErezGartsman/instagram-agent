@@ -12,8 +12,6 @@ export const FEATURES = {
   analytics: import.meta.env.DEV || import.meta.env.VITE_FEATURE_ANALYTICS === '1',
   /** Sprint 5 · the Content Studio. */
   content: import.meta.env.DEV || import.meta.env.VITE_FEATURE_CONTENT === '1',
-  /** P2 · the unified WhatsApp thread inbox (B2 decision: pull thread into cockpit).
-   *  Hidden until the full thread view is built — stub Placeholder is not premium enough
-   *  to surface in the nav. Route /app/inbox stays registered for deep-link safety. */
-  inbox: import.meta.env.VITE_FEATURE_INBOX === '1',
+  // 'inbox' RETIRED (E1 §A7, SYSTEM_ELEVATION_PRD.md): One Thread inside the
+  // dossier superseded the planned inbox surface; /app/inbox redirects to the queue.
 } as const

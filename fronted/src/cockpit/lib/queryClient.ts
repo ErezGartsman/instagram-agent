@@ -12,6 +12,13 @@ import { ApiError } from './http'
 /** Central query-key registry — every key the Realtime layer may invalidate. */
 export const queryKeys = {
   queue: ['queue'] as const,
+  overview: ['overview'] as const,
+  pipeline: ['pipeline'] as const,
+  briefing: ['briefing'] as const,
+  analytics: ['analytics'] as const,
+  funnel: (days: number) => ['analytics', 'funnel', days] as const,
+  sla: ['analytics', 'sla'] as const,
+  content: ['content'] as const,
   dossier: (personId: string) => ['dossier', personId] as const,
   thread: (personId: string) => ['thread', personId] as const,
   agentRuns: (personId: string) => ['agents', 'runs', personId] as const,

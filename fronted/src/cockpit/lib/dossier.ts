@@ -1,4 +1,4 @@
-import { API_BASE } from './api'
+import { apiFetch } from './http'
 
 // The proactive layer's data spine (Phase 3): the Morning Briefing diff and
 // the Person Dossier narrative. Both are deterministic backend payloads —
@@ -25,12 +25,8 @@ export type BriefingData = {
 }
 
 export async function fetchBriefing(token: string, signal?: AbortSignal): Promise<BriefingData> {
-  const res = await fetch(`${API_BASE}/api/cockpit/briefing`, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal,
-  })
-  if (!res.ok) throw new Error(`briefing ${res.status}`)
-  const data = await res.json() as { status?: string; compiled_at?: string; items?: BriefingItem[] }
+  const data = await apiFetch<{ status?: string; compiled_at?: string; items?: BriefingItem[] }>(
+    '/api/cockpit/briefing', token, { signal })
   if (data.status !== 'success' || !Array.isArray(data.items)) {
     throw new Error('briefing returned error payload')
   }
@@ -83,12 +79,8 @@ export async function fetchDossier(
   personId: string,
   signal?: AbortSignal,
 ): Promise<DossierData> {
-  const res = await fetch(`${API_BASE}/api/cockpit/person/${encodeURIComponent(personId)}/dossier`, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal,
-  })
-  if (!res.ok) throw new Error(`dossier ${res.status}`)
-  const data = await res.json() as { status?: string; detail?: string } & Partial<DossierData>
+  const data = await apiFetch<{ status?: string; detail?: string } & Partial<DossierData>>(
+    `/api/cockpit/person/${encodeURIComponent(personId)}/dossier`, token, { signal })
   if (data.status !== 'success' || !data.person) {
     if ((data.detail ?? '').includes('not found')) throw new DossierNotFound()
     throw new Error('dossier returned error payload')
@@ -111,9 +103,8 @@ export async function askScopedMemory(
   message: string,
   history: ScopedChatTurn[],
 ): Promise<string> {
-  const res = await fetch(`${API_BASE}/api/cockpit/ai/chat`, {
+  const data = await apiFetch<{ reply?: string }>('/api/cockpit/ai/chat', token, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({
       message,
       chips: [`Person: ${personName}`],
@@ -124,8 +115,6 @@ export async function askScopedMemory(
     }),
     signal: AbortSignal.timeout(35_000),
   })
-  if (!res.ok) throw new Error(`chat ${res.status}`)
-  const data = await res.json() as { reply?: string }
   if (!data.reply) throw new Error('chat returned no reply')
   return data.reply
 }

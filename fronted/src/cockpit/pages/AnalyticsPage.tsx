@@ -1,17 +1,19 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ResponsiveContainer, AreaChart, Area, Tooltip, YAxis } from 'recharts'
 import { PageHeader } from '../components/PageHeader'
 import { Icon } from '../components/Icon'
-import { SurfaceLoading, SurfaceError } from '../components/SurfaceStates'
+import { SurfaceLoading, SurfaceError, SampleNotice } from '../components/SurfaceStates'
 import { pushAiContext } from '../components/GlowingAiAssistant'
 import { useAuth } from '../auth/AuthProvider'
+import { queryKeys } from '../lib/queryClient'
 import { STAGE_LABELS } from '../lib/pipeline'
 import {
   compact, fmtHours,
   fetchAnalytics, fetchFunnel, fetchSla,
   SAMPLE_ANALYTICS,
-  type AnalyticsData, type FunnelData, type SlaData, type SlaStatus, type WaitingOn,
+  type AnalyticsData, type SlaData, type SlaStatus, type WaitingOn,
 } from '../lib/analytics'
 
 const ELECTRIC = '#60a5fa'
@@ -87,58 +89,54 @@ export function AnalyticsPage() {
 
 // ── Overview tab ──────────────────────────────────────────────────────────────
 function OverviewTab({ token, devBypass }: { token: string | null; devBypass: boolean }) {
-  type State = { kind: 'loading' } | { kind: 'error' } | { kind: 'ready'; data: AnalyticsData; sample: boolean }
-  const [state, setState] = useState<State>({ kind: 'loading' })
-  const [nonce, setNonce] = useState(0)
-  const retry = useCallback(() => { setState({ kind: 'loading' }); setNonce(n => n + 1) }, [])
+  const query = useQuery({
+    queryKey: queryKeys.analytics,
+    queryFn: ({ signal }) => fetchAnalytics(token!, signal),
+    enabled: !!token && !devBypass,
+  })
 
-  useEffect(() => {
-    if (devBypass) { setState({ kind: 'ready', data: SAMPLE_ANALYTICS, sample: true }); return }
-    if (!token) return
-    const ctrl = new AbortController()
-    setState({ kind: 'loading' })
-    fetchAnalytics(token, ctrl.signal)
-      .then(data => setState({ kind: 'ready', data, sample: false }))
-      .catch((err: unknown) => { if ((err as { name?: string })?.name !== 'AbortError') setState({ kind: 'error' }) })
-    return () => ctrl.abort()
-  }, [token, devBypass, nonce])
-
-  if (state.kind === 'loading') return <SurfaceLoading variant="bento" />
-  if (state.kind === 'error')   return <SurfaceError title="Couldn't load analytics" body="Check your connection and try again." onRetry={retry} />
-  return (
-    <>
-      {state.sample && (
-        <div className="mb-4 inline-flex items-center gap-2 rounded-control border border-line px-3 py-1 text-xs text-warn">
-          <Icon name="alert" size={13} /> sample data
-        </div>
-      )}
-      <Bento data={state.data} />
-    </>
-  )
+  if (devBypass) {
+    return (
+      <>
+        <SampleNotice />
+        <Bento data={SAMPLE_ANALYTICS} />
+      </>
+    )
+  }
+  if (query.data) return <Bento data={query.data} />
+  if (query.isError && !query.isFetching) {
+    return (
+      <SurfaceError
+        title="Couldn't load analytics"
+        body="Check your connection and try again."
+        onRetry={() => void query.refetch()}
+      />
+    )
+  }
+  return <SurfaceLoading variant="bento" />
 }
 
 // ── Funnel tab ─────────────────────────────────────────────────────────────────
 function FunnelTab({ token, days }: { token: string | null; days: Days }) {
-  type State = { kind: 'loading' } | { kind: 'error' } | { kind: 'ready'; data: FunnelData }
-  const [state, setState] = useState<State>({ kind: 'loading' })
-  const [nonce, setNonce] = useState(0)
-  const retry = useCallback(() => { setState({ kind: 'loading' }); setNonce(n => n + 1) }, [])
+  const query = useQuery({
+    queryKey: queryKeys.funnel(days ?? 0),  // 0 = all-time
+    queryFn: ({ signal }) => fetchFunnel(token!, days, signal),
+    enabled: !!token,
+  })
 
-  useEffect(() => {
-    if (!token) return
-    const ctrl = new AbortController()
-    setState({ kind: 'loading' })
-    fetchFunnel(token, days, ctrl.signal)
-      .then(data => setState({ kind: 'ready', data }))
-      .catch((err: unknown) => { if ((err as { name?: string })?.name !== 'AbortError') setState({ kind: 'error' }) })
-    return () => ctrl.abort()
-  }, [token, days, nonce])
+  if (query.isError && !query.isFetching) {
+    return (
+      <SurfaceError
+        title="Couldn't load funnel"
+        body="Check your connection and try again."
+        onRetry={() => void query.refetch()}
+      />
+    )
+  }
+  if (!query.data) return <SurfaceLoading variant="bento" />
 
-  if (state.kind === 'loading') return <SurfaceLoading variant="bento" />
-  if (state.kind === 'error')   return <SurfaceError title="Couldn't load funnel" body="Check your connection and try again." onRetry={retry} />
-
-  const stages = state.data.stages ?? []
-  const pairs  = state.data.pairs  ?? []
+  const stages = query.data.stages ?? []
+  const pairs  = query.data.pairs  ?? []
 
   const pipelineStages = PIPELINE.map((stage) => {
     const s         = stages.find(x => x.stage === stage)
@@ -407,63 +405,52 @@ const MOVE_CHIP: Record<WaitingOn, { label: string; cls: string }> = {
 const SLA_REFETCH_DEBOUNCE_MS = 500
 
 function LeadsTab({ token }: { token: string | null }) {
-  type State = { kind: 'loading' } | { kind: 'error' } | { kind: 'ready'; data: SlaData }
-  const [state,   setState]   = useState<State>({ kind: 'loading' })
-  const [nonce,   setNonce]   = useState(0)
   const [search,  setSearch]  = useState('')
   const [filter,  setFilter]  = useState<SlaStatus | 'all'>('all')
   const navigate = useNavigate()
-  const retry    = useCallback(() => { setState({ kind: 'loading' }); setNonce(n => n + 1) }, [])
+  const queryClient = useQueryClient()
 
-  // Initial + retry-triggered load — the only path that shows the loading skeleton.
+  // Four-state lifecycle on the spine: focus refetch comes from the query
+  // layer; 'nexus:sla-changed' (fired by the AI panel after an outreach click
+  // logs an interaction) invalidates so the table never needs a remount to
+  // see the new accountable_since. Background failures keep the last data.
+  const query = useQuery({
+    queryKey: queryKeys.sla,
+    queryFn: ({ signal }) => fetchSla(token!, signal),
+    enabled: !!token,
+  })
   useEffect(() => {
-    if (!token) return
-    const ctrl = new AbortController()
-    setState({ kind: 'loading' })
-    fetchSla(token, ctrl.signal)
-      .then(data => setState({ kind: 'ready', data }))
-      .catch((err: unknown) => { if ((err as { name?: string })?.name !== 'AbortError') setState({ kind: 'error' }) })
-    return () => ctrl.abort()
-  }, [token, nonce])
-
-  // Live propagation — silent background refetch (no loading flash, keeps
-  // existing data on a transient failure), triggered by:
-  //   • tab regains focus / becomes visible (operator switches back)
-  //   • 'nexus:sla-changed' — fired by the AI panel after an outreach click
-  //     logs an interaction, so this table never needs a remount to see the
-  //     new accountable_since take effect.
-  useEffect(() => {
-    if (!token) return
     let debounce: ReturnType<typeof setTimeout> | null = null
-    const silentRefetch = () => {
-      fetchSla(token)
-        .then(data => setState({ kind: 'ready', data }))
-        .catch(() => { /* transient — keep showing what's already on screen */ })
-    }
     const trigger = () => {
       if (debounce) clearTimeout(debounce)
-      debounce = setTimeout(silentRefetch, SLA_REFETCH_DEBOUNCE_MS)
+      debounce = setTimeout(
+        () => void queryClient.invalidateQueries({ queryKey: queryKeys.sla }),
+        SLA_REFETCH_DEBOUNCE_MS,
+      )
     }
-    const onVisibility = () => { if (document.visibilityState === 'visible') trigger() }
-    window.addEventListener('focus', trigger)
-    document.addEventListener('visibilitychange', onVisibility)
     window.addEventListener('nexus:sla-changed', trigger)
     return () => {
-      window.removeEventListener('focus', trigger)
-      document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('nexus:sla-changed', trigger)
       if (debounce) clearTimeout(debounce)
     }
-  }, [token])
+  }, [queryClient])
 
+  const state: { kind: 'loading' } | { kind: 'error' } | { kind: 'ready'; data: SlaData } =
+    query.data
+      ? { kind: 'ready', data: query.data }
+      : query.isError && !query.isFetching
+        ? { kind: 'error' }
+        : { kind: 'loading' }
+  const retry = () => void query.refetch()
+
+  const leads = query.data?.leads
   const visibleLeads = useMemo(() => {
-    if (state.kind !== 'ready') return []
-    return state.data.leads.filter(l => {
+    return (leads ?? []).filter(l => {
       const matchesFilter = filter === 'all' || l.sla_status === filter
       const matchesSearch = !search || l.person_name.toLowerCase().includes(search.toLowerCase())
       return matchesFilter && matchesSearch
     })
-  }, [state, filter, search])
+  }, [leads, filter, search])
 
   if (state.kind === 'loading') return <SurfaceLoading variant="bento" />
   if (state.kind === 'error')   return <SurfaceError title="Couldn't load SLA data" body="Check your connection and try again." onRetry={retry} />
