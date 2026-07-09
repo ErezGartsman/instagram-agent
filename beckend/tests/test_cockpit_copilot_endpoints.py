@@ -49,7 +49,7 @@ def _fake_conn():
 def test_context_returns_envelope(client):
     with patch.object(main, "get_db_conn", _fake_conn), \
          patch.object(main, "_db_person360", return_value=PERSON), \
-         patch.object(main, "_db_whatsapp_thread", return_value=THREAD):
+         patch.object(main, "_db_person_thread", return_value=THREAD):
         r = client.get("/api/cockpit/copilot/context", params={"person_id": PID})
     assert r.status_code == 200
     data = r.json()
@@ -74,7 +74,7 @@ def test_stream_emits_deltas_then_done(client):
     draft_text = "היי מאיה"
     with patch.object(main, "get_db_conn", _fake_conn), \
          patch.object(main, "_db_person360", return_value=PERSON), \
-         patch.object(main, "_db_whatsapp_thread", return_value=THREAD), \
+         patch.object(main, "_db_person_thread", return_value=THREAD), \
          patch.object(main, "_call_llm", return_value=draft_text), \
          patch.object(main, "_COPILOT_WORD_DELAY_MS", 0):  # don't sleep in CI
         r = client.post("/api/cockpit/copilot/stream",
@@ -100,7 +100,7 @@ def test_stream_uses_demo_draft_when_mock_flag_set(client):
     """COPILOT_DEMO_MOCK=1 → nexus_copilot.demo_draft_for() is called instead of _call_llm."""
     with patch.object(main, "get_db_conn", _fake_conn), \
          patch.object(main, "_db_person360", return_value=PERSON), \
-         patch.object(main, "_db_whatsapp_thread", return_value=THREAD), \
+         patch.object(main, "_db_person_thread", return_value=THREAD), \
          patch.object(main.settings, "copilot_demo_mock", True), \
          patch.object(main, "_COPILOT_WORD_DELAY_MS", 0):
         r = client.post("/api/cockpit/copilot/stream", json={"person_id": PID})

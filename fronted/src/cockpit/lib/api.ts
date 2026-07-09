@@ -26,16 +26,18 @@ export interface SearchResult {
   route: string
 }
 
-// ── WhatsApp thread ───────────────────────────────────────────────────────────
+// ── One Thread — the unified cross-channel conversation ──────────────────────
 
 export interface ThreadMessage {
   /** 'user' = lead's inbound · 'assistant' = bot handoff ACK · 'operator' = Erez's reply */
   role: 'user' | 'assistant' | 'operator'
   body: string
   at: string  // ISO 8601
+  /** Origin channel (whatsapp/instagram/telegram/…). Null for legacy rows predating the column. */
+  channel?: string | null
 }
 
-/** Fetch the merged WhatsApp thread for a person (inbound + outbound). Returns [] on error. */
+/** Fetch a person's merged conversation across ALL channels (inbound + outbound). Returns [] on error. */
 export async function fetchThread(token: string, personId: string): Promise<ThreadMessage[]> {
   try {
     const res = await fetch(

@@ -2722,3 +2722,64 @@ class TestErasureEndpoint:
         body = r.json()
         assert body["status"] == "erased"
         assert body["deleted"] == counts
+
+
+class TestDbPersonThread:
+    """
+    One Thread Phase 1 — `_db_person_thread` merges ALL channels (not just
+    WhatsApp) into one chronological list, each message tagged with its
+    source channel. Generalizes the former `_db_whatsapp_thread`.
+    """
+    PID = "22222222-2222-2222-2222-222222222222"
+
+    def _mock_cursor(self, inbound_rows, outbound_rows):
+        """A cursor whose fetchall() returns inbound rows first call, outbound
+        rows second call — mirrors _db_person_thread's two sequential queries."""
+        cur = MagicMock()
+        cur.fetchall.side_effect = [inbound_rows, outbound_rows]
+        cur.__enter__ = lambda s: s
+        cur.__exit__  = MagicMock(return_value=False)
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        return conn, cur
+
+    def test_merges_multiple_channels_chronologically(self):
+        """A person who wrote on Instagram then WhatsApp, with an operator
+        reply on Telegram, comes back as ONE timeline ordered by time —
+        not grouped by channel — with each message's origin channel intact."""
+        from datetime import datetime, timezone
+
+        def dt(s):
+            return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+
+        inbound = [
+            # (role, content, created_at, channel) — DESC order as SQL returns it
+            ("user", "hi from WA later", dt("2026-07-02T10:00:00"), "whatsapp"),
+            ("user", "hi from IG first", dt("2026-07-01T09:00:00"), "instagram"),
+        ]
+        outbound = [
+            # (body, sent_at, channel)
+            ("reply on TG", dt("2026-07-03T11:00:00"), "telegram"),
+        ]
+        conn, cur = self._mock_cursor(inbound, outbound)
+
+        thread = main._db_person_thread(conn, self.PID)
+
+        assert [m["channel"] for m in thread] == ["instagram", "whatsapp", "telegram"]
+        assert [m["at"] for m in thread] == sorted(m["at"] for m in thread)
+        assert thread[0]["role"] == "user"
+        assert thread[-1]["role"] == "operator"   # outbound is always 'operator'
+
+    def test_inbound_query_no_longer_whatsapp_only(self):
+        """Locks the Phase 1 change: the inbound query must not filter to
+        WhatsApp — every channel's sessions/messages are eligible."""
+        conn, cur = self._mock_cursor([], [])
+        main._db_person_thread(conn, self.PID)
+
+        inbound_sql = cur.execute.call_args_list[0].args[0]
+        assert "whatsapp" not in inbound_sql.lower()
+        assert "s.channel" in inbound_sql  # still SELECTed, just not filtered on
+
+    def test_empty_thread_returns_empty_list(self):
+        conn, cur = self._mock_cursor([], [])
+        assert main._db_person_thread(conn, self.PID) == []
