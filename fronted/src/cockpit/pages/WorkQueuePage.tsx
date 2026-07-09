@@ -3,7 +3,7 @@ import type { CSSProperties, KeyboardEvent, MouseEvent } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { SurfaceLoading, SurfaceEmpty, SurfaceError } from '../components/SurfaceStates'
 import { HotLeadToast } from '../components/HotLeadToast'
-import { WhatsAppThread } from '../components/WhatsAppThread'
+import { ConversationThread } from '../components/ConversationThread'
 import { CopilotNudge } from '../components/CopilotNudge'
 import { AgentPip } from '../components/AgentPip'
 import { AgentActivityFeed } from '../components/AgentActivityFeed'
@@ -554,39 +554,16 @@ function Board({
                   personId={selected.person_id}
                   token={token}
                 />
-              ) : selected.channel === 'whatsapp' ? (
-                <WhatsAppThread
+              ) : (
+                // One Thread (Phase 1): unified across every channel, not just
+                // WhatsApp — the component's own empty-state already renders the
+                // Activity timeline fallback, so no per-channel gate is needed here.
+                <ConversationThread
                   personId={selected.person_id}
                   token={token}
                   devBypass={devBypass}
                   fallbackTimeline={selected.timeline}
                 />
-              ) : (
-                <>
-                  <div className="mb-4 font-mono text-[10px] uppercase tracking-[0.13em] text-faint">Activity</div>
-                  {selected.timeline.length === 0 ? (
-                    <p className="text-sm text-muted">No recorded activity yet.</p>
-                  ) : (
-                    <ol className="relative ml-1 border-l border-line">
-                      {selected.timeline.map((e, i) => (
-                        <li
-                          key={i}
-                          className="cq-rise relative pb-4 pl-5 last:pb-0"
-                          style={{ animationDelay: `${i * 45}ms` }}
-                        >
-                          <span
-                            aria-hidden
-                            className={`absolute -left-[4.5px] top-1.5 h-2 w-2 rounded-full ${
-                              i === 0 ? 'bg-accent' : 'bg-faint'
-                            }`}
-                          />
-                          <div className="text-sm text-ink">{e.label}</div>
-                          <div className="font-mono text-[10px] text-faint">{relativeTime(e.at)}</div>
-                        </li>
-                      ))}
-                    </ol>
-                  )}
-                </>
               )}
             </div>
 

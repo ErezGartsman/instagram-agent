@@ -1852,43 +1852,54 @@ def cockpit_queue(user: dict = Depends(require_cockpit_user)):
         return {"status": "error", "detail": "Could not load the work queue."}
 
 
-def _db_whatsapp_thread(conn, person_id: str, limit: int = 150) -> list:
+def _db_person_thread(conn, person_id: str, limit: int = 150) -> list:
     """
-    Merge a person's WhatsApp conversation into one chronological list of
-    {role, body, at}. Inbound bodies live in `messages` (via sessions); operator
-    replies live in `outbound_messages`. Roles: 'user' = lead inbound,
-    'assistant' = the one-time bot handoff ACK, 'operator' = Erez's reply.
-    Commit-free; the caller owns the connection. Shared by the WS1 thread view
-    and the P2 Copilot context envelope.
+    Merge a person's conversation ACROSS ALL CHANNELS (WhatsApp, Instagram,
+    Telegram, …) into one chronological list of {role, body, at, channel}.
+    Inbound bodies live in `messages` (via sessions); operator replies live in
+    `outbound_messages`. Roles: 'user' = lead inbound, 'assistant' = the
+    one-time bot handoff ACK, 'operator' = Erez's reply. `channel` comes from
+    `sessions.channel` (inbound) / `outbound_messages.channel` (outbound) so the
+    UI can tag cross-channel leads without a second round-trip.
+
+    One Thread Phase 1 (2026-07-09): generalizes the former WhatsApp-only
+    `_db_whatsapp_thread` by dropping the `s.channel = 'whatsapp'` filter — see
+    docs/ONE_THREAD_PRD.md §3.1. Read-only; no behaviour change for send (still
+    manual/off-platform in Phase 1).
+
+    Commit-free; the caller owns the connection. Shared by the Work Queue
+    thread view and the P2 Copilot context envelope.
     """
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT m.role, m.content, m.created_at
+            SELECT m.role, m.content, m.created_at, s.channel
             FROM messages m
             JOIN sessions s ON s.id = m.session_id
-            WHERE s.person_id = %s AND s.channel = 'whatsapp'
+            WHERE s.person_id = %s
             ORDER BY m.created_at DESC
             LIMIT %s
             """,
             (person_id, limit),
         )
         inbound = [
-            {"role": r[0], "body": r[1], "at": r[2].isoformat() if r[2] else None}
+            {"role": r[0], "body": r[1], "at": r[2].isoformat() if r[2] else None,
+             "channel": r[3]}
             for r in cur.fetchall()
         ]
         cur.execute(
             """
-            SELECT body, sent_at
+            SELECT body, sent_at, channel
             FROM outbound_messages
-            WHERE person_id = %s AND channel = 'whatsapp'
+            WHERE person_id = %s
             ORDER BY sent_at DESC
             LIMIT %s
             """,
             (person_id, limit),
         )
         outbound = [
-            {"role": "operator", "body": r[0], "at": r[1].isoformat() if r[1] else None}
+            {"role": "operator", "body": r[0], "at": r[1].isoformat() if r[1] else None,
+             "channel": r[2]}
             for r in cur.fetchall()
         ]
     return sorted(inbound + outbound, key=lambda m: m["at"] or "")
@@ -1941,12 +1952,13 @@ def _db_person360(conn, person_id: str) -> Optional[dict]:
 @app.get("/api/cockpit/thread/{person_id}")
 def cockpit_thread(person_id: str, user: dict = Depends(require_cockpit_user)):
     """
-    P2 WS1 — WhatsApp conversation thread for a person. Merges inbound messages
-    with operator-authored outbound messages, oldest-first (see _db_whatsapp_thread).
+    One Thread (Phase 1) — a person's conversation across ALL channels. Merges
+    inbound messages with operator-authored outbound messages, oldest-first,
+    each tagged with its channel (see _db_person_thread).
     """
     try:
         with get_db_conn() as conn:
-            messages = _db_whatsapp_thread(conn, person_id)
+            messages = _db_person_thread(conn, person_id)
         return {"status": "success", "messages": messages}
     except Exception as e:
         logger.error(f"[cockpit/thread] query failed for {person_id}: {e}")
@@ -2173,7 +2185,7 @@ def cockpit_copilot_context(person_id: str, user: dict = Depends(require_cockpit
             person = _db_person360(conn, person_id)
             if person is None:
                 raise HTTPException(status_code=404, detail="Lead not found.")
-            thread = _db_whatsapp_thread(conn, person_id)
+            thread = _db_person_thread(conn, person_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -2205,7 +2217,7 @@ def cockpit_copilot_stream(body: CopilotStreamBody,
             person = _db_person360(conn, body.person_id)
             if person is None:
                 raise HTTPException(status_code=404, detail="Lead not found.")
-            thread = _db_whatsapp_thread(conn, body.person_id)
+            thread = _db_person_thread(conn, body.person_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -3469,7 +3481,7 @@ def cockpit_whatsapp_draft(
                 return {"status": "error", "detail": "Lead not found."}
 
             # ── WhatsApp thread (last 30 messages) ───────────────────────────
-            thread = _db_whatsapp_thread(conn, person_id, limit=30)
+            thread = _db_person_thread(conn, person_id, limit=30)
 
             # ── WhatsApp phone number ─────────────────────────────────────────
             with conn.cursor() as cur:

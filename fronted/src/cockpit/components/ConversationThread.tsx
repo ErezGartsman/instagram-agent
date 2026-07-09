@@ -1,40 +1,48 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { fetchThread, type ThreadMessage } from '../lib/api'
 import type { TimelineEvent } from '../lib/workqueue'
 import { relativeTime } from '../lib/pipeline'
 
 // ── Dev-bypass sample (dead-code-eliminated in prod builds) ───────────────────
+// Spans two channels deliberately so the dev preview exercises the channel
+// chip (only shown when a person's thread crosses >1 channel — see SPANS_MULTIPLE_CHANNELS).
 const SAMPLE_THREAD: ThreadMessage[] = import.meta.env.DEV
   ? [
       {
         role: 'user',
         body: 'שלום, ראיתי אותך באינסטגרם ורציתי לשאול על ייעוץ זוגי',
         at: new Date(Date.now() - 11 * 86_400_000 - 2 * 3_600_000).toISOString(),
+        channel: 'instagram',
       },
       {
         role: 'assistant',
         body: 'שלום! זו הודעה אוטומטית — אני עוזר הקבלה של ארז. הוא קורא את ההודעות שלך ועונה אישית. נחזור אליך בהקדם.',
         at: new Date(Date.now() - 11 * 86_400_000 - 2 * 3_600_000 + 9_000).toISOString(),
+        channel: 'instagram',
       },
       {
         role: 'user',
         body: 'אוקיי תודה. אני וחברי בזוגיות של 4 שנים ויש לנו משבר. רציתי לדעת אם יש פגישה ראשונה חינם',
         at: new Date(Date.now() - 11 * 86_400_000).toISOString(),
+        channel: 'instagram',
       },
       {
         role: 'user',
         body: 'האם אתם עובדים גם עם זוגות שגרים בחו"ל?',
         at: new Date(Date.now() - 4 * 86_400_000 - 3 * 3_600_000).toISOString(),
+        channel: 'whatsapp',
       },
       {
         role: 'user',
         body: 'אגב, ראיתי שיש לך פוסט על אמון. בדיוק מה שאנחנו עוברים. רוצה לדעת יותר',
         at: new Date(Date.now() - 4 * 86_400_000 - 2 * 3_600_000).toISOString(),
+        channel: 'whatsapp',
       },
       {
         role: 'operator',
         body: 'היי מאיה, ארז כאן. עובדים גם אונליין, ופגישה ראשונה בתשלום — אבל אם תרצי נדבר תחילה בחינם ל-15 דקות. מתי נוח לך?',
         at: new Date(Date.now() - 4 * 60_000).toISOString(),
+        channel: 'whatsapp',
       },
     ]
   : []
@@ -42,6 +50,14 @@ const SAMPLE_THREAD: ThreadMessage[] = import.meta.env.DEV
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 const GROUP_WINDOW_MS = 3 * 60_000
+
+// Short, tiny-chip labels — distinct from the full CHANNEL_LABELS used in page
+// headers (lib/pipeline.ts). A per-message inline chip needs to stay unobtrusive.
+const SHORT_CHANNEL: Record<string, string> = {
+  whatsapp: 'WA',
+  instagram: 'IG',
+  telegram: 'TG',
+}
 
 function formatTime(iso: string): string {
   const d = new Date(iso)
@@ -75,16 +91,28 @@ function DateSeparator({ at }: { at: string }) {
   )
 }
 
+function ChannelChip({ channel }: { channel: string | null | undefined }) {
+  const label = channel ? (SHORT_CHANNEL[channel] ?? channel.slice(0, 2).toUpperCase()) : null
+  if (!label) return null
+  return (
+    <span className="rounded-full border border-line/70 bg-raised/60 px-1.5 py-px font-mono text-[8px] uppercase tracking-wider text-faint">
+      {label}
+    </span>
+  )
+}
+
 function Bubble({
   msg,
   isNewGroup,
   isLastInGroup,
+  showChannelChip,
 }: {
   msg: ThreadMessage
   isNewGroup: boolean
   isLastInGroup: boolean
+  showChannelChip: boolean
 }) {
-  const { role, body, at } = msg
+  const { role, body, at, channel } = msg
 
   // ── Bot handoff notice — centered, muted ─────────────────────────────────────
   if (role === 'assistant') {
@@ -117,8 +145,9 @@ function Bubble({
           </p>
         </div>
         {isLastInGroup && (
-          <p className="mr-1 mt-0.5 font-mono text-[9px] text-glow/70">
+          <p className="mr-1 mt-0.5 flex items-center gap-1.5 font-mono text-[9px] text-glow/70">
             {formatTime(at)} · you
+            {showChannelChip && <ChannelChip channel={channel} />}
           </p>
         )}
       </div>
@@ -134,7 +163,8 @@ function Bubble({
         </p>
       </div>
       {isLastInGroup && (
-        <p className="ml-1 mt-0.5 font-mono text-[9px] text-faint">
+        <p className="ml-1 mt-0.5 flex items-center gap-1.5 font-mono text-[9px] text-faint">
+          {showChannelChip && <ChannelChip channel={channel} />}
           {formatTime(at)}
         </p>
       )}
@@ -196,12 +226,15 @@ function ActivityTimeline({ timeline }: { timeline: TimelineEvent[] }) {
   )
 }
 
-// ── WhatsAppThread ─────────────────────────────────────────────────────────────
-// Fetches the conversation thread for a WhatsApp lead and renders it as
-// premium glass bubbles. Falls back to the Activity timeline when no messages
-// are persisted yet (e.g. sample data or a non-WA channel fallback path).
+// ── ConversationThread ─────────────────────────────────────────────────────────
+// One Thread (Phase 1) — fetches a person's conversation ACROSS ALL CHANNELS
+// (WhatsApp/Instagram/Telegram) and renders it as one chronological list of
+// premium glass bubbles, tagging each with its origin channel only when the
+// person's history actually spans more than one. Falls back to the Activity
+// timeline when no messages are persisted yet. Read-only in Phase 1 — sending
+// still happens off-platform (see docs/ONE_THREAD_PRD.md).
 
-export function WhatsAppThread({
+export function ConversationThread({
   personId,
   token,
   devBypass,
@@ -232,6 +265,14 @@ export function WhatsAppThread({
     }
   }, [msgs])
 
+  // Only surface the per-bubble channel chip once a person's history actually
+  // crosses channels — a single-channel lead (the common case) stays clutter-free.
+  const spansMultipleChannels = useMemo(() => {
+    if (!msgs) return false
+    const channels = new Set(msgs.map((m) => m.channel).filter(Boolean))
+    return channels.size > 1
+  }, [msgs])
+
   if (msgs === null) return <ThreadSkeleton />
   if (msgs.length === 0) return <ActivityTimeline timeline={fallbackTimeline} />
 
@@ -258,7 +299,12 @@ export function WhatsAppThread({
           return (
             <div key={i}>
               {showDate && <DateSeparator at={msg.at} />}
-              <Bubble msg={msg} isNewGroup={isNewGroup} isLastInGroup={isLastInGroup} />
+              <Bubble
+                msg={msg}
+                isNewGroup={isNewGroup}
+                isLastInGroup={isLastInGroup}
+                showChannelChip={spansMultipleChannels}
+              />
             </div>
           )
         })}
