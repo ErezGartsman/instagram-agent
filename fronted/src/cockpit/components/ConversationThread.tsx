@@ -1,51 +1,59 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { fetchThread, type ThreadMessage } from '../lib/api'
+import type { KeyboardEvent, ReactNode } from 'react'
+import { fetchThread, sendThreadMessage, type ChannelEligibility, type ThreadData, type ThreadMessage } from '../lib/api'
 import type { TimelineEvent } from '../lib/workqueue'
 import { relativeTime } from '../lib/pipeline'
 
 // ── Dev-bypass sample (dead-code-eliminated in prod builds) ───────────────────
 // Spans two channels deliberately so the dev preview exercises the channel
-// chip (only shown when a person's thread crosses >1 channel — see SPANS_MULTIPLE_CHANNELS).
-const SAMPLE_THREAD: ThreadMessage[] = import.meta.env.DEV
-  ? [
-      {
-        role: 'user',
-        body: 'שלום, ראיתי אותך באינסטגרם ורציתי לשאול על ייעוץ זוגי',
-        at: new Date(Date.now() - 11 * 86_400_000 - 2 * 3_600_000).toISOString(),
-        channel: 'instagram',
-      },
-      {
-        role: 'assistant',
-        body: 'שלום! זו הודעה אוטומטית — אני עוזר הקבלה של ארז. הוא קורא את ההודעות שלך ועונה אישית. נחזור אליך בהקדם.',
-        at: new Date(Date.now() - 11 * 86_400_000 - 2 * 3_600_000 + 9_000).toISOString(),
-        channel: 'instagram',
-      },
-      {
-        role: 'user',
-        body: 'אוקיי תודה. אני וחברי בזוגיות של 4 שנים ויש לנו משבר. רציתי לדעת אם יש פגישה ראשונה חינם',
-        at: new Date(Date.now() - 11 * 86_400_000).toISOString(),
-        channel: 'instagram',
-      },
-      {
-        role: 'user',
-        body: 'האם אתם עובדים גם עם זוגות שגרים בחו"ל?',
-        at: new Date(Date.now() - 4 * 86_400_000 - 3 * 3_600_000).toISOString(),
-        channel: 'whatsapp',
-      },
-      {
-        role: 'user',
-        body: 'אגב, ראיתי שיש לך פוסט על אמון. בדיוק מה שאנחנו עוברים. רוצה לדעת יותר',
-        at: new Date(Date.now() - 4 * 86_400_000 - 2 * 3_600_000).toISOString(),
-        channel: 'whatsapp',
-      },
-      {
-        role: 'operator',
-        body: 'היי מאיה, ארז כאן. עובדים גם אונליין, ופגישה ראשונה בתשלום — אבל אם תרצי נדבר תחילה בחינם ל-15 דקות. מתי נוח לך?',
-        at: new Date(Date.now() - 4 * 60_000).toISOString(),
-        channel: 'whatsapp',
-      },
-    ]
-  : []
+// chip (only shown when a person's thread crosses >1 channel — see spansMultipleChannels).
+const SAMPLE_THREAD: ThreadData = import.meta.env.DEV
+  ? {
+      messages: [
+        {
+          role: 'user',
+          body: 'שלום, ראיתי אותך באינסטגרם ורציתי לשאול על ייעוץ זוגי',
+          at: new Date(Date.now() - 11 * 86_400_000 - 2 * 3_600_000).toISOString(),
+          channel: 'instagram',
+        },
+        {
+          role: 'assistant',
+          body: 'שלום! זו הודעה אוטומטית — אני עוזר הקבלה של ארז. הוא קורא את ההודעות שלך ועונה אישית. נחזור אליך בהקדם.',
+          at: new Date(Date.now() - 11 * 86_400_000 - 2 * 3_600_000 + 9_000).toISOString(),
+          channel: 'instagram',
+        },
+        {
+          role: 'user',
+          body: 'אוקיי תודה. אני וחברי בזוגיות של 4 שנים ויש לנו משבר. רציתי לדעת אם יש פגישה ראשונה חינם',
+          at: new Date(Date.now() - 11 * 86_400_000).toISOString(),
+          channel: 'instagram',
+        },
+        {
+          role: 'user',
+          body: 'האם אתם עובדים גם עם זוגות שגרים בחו"ל?',
+          at: new Date(Date.now() - 4 * 86_400_000 - 3 * 3_600_000).toISOString(),
+          channel: 'whatsapp',
+        },
+        {
+          role: 'user',
+          body: 'אגב, ראיתי שיש לך פוסט על אמון. בדיוק מה שאנחנו עוברים. רוצה לדעת יותר',
+          at: new Date(Date.now() - 4 * 86_400_000 - 2 * 3_600_000).toISOString(),
+          channel: 'whatsapp',
+        },
+        {
+          role: 'operator',
+          body: 'היי מאיה, ארז כאן. עובדים גם אונליין, ופגישה ראשונה בתשלום — אבל אם תרצי נדבר תחילה בחינם ל-15 דקות. מתי נוח לך?',
+          at: new Date(Date.now() - 4 * 60_000).toISOString(),
+          channel: 'whatsapp',
+          status: 'sent',
+        },
+      ],
+      channels: { whatsapp: { eligible: true, reason: null, window_expires_at: null } },
+      default_channel: 'whatsapp',
+    }
+  : { messages: [], channels: {}, default_channel: 'whatsapp' }
+
+const EMPTY_THREAD: ThreadData = { messages: [], channels: {}, default_channel: 'whatsapp' }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -106,13 +114,16 @@ function Bubble({
   isNewGroup,
   isLastInGroup,
   showChannelChip,
+  onRetry,
 }: {
   msg: ThreadMessage
   isNewGroup: boolean
   isLastInGroup: boolean
   showChannelChip: boolean
+  /** Present only on the composer's own optimistic bubbles (status 'sending'/'failed'). */
+  onRetry?: () => void
 }) {
-  const { role, body, at, channel } = msg
+  const { role, body, at, channel, status } = msg
 
   // ── Bot handoff notice — centered, muted ─────────────────────────────────────
   if (role === 'assistant') {
@@ -134,11 +145,13 @@ function Bubble({
 
   // ── Operator reply — right-aligned, violet accent ─────────────────────────────
   if (role === 'operator') {
+    const isFailed = status === 'failed'
+    const isSending = status === 'sending'
     return (
       <div className={`flex flex-col items-end ${isNewGroup ? 'mt-4' : 'mt-0.5'}`}>
         <div
-          className="max-w-[78%] rounded-card bg-accent px-3.5 py-2.5"
-          style={{ boxShadow: 'var(--shadow-glow)' }}
+          className={`max-w-[78%] rounded-card px-3.5 py-2.5 ${isFailed ? 'bg-danger/20 border border-danger/40' : 'bg-accent'} ${isSending ? 'opacity-60' : ''}`}
+          style={!isFailed ? { boxShadow: 'var(--shadow-glow)' } : undefined}
         >
           <p className="text-sm leading-relaxed text-ink" dir="auto">
             {body}
@@ -146,8 +159,19 @@ function Bubble({
         </div>
         {isLastInGroup && (
           <p className="mr-1 mt-0.5 flex items-center gap-1.5 font-mono text-[9px] text-glow/70">
-            {formatTime(at)} · you
-            {showChannelChip && <ChannelChip channel={channel} />}
+            {isSending ? 'sending…' : isFailed ? (
+              <span className="flex items-center gap-1 text-danger">
+                failed
+                {onRetry && (
+                  <button type="button" onClick={onRetry} className="underline hover:text-warn">
+                    retry
+                  </button>
+                )}
+              </span>
+            ) : (
+              <>{formatTime(at)} · you</>
+            )}
+            {!isSending && !isFailed && showChannelChip && <ChannelChip channel={channel} />}
           </p>
         )}
       </div>
@@ -226,13 +250,79 @@ function ActivityTimeline({ timeline }: { timeline: TimelineEvent[] }) {
   )
 }
 
+// ── Composer — One Thread Phase 2, WhatsApp only ──────────────────────────────
+// Docked at the bottom via `sticky` (the scroll container is the parent panel in
+// WorkQueuePage, not this component — sticky works within any scrolling ancestor
+// without needing to own the scroll itself). Disabled + explained, never a bare
+// failure, when the channel isn't sendable yet or the 24h window has closed.
+
+function Composer({
+  draft,
+  onDraftChange,
+  onSend,
+  sending,
+  blockedReason,
+  channelSupported,
+}: {
+  draft: string
+  onDraftChange: (v: string) => void
+  onSend: () => void
+  sending: boolean
+  blockedReason: string | null
+  channelSupported: boolean
+}) {
+  const canSend = channelSupported && !blockedReason && draft.trim().length > 0 && !sending
+
+  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault()
+      if (canSend) onSend()
+    }
+  }
+
+  return (
+    <div className="sticky bottom-0 -mx-6 mt-4 border-t border-line bg-bg px-6 pt-3">
+      {blockedReason && (
+        <p className="mb-2 font-mono text-[10px] text-faint">{blockedReason}</p>
+      )}
+      <div className="flex items-end gap-2 pb-3">
+        <textarea
+          dir="auto"
+          rows={1}
+          value={draft}
+          onChange={(e) => onDraftChange(e.target.value)}
+          onKeyDown={handleKeyDown}
+          disabled={!channelSupported}
+          placeholder={channelSupported ? 'Reply on WhatsApp… (⌘/Ctrl+Enter to send)' : "Sending here isn't available yet"}
+          className="max-h-32 min-h-[38px] flex-1 resize-none rounded-control border border-line bg-surface px-3 py-2 text-sm text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none disabled:opacity-50"
+        />
+        <button
+          type="button"
+          onClick={onSend}
+          disabled={!canSend}
+          className={`shrink-0 rounded-control px-3.5 py-2 font-mono text-[11px] uppercase tracking-wide transition-colors ${
+            canSend ? 'bg-accent text-ink' : 'cursor-not-allowed bg-raised text-faint'
+          }`}
+          style={canSend ? { boxShadow: 'var(--shadow-glow)' } : undefined}
+        >
+          {sending ? '…' : 'Send'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 // ── ConversationThread ─────────────────────────────────────────────────────────
-// One Thread (Phase 1) — fetches a person's conversation ACROSS ALL CHANNELS
-// (WhatsApp/Instagram/Telegram) and renders it as one chronological list of
-// premium glass bubbles, tagging each with its origin channel only when the
-// person's history actually spans more than one. Falls back to the Activity
-// timeline when no messages are persisted yet. Read-only in Phase 1 — sending
-// still happens off-platform (see docs/ONE_THREAD_PRD.md).
+// One Thread — fetches a person's conversation ACROSS ALL CHANNELS (WhatsApp/
+// Instagram/Telegram) and renders it as one chronological list of premium glass
+// bubbles, tagging each with its origin channel only when the person's history
+// actually spans more than one. Falls back to the Activity timeline when no
+// messages are persisted yet.
+//
+// Phase 2 adds the bottom-docked composer: send-from-cockpit, WhatsApp only for
+// now (docs/ONE_THREAD_PRD.md). The composer stays visible even for an empty/
+// loading thread so the operator always sees *why* they can or can't reply yet,
+// rather than the affordance appearing and disappearing.
 
 export function ConversationThread({
   personId,
@@ -245,20 +335,26 @@ export function ConversationThread({
   devBypass: boolean
   fallbackTimeline: TimelineEvent[]
 }) {
-  const [msgs, setMsgs] = useState<ThreadMessage[] | null>(null)
+  const [thread, setThread] = useState<ThreadData | null>(null)
+  const [draft, setDraft] = useState('')
+  const [sending, setSending] = useState(false)
+  const clientTokenRef = useRef<string>(crypto.randomUUID())
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    setMsgs(null)
+    setThread(null)
+    setDraft('')
     if (devBypass) {
-      const t = setTimeout(() => setMsgs(SAMPLE_THREAD), 180)
+      const t = setTimeout(() => setThread(SAMPLE_THREAD), 180)
       return () => clearTimeout(t)
     }
-    if (!token) { setMsgs([]); return }
-    fetchThread(token, personId).then(setMsgs).catch(() => setMsgs([]))
+    if (!token) { setThread(EMPTY_THREAD); return }
+    fetchThread(token, personId).then(setThread).catch(() => setThread(EMPTY_THREAD))
   }, [personId, token, devBypass])
 
-  // Auto-scroll to the most-recent message whenever the thread loads or person changes
+  const msgs = thread?.messages ?? null
+
+  // Auto-scroll to the most-recent message whenever the thread loads or grows.
   useEffect(() => {
     if (msgs && msgs.length > 0) {
       bottomRef.current?.scrollIntoView({ behavior: 'instant' })
@@ -273,44 +369,134 @@ export function ConversationThread({
     return channels.size > 1
   }, [msgs])
 
-  if (msgs === null) return <ThreadSkeleton />
-  if (msgs.length === 0) return <ActivityTimeline timeline={fallbackTimeline} />
+  const defaultChannel = thread?.default_channel ?? 'whatsapp'
+  const eligibility: ChannelEligibility | undefined = thread?.channels?.[defaultChannel]
+  // Phase 2 only sends on WhatsApp — Instagram/Telegram sending lands in Phase 3.
+  const channelSupported = defaultChannel === 'whatsapp'
+
+  const blockedReason = !channelSupported
+    ? `Replies on ${SHORT_CHANNEL[defaultChannel] ?? defaultChannel} aren't supported yet — WhatsApp only for now.`
+    : eligibility && !eligibility.eligible
+      ? (eligibility.reason === 'no_inbound_yet'
+          ? "This lead hasn't messaged on WhatsApp yet — nothing to reply to."
+          : "The 24-hour WhatsApp window has closed — they'll need to message again first.")
+      : null
+
+  const attemptSend = async (text: string, tempId: string) => {
+    setSending(true)
+
+    if (devBypass) {
+      // Demo-only local echo — no real send, matching this page's existing
+      // dev-bypass philosophy (see DEV_BYPASS_DRAFT in WorkQueuePage).
+      await new Promise((r) => setTimeout(r, 250))
+      setThread((prev) => prev && {
+        ...prev,
+        messages: prev.messages.map((m) =>
+          m.id === tempId ? { ...m, status: 'sent' } : m),
+      })
+      setSending(false)
+      return
+    }
+    if (!token) { setSending(false); return }
+
+    const result = await sendThreadMessage(token, personId, text, clientTokenRef.current, defaultChannel)
+    setSending(false)
+    if (result.status === 'success' && result.message) {
+      clientTokenRef.current = crypto.randomUUID()
+      setThread((prev) => prev && {
+        ...prev,
+        messages: prev.messages.map((m) => (m.id === tempId ? result.message! : m)),
+      })
+    } else {
+      setThread((prev) => prev && {
+        ...prev,
+        messages: prev.messages.map((m) =>
+          m.id === tempId ? { ...m, status: 'failed' } : m),
+      })
+    }
+  }
+
+  const handleSend = () => {
+    const text = draft.trim()
+    if (!text || sending) return
+    const tempId = crypto.randomUUID()
+    const optimistic: ThreadMessage = {
+      id: tempId, role: 'operator', body: text, at: new Date().toISOString(),
+      channel: defaultChannel, status: 'sending',
+    }
+    setThread((prev) => prev && { ...prev, messages: [...prev.messages, optimistic] })
+    setDraft('')
+    void attemptSend(text, tempId)
+  }
+
+  const handleRetry = (msg: ThreadMessage) => {
+    if (!msg.id || sending) return
+    setThread((prev) => prev && {
+      ...prev,
+      messages: prev.messages.map((m) => (m.id === msg.id ? { ...m, status: 'sending' } : m)),
+    })
+    void attemptSend(msg.body, msg.id)
+  }
+
+  let body: ReactNode
+  if (msgs === null) {
+    body = <ThreadSkeleton />
+  } else if (msgs.length === 0) {
+    body = <ActivityTimeline timeline={fallbackTimeline} />
+  } else {
+    body = (
+      <>
+        <div className="mb-3 font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
+          Conversation
+        </div>
+
+        <div className="flex flex-col">
+          {msgs.map((msg, i) => {
+            const prev = msgs[i - 1]
+            const next = msgs[i + 1]
+            const showDate = !prev || needsDateSeparator(prev, msg)
+            const gapBefore = prev
+              ? new Date(msg.at).getTime() - new Date(prev.at).getTime()
+              : Infinity
+            const gapAfter = next
+              ? new Date(next.at).getTime() - new Date(msg.at).getTime()
+              : Infinity
+            const isNewGroup = !prev || prev.role !== msg.role || gapBefore > GROUP_WINDOW_MS
+            const isLastInGroup = !next || next.role !== msg.role || gapAfter > GROUP_WINDOW_MS
+
+            return (
+              <div key={msg.id ?? i}>
+                {showDate && <DateSeparator at={msg.at} />}
+                <Bubble
+                  msg={msg}
+                  isNewGroup={isNewGroup}
+                  isLastInGroup={isLastInGroup}
+                  showChannelChip={spansMultipleChannels}
+                  onRetry={msg.status === 'failed' ? () => handleRetry(msg) : undefined}
+                />
+              </div>
+            )
+          })}
+        </div>
+
+        <div ref={bottomRef} className="h-2" />
+      </>
+    )
+  }
 
   return (
     <>
-      <div className="mb-3 font-mono text-[10px] uppercase tracking-[0.13em] text-faint">
-        Conversation
-      </div>
-
-      <div className="flex flex-col">
-        {msgs.map((msg, i) => {
-          const prev = msgs[i - 1]
-          const next = msgs[i + 1]
-          const showDate = !prev || needsDateSeparator(prev, msg)
-          const gapBefore = prev
-            ? new Date(msg.at).getTime() - new Date(prev.at).getTime()
-            : Infinity
-          const gapAfter = next
-            ? new Date(next.at).getTime() - new Date(msg.at).getTime()
-            : Infinity
-          const isNewGroup = !prev || prev.role !== msg.role || gapBefore > GROUP_WINDOW_MS
-          const isLastInGroup = !next || next.role !== msg.role || gapAfter > GROUP_WINDOW_MS
-
-          return (
-            <div key={i}>
-              {showDate && <DateSeparator at={msg.at} />}
-              <Bubble
-                msg={msg}
-                isNewGroup={isNewGroup}
-                isLastInGroup={isLastInGroup}
-                showChannelChip={spansMultipleChannels}
-              />
-            </div>
-          )
-        })}
-      </div>
-
-      <div ref={bottomRef} className="h-2" />
+      {body}
+      {thread && (
+        <Composer
+          draft={draft}
+          onDraftChange={setDraft}
+          onSend={handleSend}
+          sending={sending}
+          blockedReason={blockedReason}
+          channelSupported={channelSupported}
+        />
+      )}
     </>
   )
 }
