@@ -29,26 +29,93 @@ export interface SearchResult {
 // ── One Thread — the unified cross-channel conversation ──────────────────────
 
 export interface ThreadMessage {
+  /** Present on composer-sent messages (Phase 2) — lets the UI track/replace an
+   *  optimistic bubble once the real send resolves. Absent on fetched history. */
+  id?: string
   /** 'user' = lead's inbound · 'assistant' = bot handoff ACK · 'operator' = Erez's reply */
   role: 'user' | 'assistant' | 'operator'
   body: string
   at: string  // ISO 8601
   /** Origin channel (whatsapp/instagram/telegram/…). Null for legacy rows predating the column. */
   channel?: string | null
+  /** Outbound only (Phase 2): delivery state. 'sending' is a local-only optimistic
+   *  state — the backend never returns it. Absent on inbound messages. */
+  status?: 'sending' | 'sent' | 'delivered' | 'read' | 'failed'
 }
 
-/** Fetch a person's merged conversation across ALL channels (inbound + outbound). Returns [] on error. */
-export async function fetchThread(token: string, personId: string): Promise<ThreadMessage[]> {
+/** Per-channel send-eligibility (Phase 2: WhatsApp's 24h free-form window). */
+export interface ChannelEligibility {
+  eligible: boolean
+  /** null when eligible; else 'no_inbound_yet' | 'window_expired'. */
+  reason: string | null
+  window_expires_at: string | null
+}
+
+export interface ThreadData {
+  messages: ThreadMessage[]
+  /** Keyed by channel — only 'whatsapp' is populated until Phase 3. */
+  channels: Record<string, ChannelEligibility>
+  /** 'Reply to last inbound' — the channel the composer should pre-select. */
+  default_channel: string
+}
+
+const EMPTY_THREAD: ThreadData = { messages: [], channels: {}, default_channel: 'whatsapp' }
+
+/** Fetch a person's merged conversation across ALL channels, plus send-eligibility. Empty shape on error. */
+export async function fetchThread(token: string, personId: string): Promise<ThreadData> {
   try {
     const res = await fetch(
       `${API_BASE}/api/cockpit/thread/${encodeURIComponent(personId)}`,
       { headers: { Authorization: `Bearer ${token}` } },
     )
-    if (!res.ok) return []
-    const data = await res.json() as { messages?: ThreadMessage[] }
-    return data.messages ?? []
+    if (!res.ok) return EMPTY_THREAD
+    const data = await res.json() as Partial<ThreadData>
+    return {
+      messages: data.messages ?? [],
+      channels: data.channels ?? {},
+      default_channel: data.default_channel ?? 'whatsapp',
+    }
   } catch {
-    return []
+    return EMPTY_THREAD
+  }
+}
+
+export interface SendThreadMessageResult {
+  status: 'success' | 'error'
+  message?: ThreadMessage
+  deduped?: boolean
+  /** error only — e.g. 'window_expired' | 'no_address' | 'send_failed' | 'channel_not_supported'. */
+  reason_code?: string
+  detail?: string
+}
+
+/**
+ * Send a message from the cockpit composer (One Thread Phase 2, WhatsApp only).
+ * clientToken must be stable across retries of the SAME attempt (generate once
+ * per compose, replay on retry) — the backend dedupes on it so a retry never
+ * reaches the lead twice. Never throws; network failures surface the same
+ * {status:'error'} shape the backend uses for a blocked send.
+ */
+export async function sendThreadMessage(
+  token: string,
+  personId: string,
+  body: string,
+  clientToken: string,
+  channel?: string,
+): Promise<SendThreadMessageResult> {
+  try {
+    const res = await fetch(
+      `${API_BASE}/api/cockpit/thread/${encodeURIComponent(personId)}/send`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ body, client_token: clientToken, channel }),
+      },
+    )
+    return await res.json() as SendThreadMessageResult
+  } catch {
+    return { status: 'error', reason_code: 'network_error',
+              detail: 'Could not reach the server — check your connection.' }
   }
 }
 
