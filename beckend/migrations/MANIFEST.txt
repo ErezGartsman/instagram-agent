@@ -1,0 +1,22 @@
+# Migration order of record — scripts/migrate.py reads this file top-to-bottom.
+# Filenames are NOT sorted lexicographically: the v1_* era (Sprint 3, person
+# spine) predates the numeric era (002+, cockpit engines). Append new
+# migrations at the bottom; never reorder or renumber applied entries.
+#
+# Era 1 — NEXUS V1 spine (applied via Supabase MCP, 2026-06-10 …)
+v1_000_sessions_live_schema_record.sql
+v1_001_person_spine.sql
+v1_002_flow.sql
+v1_003_memory.sql
+v1_004_erasure_log.sql
+v1_005_content.sql
+v1_006_opportunity_snooze.sql
+v1_007_outbound_messages.sql
+# Era 2 — cockpit engines (007 was never created; the gap is historical, keep it)
+002_agent_runtime.sql
+003_analytics_engine.sql
+004_accountability_sla.sql
+005_close_anon_view_exposure.sql
+006_index_foreign_keys.sql
+008_outbound_messages_delivery.sql
+# Era 3 — System Elevation (SYSTEM_ELEVATION_PRD.md): 009_flows.sql lands in F1

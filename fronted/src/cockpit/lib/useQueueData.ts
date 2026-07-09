@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { MutableRefObject } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { fetchQueue, rankQueue, SAMPLE_QUEUE, type QueueItem } from './workqueue'
+import { queryKeys } from './queryClient'
+import { useQueueRealtimeInvalidation } from './realtime'
 
 // ── Constants ──────────────────────────────────────────────────────────────
-const POLL_MS = 30_000   // background poll interval
-const FOCUS_DEBOUNCE_MS = 500  // guard against rapid focus/blur cycling
+const POLL_MS = 30_000   // fallback poll — Realtime invalidation is the norm
 /** Minimum confidence score (0-100) for a lead to trigger a hot-lead alert. */
 export const HOT_LEAD_THRESHOLD = 70
 
@@ -22,163 +24,108 @@ export type QueueDataState =
   | { kind: 'ready'; items: QueueItem[]; sample: boolean }
 
 /**
- * Smart-polling queue data hook for P1 Liveness.
+ * Work Queue data on the TanStack Query spine (E0 rewrite — the hand-rolled
+ * polling/abort/focus machinery this hook used to carry is now the query
+ * layer's job; SYSTEM_ELEVATION_PRD.md §A2). The public contract is unchanged:
  *
- * Three guarantees:
- *   1. Signature-diff guard — setState is skipped when nothing changed.
- *   2. Pending-action suppression — if `suppressRef.current` is true
- *      (set by the Board while an optimistic action is in flight) the
- *      background poll yields silently. The next poll or focus-refetch
- *      picks up after the action commits / is undone.
- *   3. Aggressive focus-refetch — tab focus and visibility change both
- *      trigger an immediate check so Erez always lands on fresh data.
+ *   1. Signature-diff guard — consumers re-render only when the queue
+ *      genuinely changed.
+ *   2. Pending-action suppression — while `suppressRef.current` is true
+ *      (set by the Board during an optimistic action) fresh server data is
+ *      held back; the next update after release applies it.
+ *   3. Liveness — Realtime invalidation on agent_runs (push), plus the 30s
+ *      poll and focus refetch as fallbacks.
+ *
+ * Errors: an initial-load failure surfaces `{kind:'error'}` (after the query
+ * layer's retries); background failures keep the last good snapshot, exactly
+ * like the old behavior — except they now also mark the query stale so the
+ * next focus heals it.
  *
  * @param token       Supabase access token (null while loading/signed out).
  * @param devBypass   True in local dev — uses SAMPLE_QUEUE, no API call.
  * @param suppressRef Mutable ref owned by WorkQueuePage, written by Board.
- *                    true  = action in flight, skip background setState.
- *                    false = safe to apply server updates.
  */
 export function useQueueData(
   token: string | null,
   devBypass: boolean,
   suppressRef: MutableRefObject<boolean>,
-  /** Called with the highest-confidence new lead whenever a background poll
-   *  surfaces an item above HOT_LEAD_THRESHOLD that wasn't in the previous
-   *  snapshot. Never fires on the initial load (avoids notifying for stale
-   *  items already in the queue when the cockpit opens). */
+  /** Called with the highest-confidence new lead whenever an update surfaces
+   *  an item above HOT_LEAD_THRESHOLD that wasn't previously seen. Never fires
+   *  on the initial load. */
   onHotLead?: (item: QueueItem) => void,
 ): {
   state: QueueDataState
   refetch: () => void
 } {
-  const [state, setState] = useState<QueueDataState>({ kind: 'loading' })
+  // Accepted snapshot — what consumers actually see. Server data only lands
+  // here through the accept-effect below (suppression + signature gates).
+  const [accepted, setAccepted] = useState<QueueItem[] | null>(null)
 
-  // Refs that change without triggering re-renders.
   const sigRef      = useRef('')
-  const abortRef    = useRef<AbortController | null>(null)
-  const mountedRef  = useRef(true)
-  // IDs seen in previous snapshots — used to detect genuinely new leads.
-  // Populated on first successful fetch; no notifications until then.
+  const initialRef  = useRef(true)
   const seenIdsRef  = useRef<Set<string>>(new Set())
-  // Stable ref wrapper so doFetch doesn't need onHotLead in its deps.
   const onHotLeadRef = useRef(onHotLead)
   onHotLeadRef.current = onHotLead
 
-  // ── Core fetch ────────────────────────────────────────────────────────────
-  // isInitial=true  → show loading state on error, always apply result.
-  // isInitial=false → silent background; bail if suppressed or unchanged.
-  const doFetch = useCallback(
-    async (isInitial: boolean) => {
-      if (!isInitial && suppressRef.current) return  // yield to action loop
+  const enabled = !!token && !devBypass
+  useQueueRealtimeInvalidation(enabled)
 
-      // ── Dev bypass ──────────────────────────────────────────────────────
-      if (devBypass) {
-        if (isInitial) {
-          const items = rankQueue(SAMPLE_QUEUE)
-          seenIdsRef.current = new Set(items.map((i) => i.id))
-          sigRef.current = queueSig(items)
-          setState({ kind: 'ready', items, sample: true })
-        }
-        return
+  const query = useQuery({
+    queryKey: queryKeys.queue,
+    queryFn: async ({ signal }) => rankQueue(await fetchQueue(token!, signal)),
+    enabled,
+    refetchInterval: POLL_MS,
+    staleTime: 10_000,
+  })
+
+  // ── Accept-effect: server data → accepted snapshot ───────────────────────
+  useEffect(() => {
+    const items = query.data
+    if (!enabled || !items) return
+    if (!initialRef.current && suppressRef.current) return  // yield to action loop
+
+    const newSig = queueSig(items)
+    if (newSig === sigRef.current) return
+
+    if (initialRef.current) {
+      // Populate the seen-ID set without notification — these items were
+      // already in the queue when the cockpit opened.
+      seenIdsRef.current = new Set(items.map((i) => i.id))
+      initialRef.current = false
+    } else {
+      // Hot-lead detection: new items above threshold that weren't seen before.
+      if (seenIdsRef.current.size > 0 && onHotLeadRef.current) {
+        const newHot = items
+          .filter((i) => !seenIdsRef.current.has(i.id) && i.confidence >= HOT_LEAD_THRESHOLD)
+          .sort((a, b) => b.confidence - a.confidence)
+        if (newHot.length > 0) onHotLeadRef.current(newHot[0])
       }
-
-      if (!token) return
-
-      // Abort any in-flight request before starting a new one.
-      abortRef.current?.abort()
-      const controller = new AbortController()
-      abortRef.current = controller
-
-      try {
-        const raw    = await fetchQueue(token, controller.signal)
-        if (!mountedRef.current) return
-        const items  = rankQueue(raw)
-        const newSig = queueSig(items)
-
-        if (isInitial) {
-          // Populate the seen-ID set without notification — these items were
-          // already in the queue when the cockpit opened.
-          seenIdsRef.current = new Set(items.map((i) => i.id))
-          sigRef.current = newSig
-          setState({ kind: 'ready', items, sample: false })
-          return
-        }
-
-        // Background poll — signature guard.
-        if (newSig === sigRef.current) return
-
-        // Hot-lead detection: new items above threshold that weren't seen before.
-        // If seenIds is empty (error recovery), populate silently — no spam.
-        if (seenIdsRef.current.size > 0 && onHotLeadRef.current) {
-          const newHot = items
-            .filter((i) => !seenIdsRef.current.has(i.id) && i.confidence >= HOT_LEAD_THRESHOLD)
-            .sort((a, b) => b.confidence - a.confidence)  // highest first
-          if (newHot.length > 0) onHotLeadRef.current(newHot[0])
-        }
-        // Always expand the seen set (even if seenIds was empty — recovery case).
-        items.forEach((i) => seenIdsRef.current.add(i.id))
-
-        sigRef.current = newSig
-        setState({ kind: 'ready', items, sample: false })
-      } catch (err: unknown) {
-        if (!mountedRef.current) return
-        if ((err as { name?: string })?.name === 'AbortError') return
-        // Initial load failure → show error state so the user can retry.
-        // Background poll failure → silent; next poll will try again.
-        if (isInitial) setState({ kind: 'error' })
-      }
-    },
-    // suppressRef is a stable ref object — changing its `.current` doesn't
-    // cause doFetch to be recreated, which is intentional.
-    [token, devBypass, suppressRef],
-  )
-
-  // ── Initial load ─────────────────────────────────────────────────────────
-  useEffect(() => {
-    mountedRef.current = true
-    sigRef.current = ''
-    setState({ kind: 'loading' })
-    void doFetch(true)
-    return () => {
-      mountedRef.current = false
-      abortRef.current?.abort()
+      items.forEach((i) => seenIdsRef.current.add(i.id))
     }
-  }, [doFetch])
 
-  // ── Background polling ────────────────────────────────────────────────────
-  useEffect(() => {
-    const id = setInterval(() => void doFetch(false), POLL_MS)
-    return () => clearInterval(id)
-  }, [doFetch])
+    sigRef.current = newSig
+    setAccepted(items)
+    // query.data is structurally shared — identical fetches keep the same
+    // reference, so this effect is already skipped on "nothing happened" polls.
+  }, [query.data, enabled, suppressRef])
 
-  // ── Focus + visibility refetch ────────────────────────────────────────────
-  // Debounced so rapid focus/blur cycling doesn't hammer the API.
-  useEffect(() => {
-    let debounce: ReturnType<typeof setTimeout> | null = null
-    const trigger = () => {
-      if (debounce) clearTimeout(debounce)
-      debounce = setTimeout(() => void doFetch(false), FOCUS_DEBOUNCE_MS)
-    }
-    const onVisibility = () => {
-      if (document.visibilityState === 'visible') trigger()
-    }
-    window.addEventListener('focus', trigger)
-    document.addEventListener('visibilitychange', onVisibility)
-    return () => {
-      window.removeEventListener('focus', trigger)
-      document.removeEventListener('visibilitychange', onVisibility)
-      if (debounce) clearTimeout(debounce)
-    }
-  }, [doFetch])
-
-  // refetch is the "Try again" handler for the error state — it shows loading
-  // and treats the result as an initial load (never silently discarded).
+  // refetch is the "Try again" handler for the error state.
+  const queryRefetch = query.refetch
   const refetch = useCallback(() => {
-    sigRef.current = ''
-    setState({ kind: 'loading' })
-    void doFetch(true)
-  }, [doFetch])
+    void queryRefetch()
+  }, [queryRefetch])
+
+  // ── State derivation (contract-identical to the pre-E0 hook) ─────────────
+  let state: QueueDataState
+  if (devBypass) {
+    state = { kind: 'ready', items: rankQueue(SAMPLE_QUEUE), sample: true }
+  } else if (accepted) {
+    state = { kind: 'ready', items: accepted, sample: false }
+  } else if (query.isError && !query.isFetching) {
+    state = { kind: 'error' }
+  } else {
+    state = { kind: 'loading' }
+  }
 
   return { state, refetch }
 }

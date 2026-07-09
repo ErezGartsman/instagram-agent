@@ -1,4 +1,4 @@
-import { API_BASE } from './api'
+import { apiFetch } from './http'
 
 // The Work Queue is the Decision Engine's surface: a priority-ranked list of
 // people, each carrying the Action / Confidence / Reason it was surfaced for,
@@ -41,12 +41,7 @@ export type QueueItem = {
 }
 
 export async function fetchQueue(token: string, signal?: AbortSignal): Promise<QueueItem[]> {
-  const res = await fetch(`${API_BASE}/api/cockpit/queue`, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal,
-  })
-  if (!res.ok) throw new Error(`queue ${res.status}`)
-  const data = (await res.json()) as { items?: QueueItem[] }
+  const data = await apiFetch<{ items?: QueueItem[] }>('/api/cockpit/queue', token, { signal })
   return data.items ?? []
 }
 
@@ -64,16 +59,14 @@ export async function postQueueAction(
   type: QueueActionType,
   opts: { snoozeHours?: number; message?: string } = {},
 ): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/cockpit/queue/${id}/action`, {
+  await apiFetch(`/api/cockpit/queue/${id}/action`, token, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({
       type,
       snooze_hours: opts.snoozeHours ?? null,
       message: opts.message ?? null,
     }),
   })
-  if (!res.ok) throw new Error(`action ${res.status}`)
 }
 
 /** Highest confidence first — a stable client-side fallback ordering. The
