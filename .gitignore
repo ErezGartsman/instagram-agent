@@ -63,6 +63,10 @@ infrastructure/
 dbt_projects/
 powerBI/
 scripts/
+# …but the migration runner is source, not scratch (E0):
+!beckend/scripts/
+beckend/scripts/*
+!beckend/scripts/migrate.py
 orchestrator.py
 node_modules/
 .ig-profile/

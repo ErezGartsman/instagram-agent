@@ -15,6 +15,8 @@ export default defineConfig({
     dedupe: ['react', 'react-dom'],
   },
   server: {
+    // Respect an externally assigned port (preview tooling / PORT env); default 5173.
+    port: Number(process.env.PORT) || 5173,
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:8012',
