@@ -211,3 +211,25 @@ def resolve_whatsapp_recipient(conn, person_id: str) -> str | None:
         return None
     digits = re.sub(r"\D", "", str(chosen))
     return digits or None
+
+
+def resolve_channel_recipient(conn, person_id: str, channel: str) -> str | None:
+    """
+    One Thread's channel-agnostic recipient lookup (Phase 3 —
+    docs/ONE_THREAD_PRD.md §4.1). WhatsApp keeps its own resolver above (phone
+    fallback + digit normalization); Instagram/Telegram identities need none of
+    that — their person_identity.external_id already IS the platform's own
+    recipient id (igsid / chat_id), verbatim. Returns None when the person has
+    no identity on `channel` — callers MUST treat None as "cannot send".
+    Commit-free.
+    """
+    if channel == "whatsapp":
+        return resolve_whatsapp_recipient(conn, person_id)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT external_id FROM person_identity "
+            "WHERE person_id = %s AND channel = %s LIMIT 1",
+            (person_id, channel),
+        )
+        row = cur.fetchone()
+    return row[0] if row else None

@@ -1971,19 +1971,23 @@ def cockpit_thread(person_id: str, user: dict = Depends(require_cockpit_user)):
     messages with operator-authored outbound messages, oldest-first, each
     tagged with its channel (see _db_person_thread).
 
-    Phase 2 adds `channels` (per-channel send-eligibility — WhatsApp's 24h
-    free-form window today; Instagram/Telegram land in Phase 3) and
-    `default_channel` (reply-to-last-inbound) so the composer can pre-select
-    a channel and grey out Send with a real reason instead of failing opaquely.
+    `channels` carries per-channel send-eligibility for every channel One
+    Thread can send on (WhatsApp/Instagram: 24h free-form window; Telegram: no
+    window) and `default_channel` (reply-to-last-inbound) so the composer can
+    pre-select a channel and grey out Send with a real reason instead of
+    failing opaquely.
     """
     try:
         with get_db_conn() as conn:
             messages = _db_person_thread(conn, person_id)
-            wa_eligibility = _wa_send_eligibility(conn, person_id)
+            channels = {
+                ch: _channel_send_eligibility(conn, person_id, ch)
+                for ch in _SUPPORTED_SEND_CHANNELS
+            }
         return {
             "status": "success",
             "messages": messages,
-            "channels": {"whatsapp": wa_eligibility},
+            "channels": channels,
             "default_channel": _resolve_default_channel(messages),
         }
     except Exception as e:
@@ -3715,39 +3719,61 @@ def cockpit_whatsapp_outreach(
         return {"status": "error", "detail": "Could not log outreach."}
 
 
-# ── One Thread Phase 2 — send-from-cockpit (WhatsApp only; docs/ONE_THREAD_PRD.md) ──
+# ── One Thread — send-from-cockpit (docs/ONE_THREAD_PRD.md) ──────────────────
 #
 # Deliberately separate from _dispatch_outreach (the Work Queue Action Loop's
-# existing 'send' actuator, above): that endpoint's contract — HTTPException on
-# failure, no eligibility pre-check, no idempotency — is live and tested
-# (TestSendOutreach in test_cockpit_action.py). This is additive, not a
-# refactor of shipped behaviour. Both reuse the same safe, non-behaviour-
-# changing primitives: resolve_whatsapp_recipient / _KAPSO_CHANNEL / _wa_extract_message_id
-# / log_interaction.
+# existing WhatsApp-only 'send' actuator, above): that endpoint's contract —
+# HTTPException on failure, no eligibility pre-check, no idempotency — is live
+# and tested (TestSendOutreach in test_cockpit_action.py). This is additive,
+# not a refactor of shipped behaviour. Both reuse the same safe, non-
+# behaviour-changing primitives (resolve_whatsapp_recipient / _KAPSO_CHANNEL /
+# log_interaction).
+#
+# Phase 2 shipped WhatsApp only; Phase 3 generalizes route_and_send to
+# Instagram + Telegram via the existing MessagingChannel adapters
+# (_INSTAGRAM_CHANNEL / _TELEGRAM_CHANNEL) — the same classes the funnel
+# already sends through, so no new wire protocol, just a new caller.
 
-_WA_FREEFORM_WINDOW_HOURS = 24
+_SUPPORTED_SEND_CHANNELS = {"whatsapp", "instagram", "telegram"}
+
+# Free-form (non-template) send windows, in hours. A channel with no entry here
+# has NO session-expiry concept — Telegram bots may message anyone who has ever
+# started a conversation with them, unlike WhatsApp/Instagram's Meta-imposed
+# customer-service window.
+_CHANNEL_WINDOW_HOURS = {"whatsapp": 24, "instagram": 24}
+
+_INELIGIBLE_DETAIL = {
+    "no_inbound_yet": "This lead hasn't messaged on {channel} yet — nothing to reply to.",
+    "window_expired": "The 24-hour {channel} window has closed — they'll need to message again first.",
+}
 
 
-def _wa_send_eligibility(conn, person_id: str) -> dict:
+def _channel_send_eligibility(conn, person_id: str, channel: str) -> dict:
     """
-    WhatsApp's 24h customer-service window: a free-form (non-template) send is
-    only allowed within 24h of the person's most recent INBOUND WhatsApp
-    message. Returns {eligible, reason, window_expires_at} — reason is None
-    when eligible, else 'no_inbound_yet' (never messaged on WhatsApp) or
-    'window_expired' (they have, but >24h ago). Commit-free.
+    Free-form send eligibility for one channel. WhatsApp/Instagram enforce a
+    24h customer-service window (computed from the person's most recent
+    INBOUND message on that channel); Telegram has none — eligibility there is
+    just "has this person ever messaged on Telegram at all". Returns
+    {eligible, reason, window_expires_at} — reason is None when eligible, else
+    'no_inbound_yet' or 'window_expired'. Commit-free.
     """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT MAX(m.created_at) FROM messages m "
             "JOIN sessions s ON s.id = m.session_id "
-            "WHERE s.person_id = %s AND s.channel = 'whatsapp' AND m.role = 'user'",
-            (person_id,),
+            "WHERE s.person_id = %s AND s.channel = %s AND m.role = 'user'",
+            (person_id, channel),
         )
         row = cur.fetchone()
     last_inbound = row[0] if row else None
     if last_inbound is None:
         return {"eligible": False, "reason": "no_inbound_yet", "window_expires_at": None}
-    expires_at = last_inbound + datetime.timedelta(hours=_WA_FREEFORM_WINDOW_HOURS)
+
+    window_hours = _CHANNEL_WINDOW_HOURS.get(channel)
+    if window_hours is None:
+        return {"eligible": True, "reason": None, "window_expires_at": None}
+
+    expires_at = last_inbound + datetime.timedelta(hours=window_hours)
     eligible = datetime.datetime.now(datetime.timezone.utc) <= expires_at
     return {
         "eligible": eligible,
@@ -3756,33 +3782,79 @@ def _wa_send_eligibility(conn, person_id: str) -> dict:
     }
 
 
-def _wa_send_and_record(conn, person_id: str, text: str, *, by: str,
-                        client_token: Optional[str] = None) -> dict:
-    """
-    The composer's core send: dedupe on client_token → eligibility → resolve
-    recipient → send via Kapso → persist to outbound_messages → log a
-    ref-only 'contacted' signal. Never raises — returns a structured
-    {"ok": bool, ...} result so the endpoint can surface *why* a send was
-    blocked instead of a generic failure. Commit-free; the caller owns the
-    transaction (mirrors every other _db_* helper in this file).
+def _ig_extract_message_id(resp: Optional[str]) -> Optional[str]:
+    """Best-effort pull of the Graph API message_id from an Instagram send response."""
+    try:
+        return (json.loads(resp or "") or {}).get("message_id")
+    except Exception:
+        return None
 
-    client_token guards against a UI double-click/retry reaching Kapso twice:
-    checked up front (fast path — skips resolve/send entirely on a genuine
-    retry) AND enforced atomically on the INSERT via
+
+def _dispatch_channel_send(channel: str, recipient: str, text: str):
+    """
+    Fire the actual send for one channel via its existing MessagingChannel
+    adapter (_KAPSO_CHANNEL / _INSTAGRAM_CHANNEL / _TELEGRAM_CHANNEL — the same
+    classes the funnel already sends through). Returns (provider, raw_result):
+    raw_result is None on failure (network/API error — each adapter already
+    logs the actionable reason), else the channel's own successful response —
+    the raw Kapso/Graph JSON body for WhatsApp/Instagram (parsed below by
+    _extract_provider_message_id), or the Telegram message_id (int) directly,
+    since TelegramChannel.send_text returns nothing else worth keeping.
+    """
+    if channel == "whatsapp":
+        return "kapso", _KAPSO_CHANNEL.send_text(recipient, text)
+    if channel == "instagram":
+        return "meta_ig", _INSTAGRAM_CHANNEL.send_text(recipient, text)
+    if channel == "telegram":
+        return "telegram", _TELEGRAM_CHANNEL.send_text(recipient, text)
+    raise ValueError(f"unsupported channel {channel!r}")
+
+
+def _extract_provider_message_id(channel: str, raw_result) -> Optional[str]:
+    if raw_result is None:
+        return None
+    if channel == "whatsapp":
+        return _wa_extract_message_id(raw_result)
+    if channel == "instagram":
+        return _ig_extract_message_id(raw_result)
+    if channel == "telegram":
+        return str(raw_result)   # already the Telegram message_id itself
+    return None
+
+
+def route_and_send(conn, person_id: str, channel: str, text: str, *, by: str,
+                   client_token: Optional[str] = None) -> dict:
+    """
+    One Thread's channel-agnostic send-from-cockpit dispatcher: dedupe on
+    client_token → eligibility → resolve recipient → send via the channel's
+    adapter → persist to outbound_messages → log a ref-only 'contacted'
+    signal. Never raises — returns a structured {"ok": bool, ...} result so
+    the endpoint can surface *why* a send was blocked instead of a generic
+    failure. Commit-free; the caller owns the transaction (mirrors every
+    other _db_* helper in this file).
+
+    client_token guards against a UI double-click/retry reaching the provider
+    twice: checked up front (fast path — skips resolve/send entirely on a
+    genuine retry) AND enforced atomically on the INSERT via
     outbound_messages_client_token_uniq (belt-and-suspenders for a true race).
     """
+    channel = (channel or "").strip().lower()
+    if channel not in _SUPPORTED_SEND_CHANNELS:
+        return {"ok": False, "reason_code": "channel_not_supported",
+                "detail": f"Sending on {channel or '(none)'} isn't available yet."}
+
     if client_token:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, body, sent_at, status, provider_message_id "
+                "SELECT id, body, sent_at, status, provider_message_id, channel "
                 "FROM outbound_messages WHERE client_token = %s",
                 (client_token,),
             )
             existing = cur.fetchone()
         if existing:
-            eid, ebody, esent, estatus, epmid = existing
+            eid, ebody, esent, estatus, epmid, echannel = existing
             return {"ok": True, "deduped": True, "message": {
-                "id": str(eid), "role": "operator", "channel": "whatsapp",
+                "id": str(eid), "role": "operator", "channel": echannel,
                 "body": ebody, "at": esent.isoformat() if esent else None,
                 "status": estatus, "provider_message_id": epmid,
             }}
@@ -3792,17 +3864,17 @@ def _wa_send_and_record(conn, person_id: str, text: str, *, by: str,
         return {"ok": False, "reason_code": "empty_message",
                 "detail": "Message is empty."}
 
-    eligibility = _wa_send_eligibility(conn, person_id)
+    eligibility = _channel_send_eligibility(conn, person_id, channel)
     if not eligibility["eligible"]:
-        detail = ("This lead hasn't messaged on WhatsApp yet — nothing to reply to."
-                   if eligibility["reason"] == "no_inbound_yet" else
-                   "The 24-hour WhatsApp window has closed — they'll need to message again first.")
-        return {"ok": False, "reason_code": eligibility["reason"], "detail": detail}
+        template = _INELIGIBLE_DETAIL.get(
+            eligibility["reason"], "Sending isn't available for this lead right now.")
+        return {"ok": False, "reason_code": eligibility["reason"],
+                "detail": template.format(channel=channel.capitalize())}
 
-    recipient = nexus_identity.resolve_whatsapp_recipient(conn, person_id)
+    recipient = nexus_identity.resolve_channel_recipient(conn, person_id, channel)
     if not recipient:
         return {"ok": False, "reason_code": "no_address",
-                "detail": "This lead has no WhatsApp number on file."}
+                "detail": f"This lead has no {channel} identity on file."}
 
     with conn.cursor() as cur:
         cur.execute(
@@ -3814,33 +3886,32 @@ def _wa_send_and_record(conn, person_id: str, text: str, *, by: str,
         opp = cur.fetchone()
         opportunity_id = str(opp[0]) if opp else None
 
-    resp = _KAPSO_CHANNEL.send_text(recipient, text)
-    if resp is None:
-        # _kapso_call already logged the actionable reason (token scope,
-        # 24h-window, bad recipient) — persist a failed row for audit, matching
+    provider, raw_result = _dispatch_channel_send(channel, recipient, text)
+    if raw_result is None:
+        # The adapter already logged the actionable reason (token scope,
+        # window, bad recipient) — persist a failed row for audit, matching
         # the 'sent' row shape so the thread view can render a failed bubble.
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO outbound_messages "
                 "(person_id, opportunity_id, channel, body, sent_by, status, "
                 " failure_reason, provider, send_target, client_token) "
-                "VALUES (%s, %s, 'whatsapp', %s, %s, 'failed', 'send_failed', "
-                "        'kapso', %s, %s)",
-                (person_id, opportunity_id, text, by, recipient, client_token),
+                "VALUES (%s, %s, %s, %s, %s, 'failed', 'send_failed', %s, %s, %s)",
+                (person_id, opportunity_id, channel, text, by, provider, recipient, client_token),
             )
         return {"ok": False, "reason_code": "send_failed",
-                "detail": "WhatsApp send failed — please try again."}
+                "detail": "Send failed — please try again."}
 
-    message_id = _wa_extract_message_id(resp)
+    message_id = _extract_provider_message_id(channel, raw_result)
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO outbound_messages "
             "(person_id, opportunity_id, channel, body, provider_message_id, "
             " sent_by, status, provider, send_target, client_token) "
-            "VALUES (%s, %s, 'whatsapp', %s, %s, %s, 'sent', 'kapso', %s, %s) "
+            "VALUES (%s, %s, %s, %s, %s, %s, 'sent', %s, %s, %s) "
             "ON CONFLICT (client_token) WHERE client_token IS NOT NULL DO NOTHING "
             "RETURNING id, sent_at",
-            (person_id, opportunity_id, text, message_id, by, recipient, client_token),
+            (person_id, opportunity_id, channel, text, message_id, by, provider, recipient, client_token),
         )
         row = cur.fetchone()
 
@@ -3855,19 +3926,19 @@ def _wa_send_and_record(conn, person_id: str, text: str, *, by: str,
             )
             eid, ebody, esent, estatus, epmid = cur.fetchone()
         return {"ok": True, "deduped": True, "message": {
-            "id": str(eid), "role": "operator", "channel": "whatsapp",
+            "id": str(eid), "role": "operator", "channel": channel,
             "body": ebody, "at": esent.isoformat() if esent else None,
             "status": estatus, "provider_message_id": epmid,
         }}
 
     new_id, sent_at = row
     nexus_interactions.log_interaction(
-        conn, "contacted", "whatsapp", person_id=person_id,
+        conn, "contacted", channel, person_id=person_id,
         payload={"by": by, "via": "cockpit_thread", "message_id": message_id,
                  "length": len(text)},
     )
     return {"ok": True, "message": {
-        "id": str(new_id), "role": "operator", "channel": "whatsapp",
+        "id": str(new_id), "role": "operator", "channel": channel,
         "body": text, "at": sent_at.isoformat() if sent_at else None,
         "status": "sent", "provider_message_id": message_id,
     }}
@@ -3875,7 +3946,7 @@ def _wa_send_and_record(conn, person_id: str, text: str, *, by: str,
 
 class ThreadSendBody(BaseModel):
     body: str
-    channel: Optional[str] = None   # omit to use the resolved default (Phase 2: whatsapp only)
+    channel: Optional[str] = None   # omit to default to 'whatsapp'; the frontend always sends the resolved channel explicitly
     client_token: str               # frontend generates once per send attempt; replayed on retry
 
 
@@ -3883,17 +3954,18 @@ class ThreadSendBody(BaseModel):
 def cockpit_thread_send(person_id: str, body: ThreadSendBody,
                         user: dict = Depends(require_cockpit_user)):
     """
-    One Thread Phase 2 — send a message from the cockpit composer. WhatsApp
-    only for now; Instagram/Telegram land in Phase 3 (a channel other than
-    whatsapp returns 'channel_not_supported' rather than silently no-op'ing
-    or sending on the wrong rail). Always 200 with a structured body — the
-    composer needs reason_code to explain *why* a send was blocked, not a
-    bare error.
+    One Thread — send a message from the cockpit composer. Supports WhatsApp,
+    Instagram, and Telegram; an unrecognized channel returns
+    'channel_not_supported' rather than silently no-op'ing or sending on the
+    wrong rail. Always 200 with a structured body — the composer needs
+    reason_code to explain *why* a send was blocked, not a bare error.
     """
     channel = (body.channel or "whatsapp").strip().lower()
     by = user.get("email") or user.get("sub") or "operator"
 
-    if channel != "whatsapp":
+    if channel not in _SUPPORTED_SEND_CHANNELS:
+        # Fast-fail before touching the DB — route_and_send would reject this
+        # too, but there's no reason to pay a round-trip for a client error.
         return {"status": "error", "reason_code": "channel_not_supported",
                 "detail": f"Sending on {channel} isn't available yet."}
 
@@ -3905,8 +3977,8 @@ def cockpit_thread_send(person_id: str, body: ThreadSendBody,
                     return {"status": "error", "reason_code": "not_found",
                             "detail": "Lead not found."}
 
-            result = _wa_send_and_record(conn, person_id, body.body, by=by,
-                                         client_token=body.client_token)
+            result = route_and_send(conn, person_id, channel, body.body, by=by,
+                                    client_token=body.client_token)
             if result["ok"]:
                 conn.commit()
                 return {"status": "success", "message": result["message"],
@@ -5951,8 +6023,12 @@ class TelegramChannel(MessagingChannel):
     CHANNEL_NAME = "telegram"
 
     def send_text(self, recipient_id: str, text: str,
-                  reply_markup: dict = None) -> None:
-        _send_telegram_message(recipient_id, text, reply_markup)
+                  reply_markup: dict = None) -> Optional[int]:
+        """Returns the sent message_id on success, or None on failure — mirrors
+        WhatsAppChannel.send_text so the cockpit's One Thread composer can
+        detect delivery. Funnel callers ignore the return; behaviour is
+        unchanged."""
+        return _send_telegram_message(recipient_id, text, reply_markup)
 
     def send_quick_replies(self, recipient_id: str, text: str,
                            replies: list[dict]) -> None:
@@ -6045,11 +6121,17 @@ _IG_ALREADY_LEAD_REPLY = (
 )
 
 
-def _ig_graph_call(path: str, payload: dict) -> None:
+def _ig_graph_call(path: str, payload: dict) -> Optional[str]:
     """
     POST to the Instagram Graph API send endpoint (/me/messages).
     Uses stdlib urllib — no extra dependency.
     Best-effort: logs on failure, never raises (webhook must always return 200).
+
+    Returns the raw response body on success (mirrors _wa_graph_call/_kapso_call
+    so send_text can surface a message id for delivery confirmation — see
+    WhatsAppChannel.send_text), or None on failure. Every existing funnel caller
+    already discards this return value (bare statement calls), so surfacing it
+    is additive — not a behaviour change for them.
 
     HOST: the "Instagram API with Instagram Login" flow (no Facebook Page) is
     served by graph.instagram.com — NOT graph.facebook.com. Using the wrong host
@@ -6057,7 +6139,7 @@ def _ig_graph_call(path: str, payload: dict) -> None:
     """
     if not settings.ig_access_token:
         logger.error("[instagram] IG_ACCESS_TOKEN not set — cannot send reply.")
-        return
+        return None
     url  = f"https://graph.instagram.com/v21.0/me/messages?access_token={settings.ig_access_token}"
     data = json.dumps(payload).encode("utf-8")
     req  = urllib.request.Request(
@@ -6065,9 +6147,10 @@ def _ig_graph_call(path: str, payload: dict) -> None:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            resp.read()
+            return resp.read().decode("utf-8", "ignore")
     except Exception as e:
         logger.error(f"[instagram] Graph API call to {path} failed: {e}")
+        return None
 
 
 class InstagramChannel(MessagingChannel):
@@ -6087,9 +6170,13 @@ class InstagramChannel(MessagingChannel):
     def _recipient(self, igsid: str) -> dict:
         return {"id": igsid}
 
-    def send_text(self, recipient_id: str, text: str) -> None:
+    def send_text(self, recipient_id: str, text: str) -> Optional[str]:
+        """Returns the raw Graph API response (carries the message_id) on
+        success, or None on failure — mirrors WhatsAppChannel.send_text so the
+        cockpit's One Thread composer can detect delivery. Funnel callers
+        ignore the return; behaviour is unchanged."""
         text = (text or "").strip()[:1000] or "…"   # IG hard cap is 1000 chars
-        _ig_graph_call("/me/messages", {
+        return _ig_graph_call("/me/messages", {
             "recipient":      self._recipient(recipient_id),
             "message":        {"text": text},
             "messaging_type": "RESPONSE",
