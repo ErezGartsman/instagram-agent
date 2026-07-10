@@ -52,6 +52,9 @@ from nexus import work_queue as nexus_work_queue  # noqa: F401 — used by route
 from nexus import whatsapp as nexus_whatsapp
 from nexus.agents.base import run_agent  # noqa: F401 — used by routers/* via main.<name> (E0 late-binding contract)
 from nexus.agents.qualification import qualification_agent  # noqa: F401 — used by routers/* via main.<name> (E0 late-binding contract)
+from nexus.flows import dispatcher as nexus_flows_dispatcher  # noqa: F401 — used by routers/* via main.<name> (E0 late-binding contract)
+from nexus.flows import policy as nexus_flows_policy
+from nexus.flows import runner as nexus_flows_runner  # noqa: F401 — used by routers/* via main.<name> (E0 late-binding contract)
 import scheduler as nexus_scheduler
 
 
@@ -563,6 +566,8 @@ _INTERNAL_TABLES = {
     "interactions", "opportunities", "bookings",
     "person_profile", "session_summaries", "operator_notes", "erasure_log",
     "content_pieces",
+    # Flows engine (migration 009, F1) — internal automation infra.
+    "flow_definitions", "flow_runs", "flow_run_steps", "flow_timers",
 }
 
 def get_schema_description(conn) -> str:
@@ -5582,6 +5587,19 @@ _KAPSO_CHANNEL = KapsoChannel()
 # importing main (which would be circular). Mirrors the nexus.db.configure pattern.
 nexus_whatsapp.configure(
     lambda recipient, text: _KAPSO_CHANNEL.send_text(recipient, text)
+)
+
+# Wire the Policy Gate (F1, SYSTEM_ELEVATION_PRD.md §B5) — same bridge pattern,
+# after is_crisis/_channel_send_eligibility/_get_config/_send_telegram_message
+# are all already defined above this point in the module.
+nexus_flows_policy.configure(
+    is_crisis_fn=is_crisis,
+    channel_eligibility_fn=_channel_send_eligibility,
+    get_config_fn=_get_config,
+    notify_operator_fn=(
+        lambda text: _send_telegram_message(settings.telegram_owner_chat_id, text)
+        if settings.telegram_owner_chat_id else None
+    ),
 )
 
 
