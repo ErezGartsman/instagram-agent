@@ -22,6 +22,8 @@ export const queryKeys = {
   dossier: (personId: string) => ['dossier', personId] as const,
   thread: (personId: string) => ['thread', personId] as const,
   agentRuns: (personId: string) => ['agents', 'runs', personId] as const,
+  flows: ['flows'] as const,
+  flowRuns: (flowId: string) => ['flows', 'runs', flowId] as const,
 }
 
 export const queryClient = new QueryClient({

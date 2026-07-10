@@ -47,3 +47,35 @@ export function useQueueRealtimeInvalidation(enabled: boolean): void {
     }
   }, [enabled, qc])
 }
+
+/**
+ * Flows canvas liveness: flow_runs joined the supabase_realtime publication in
+ * migration 009, so a run created/advanced by a sweep pushes here — invalidate
+ * the flows list (run_count) and the selected flow's run history. The canvas
+ * updates as the engine works, no poll needed.
+ */
+export function useFlowsRealtimeInvalidation(enabled: boolean, flowId: string | null): void {
+  const qc = useQueryClient()
+  useEffect(() => {
+    if (!enabled) return
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const channel = supabase
+      .channel('rt:flows-invalidation')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'flow_runs' },
+        () => {
+          if (timer) clearTimeout(timer)
+          timer = setTimeout(() => {
+            void qc.invalidateQueries({ queryKey: queryKeys.flows })
+            if (flowId) void qc.invalidateQueries({ queryKey: queryKeys.flowRuns(flowId) })
+          }, DEBOUNCE_MS)
+        },
+      )
+      .subscribe()
+    return () => {
+      if (timer) clearTimeout(timer)
+      void supabase.removeChannel(channel)
+    }
+  }, [enabled, flowId, qc])
+}

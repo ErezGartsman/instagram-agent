@@ -42,6 +42,12 @@ const SettingsPage = lazy(() =>
   import('./cockpit/pages/SettingsPage').then((m) => ({ default: m.SettingsPage })),
 )
 
+// Flows canvas (F2) — code-split so the canvas + inspector stay out of the
+// initial cockpit chunk (respecting the E2 bundle budget).
+const FlowsPage = lazy(() =>
+  import('./cockpit/pages/FlowsPage').then((m) => ({ default: m.FlowsPage })),
+)
+
 const router = createBrowserRouter([
   // The public front door — the premium marketing landing at the root.
   {
@@ -75,6 +81,9 @@ const router = createBrowserRouter([
       // Deep links stay safe: old /app/inbox bookmarks land on the queue.
       { path: 'inbox', element: <Navigate to="/app/queue" replace /> },
       ...(FEATURES.content ? [{ path: 'content', element: <ContentStudioPage /> }] : []),
+      ...(FEATURES.flows
+        ? [{ path: 'flows', element: <Suspense fallback={null}><FlowsPage /></Suspense> }]
+        : []),
       { path: 'settings', element: <Suspense fallback={null}><SettingsPage /></Suspense> },
       { path: '*', element: <NotFoundPage /> },
     ],

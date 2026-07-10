@@ -42,10 +42,11 @@ class TestListFlows:
 
     def test_success_shape(self, client, monkeypatch):
         monkeypatch.setattr(main.nexus_flows_policy, "flows_enabled", lambda: False)
+        graph = {"nodes": [{"id": "t1", "type": "trigger"}], "edges": []}
         row = (
             "f1", "cooling-lead-nudge", 1, "published", False,
             "Cooling lead → notify operator", "desc",
-            {"type": "state", "predicate": {}}, None, None, 3, None,
+            {"type": "state", "predicate": {}}, None, None, graph, 3, None,
         )
         with patch.object(main, "get_db_conn", _conn_with(fetchall=[row])):
             r = client.get("/api/cockpit/flows")
@@ -57,6 +58,7 @@ class TestListFlows:
         assert body["flows"][0]["slug"] == "cooling-lead-nudge"
         assert body["flows"][0]["live"] is False
         assert body["flows"][0]["run_count"] == 3
+        assert body["flows"][0]["graph"] == graph
 
     def test_db_error_returns_error_shape_not_500(self, client):
         broken = MagicMock(side_effect=RuntimeError("db down"))

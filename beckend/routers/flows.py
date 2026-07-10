@@ -67,7 +67,7 @@ def list_flows(user: dict = main.Depends(main.require_cockpit_user)):
                 cur.execute(
                     "SELECT fd.id, fd.slug, fd.version, fd.status, fd.live, "
                     "       fd.name, fd.description, fd.trigger, fd.created_at, "
-                    "       fd.published_at, "
+                    "       fd.published_at, fd.graph, "
                     "       (SELECT COUNT(*) FROM flow_runs fr WHERE fr.flow_id = fd.id) AS run_count, "
                     "       (SELECT MAX(fr.started_at) FROM flow_runs fr WHERE fr.flow_id = fd.id) AS last_run_at "
                     "FROM flow_definitions fd "
@@ -80,7 +80,10 @@ def list_flows(user: dict = main.Depends(main.require_cockpit_user)):
                 "live": r[4], "name": r[5], "description": r[6], "trigger": r[7],
                 "created_at": r[8].isoformat() if r[8] else None,
                 "published_at": r[9].isoformat() if r[9] else None,
-                "run_count": r[10], "last_run_at": r[11].isoformat() if r[11] else None,
+                # graph = {nodes:[{id,type,...}], edges:[{from,to,when?}]} — the
+                # canvas renders this topology; F2 frontend needs it inline.
+                "graph": r[10],
+                "run_count": r[11], "last_run_at": r[12].isoformat() if r[12] else None,
             }
             for r in rows
         ]

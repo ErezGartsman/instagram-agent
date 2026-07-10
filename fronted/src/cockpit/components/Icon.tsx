@@ -16,6 +16,12 @@ export type IconName =
   | 'x'
   | 'send'
   | 'refresh'
+  | 'zap'
+  | 'branch'
+  | 'bell'
+  | 'flag'
+  | 'shield'
+  | 'play'
 
 type Props = { name: IconName; size?: number } & Omit<SVGProps<SVGSVGElement>, 'name'>
 
@@ -147,6 +153,49 @@ export function Icon({ name, size = 18, ...rest }: Props) {
         <svg {...common}>
           <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
           <path d="M3 3v5h5" />
+        </svg>
+      )
+    case 'zap':
+      return (
+        <svg {...common}>
+          <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
+        </svg>
+      )
+    case 'branch':
+      return (
+        <svg {...common}>
+          <circle cx="6" cy="6" r="2.5" />
+          <circle cx="6" cy="18" r="2.5" />
+          <circle cx="18" cy="12" r="2.5" />
+          <path d="M6 8.5v3a3 3 0 0 0 3 3h6.5" />
+          <path d="M6 15.5v-3" opacity="0" />
+          <path d="M15.5 9.5 18 12l-2.5 2.5" opacity="0" />
+        </svg>
+      )
+    case 'bell':
+      return (
+        <svg {...common}>
+          <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+          <path d="M13.7 21a2 2 0 0 1-3.4 0" />
+        </svg>
+      )
+    case 'flag':
+      return (
+        <svg {...common}>
+          <path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V4s-1 1-4 1-5-2-8-2-4 1-4 1z" />
+          <line x1="4" y1="22" x2="4" y2="15" />
+        </svg>
+      )
+    case 'shield':
+      return (
+        <svg {...common}>
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+        </svg>
+      )
+    case 'play':
+      return (
+        <svg {...common}>
+          <polygon points="6 4 20 12 6 20 6 4" />
         </svg>
       )
   }

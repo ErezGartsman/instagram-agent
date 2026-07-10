@@ -1,5 +1,5 @@
 import type { LucideIcon } from 'lucide-react'
-import { LayoutGrid, ListChecks, Columns3, Sparkles, ChartColumn } from 'lucide-react'
+import { LayoutGrid, ListChecks, Columns3, Sparkles, ChartColumn, Workflow } from 'lucide-react'
 import { FEATURES } from '../lib/flags'
 
 export type NavItem = { to: string; label: string; icon: LucideIcon }
@@ -38,6 +38,12 @@ export const NAV_SECTIONS: NavSection[] = [
       ...(FEATURES.analytics
         ? [{ to: '/app/analytics', label: 'Analytics', icon: ChartColumn }]
         : []),
+    ],
+  },
+  {
+    label: 'Automate',
+    items: [
+      ...(FEATURES.flows ? [{ to: '/app/flows', label: 'Flows', icon: Workflow }] : []),
     ],
   },
 ]
