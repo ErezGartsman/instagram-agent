@@ -67,6 +67,10 @@ scripts/
 !beckend/scripts/
 beckend/scripts/*
 !beckend/scripts/migrate.py
+# …and the bundle-budget CI gate is source too (E2):
+!fronted/scripts/
+fronted/scripts/*
+!fronted/scripts/check-bundle-budget.mjs
 orchestrator.py
 node_modules/
 .ig-profile/

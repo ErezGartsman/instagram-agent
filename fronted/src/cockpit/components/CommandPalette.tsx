@@ -6,9 +6,43 @@ import { LoaderCircle, Search } from 'lucide-react'
 import { Icon } from './Icon'
 import type { IconName } from './Icon'
 import { useAuth } from '../auth/AuthProvider'
-import { searchCockpit, type SearchResult, type SearchResultType } from '../lib/api'
+import { searchCockpit, triggerAgent, type SearchResult, type SearchResultType } from '../lib/api'
 import { fetchQueue, rankQueue, SAMPLE_QUEUE, type QueueItem } from '../lib/workqueue'
 import { NAV } from '../shell/nav'
+
+// Per-lead quick moves (E2 §A6: the palette grows from search into actions) —
+// ids carry a stable prefix `select()` special-cases to run a real mutation
+// before navigating, rather than a plain page jump.
+const ACT_PREFIX = 'act:'      // act:<type>:<leadId> -> Action Loop move, undoable in the queue
+const AGENT_PREFIX = 'agent:'  // agent:<leadId>       -> trigger the qualification agent
+
+/** The Action Loop quick-moves for one lead — done/snooze/dismiss route through
+ *  ?act= so WorkQueuePage fires the SAME optimistic, undoable act() a manual
+ *  click would; the agent trigger calls the real (already-shipped) endpoint. */
+function leadQuickActions(lead: QueueItem): SearchResult[] {
+  return [
+    {
+      type: 'action', id: `${ACT_PREFIX}done:${lead.id}`,
+      label: `Mark ${lead.name} done`, sublabel: 'Handled — remove from the queue',
+      route: `/app/queue?focus=${lead.id}&act=done`,
+    },
+    {
+      type: 'action', id: `${ACT_PREFIX}snooze:${lead.id}`,
+      label: `Snooze ${lead.name}`, sublabel: 'Set aside — resurfaces later',
+      route: `/app/queue?focus=${lead.id}&act=snooze`,
+    },
+    {
+      type: 'action', id: `${ACT_PREFIX}dismiss:${lead.id}`,
+      label: `Dismiss ${lead.name}`, sublabel: 'Remove from the queue',
+      route: `/app/queue?focus=${lead.id}&act=dismiss`,
+    },
+    {
+      type: 'action', id: `${AGENT_PREFIX}${lead.id}`,
+      label: `✦ Trigger agent → ${lead.name}`, sublabel: 'Run qualification; watch the Agent Log',
+      route: `/app/queue?focus=${lead.id}`,
+    },
+  ]
+}
 
 const EASE: [number, number, number, number] = [0.25, 0.4, 0.25, 1]
 const DEBOUNCE_MS = 200
@@ -223,22 +257,36 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
     sublabel: `${lead.action} · ${lead.confidence}%`,
     route: `/app/queue?focus=${lead.id}`,
   }))
+  // Quick moves for the single hottest lead — grounded to today's real
+  // Action Loop + agent-trigger endpoints (E2 §A6).
+  const moveItems: SearchResult[] = topLeads[0] ? leadQuickActions(topLeads[0]) : []
 
   // Unified flat list for keyboard navigation — whichever mode is active
   const navItems: SearchResult[] = isTyping
     ? [...filteredPages, ...people, ...content]
-    : [...leadItems, ...QUICK_ACTIONS]
+    : [...leadItems, ...moveItems, ...QUICK_ACTIONS]
 
   const pageLen   = filteredPages.length
   const personLen = people.length
   const leadLen   = leadItems.length
+  const moveLen   = moveItems.length
 
   // ── Actions ────────────────────────────────────────────────────────────────
   const close = useCallback(() => { onClose(); setQuery('') }, [onClose])
 
   const select = useCallback(
-    (result: SearchResult) => { close(); navigate(result.route) },
-    [close, navigate],
+    (result: SearchResult) => {
+      close()
+      if (result.id.startsWith(AGENT_PREFIX)) {
+        const token = session?.access_token
+        const personId = result.id.slice(AGENT_PREFIX.length)
+        // Fire-and-forget, same contract as api.ts's triggerAgent: never
+        // throws, the Agent Log picks up the run via Realtime once it starts.
+        if (token) void triggerAgent(token, personId)
+      }
+      navigate(result.route)
+    },
+    [close, navigate, session?.access_token],
   )
 
   const onKeyDown = useCallback(
@@ -346,15 +394,30 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
                     ))}
                   </ResultSection>
 
+                  {/* Quick moves — real actions on the hottest lead (E2 §A6) */}
+                  {moveItems.length > 0 && (
+                    <ResultSection label="Quick moves">
+                      {moveItems.map((r, i) => (
+                        <ResultRow
+                          key={r.id}
+                          result={r}
+                          isActive={activeIdx === leadLen + i}
+                          onSelect={() => select(r)}
+                          onHover={() => setActiveIdx(leadLen + i)}
+                        />
+                      ))}
+                    </ResultSection>
+                  )}
+
                   {/* Quick actions */}
                   <ResultSection label="Quick actions">
                     {QUICK_ACTIONS.map((r, i) => (
                       <ResultRow
                         key={r.id}
                         result={r}
-                        isActive={activeIdx === leadLen + i}
+                        isActive={activeIdx === leadLen + moveLen + i}
                         onSelect={() => select(r)}
-                        onHover={() => setActiveIdx(leadLen + i)}
+                        onHover={() => setActiveIdx(leadLen + moveLen + i)}
                       />
                     ))}
                   </ResultSection>
