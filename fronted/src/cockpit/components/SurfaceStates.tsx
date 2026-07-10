@@ -1,13 +1,10 @@
 import type { ReactNode } from 'react'
 import { Icon } from './Icon'
 import type { IconName } from './Icon'
+import { Button, Skeleton } from './ui'
 
-// ── Bone ──────────────────────────────────────────────────────────────────────
-// The atom of every skeleton: a cool electric shimmer block. Geometry comes
-// from the parent variant; this just applies the shimmer class + radius.
-function Bone({ className = '' }: { className?: string }) {
-  return <div className={`cq-shimmer-block rounded-control ${className}`} aria-hidden />
-}
+// The atom of every skeleton geometry below — the shared ui/Skeleton shimmer.
+const Bone = Skeleton
 
 // ── SurfaceLoading ────────────────────────────────────────────────────────────
 // Five geometry variants — each mirrors the real surface's layout so the
@@ -210,15 +207,26 @@ export function SurfaceError({
       <p className="mt-2 max-w-sm text-sm leading-relaxed text-muted">{body}</p>
 
       {onRetry != null && (
-        <button
-          type="button"
-          onClick={onRetry}
-          className="mt-6 inline-flex items-center gap-2 rounded-control border border-line bg-raised px-4 py-2 text-sm text-muted transition-colors hover:bg-surface hover:text-ink"
-        >
-          <Icon name="refresh" size={14} />
+        <Button className="mt-6" icon="refresh" onClick={onRetry}>
           Try again
-        </button>
+        </Button>
       )}
+    </div>
+  )
+}
+
+// ── SampleNotice ──────────────────────────────────────────────────────────────
+// The dev-bypass banner every surface shows when it renders SAMPLE_* data.
+// One component so the copy and tone stay identical across pages.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function SampleNotice({ className = '' }: { className?: string }) {
+  return (
+    <div
+      className={`mb-4 inline-flex items-center gap-2 rounded-control border border-line px-3 py-1 text-xs text-warn ${className}`}
+    >
+      <Icon name="alert" size={13} />
+      sample data (dev bypass) — live data loads when you&rsquo;re signed in
     </div>
   )
 }

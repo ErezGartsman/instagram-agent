@@ -1,8 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { useQuery } from '@tanstack/react-query'
 import { Icon } from './Icon'
 import { useAuth } from '../auth/AuthProvider'
-import { fetchBriefing, type BriefingData, type BriefingTone } from '../lib/dossier'
+import { queryKeys } from '../lib/queryClient'
+import { fetchBriefing, type BriefingTone } from '../lib/dossier'
 
 /**
  * Morning briefing — the cockpit's proactive "push" surface (live since Phase 3).
@@ -34,7 +36,6 @@ function compiledLabel(iso: string): string {
 export function MorningBriefing() {
   const navigate = useNavigate()
   const { session } = useAuth()
-  const [briefing, setBriefing] = useState<BriefingData | null>(null)
   const [acked, setAcked] = useState<boolean>(() => {
     try {
       return localStorage.getItem(ACK_KEY) === new Date().toDateString()
@@ -44,14 +45,16 @@ export function MorningBriefing() {
   })
 
   const token = session?.access_token
-  useEffect(() => {
-    if (!token || acked) return
-    const ctrl = new AbortController()
-    fetchBriefing(token, ctrl.signal)
-      .then(setBriefing)
-      .catch(() => { /* silent — a briefing that can't compile says nothing */ })
-    return () => ctrl.abort()
-  }, [token, acked])
+  // Deliberately two-state, not four: this is the one surface where silence IS
+  // the design (a briefing that can't compile, or has nothing to say, renders
+  // nothing). retry: false — never hammer a quiet card.
+  const { data: briefing } = useQuery({
+    queryKey: queryKeys.briefing,
+    queryFn: ({ signal }) => fetchBriefing(token!, signal),
+    enabled: !!token && !acked,
+    retry: false,
+    staleTime: 5 * 60_000,
+  })
 
   if (acked || !briefing || briefing.items.length === 0) return null
 

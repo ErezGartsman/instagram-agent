@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
+import { useQuery } from '@tanstack/react-query'
 import { Icon } from '../components/Icon'
 import { SurfaceLoading, SurfaceError } from '../components/SurfaceStates'
 import { useAuth } from '../auth/AuthProvider'
+import { queryKeys } from '../lib/queryClient'
 import {
   askScopedMemory, DossierNotFound, fetchDossier, fmtDay,
   type DossierChapter, type DossierData, type DossierTimelineEvent,
@@ -35,28 +37,30 @@ export function PersonDossierPage() {
   const { id } = useParams()
   const { session } = useAuth()
   const token = session?.access_token
-  const [state, setState] = useState<State>({ kind: 'loading' })
-  const [retryNonce, setRetryNonce] = useState(0)
-  const retry = useCallback(() => {
-    setState({ kind: 'loading' })
-    setRetryNonce((x) => x + 1)
-  }, [])
 
-  useEffect(() => {
-    if (!id || !token) {
-      setState({ kind: 'empty' })
-      return
-    }
-    const ctrl = new AbortController()
-    setState({ kind: 'loading' })
-    fetchDossier(token, id, ctrl.signal)
-      .then((data) => setState({ kind: 'ready', data }))
-      .catch((err: unknown) => {
-        if ((err as { name?: string } | null)?.name === 'AbortError') return
-        setState(err instanceof DossierNotFound ? { kind: 'empty' } : { kind: 'error' })
-      })
-    return () => ctrl.abort()
-  }, [id, token, retryNonce])
+  // Four-state lifecycle on the TanStack spine (E1 §A2/§A4). DossierNotFound
+  // is a clean domain outcome, not a failure: it renders the authored empty
+  // state and is never retried.
+  const query = useQuery({
+    queryKey: queryKeys.dossier(id ?? 'unknown'),
+    queryFn: ({ signal }) => fetchDossier(token!, id!, signal),
+    enabled: !!id && !!token,
+    retry: (failureCount, err) => !(err instanceof DossierNotFound) && failureCount < 2,
+  })
+
+  const retry = () => void query.refetch()
+  let state: State
+  if (!id || !token) {
+    state = { kind: 'empty' }
+  } else if (query.data) {
+    state = { kind: 'ready', data: query.data }
+  } else if (query.isError && query.error instanceof DossierNotFound) {
+    state = { kind: 'empty' }
+  } else if (query.isError && !query.isFetching) {
+    state = { kind: 'error' }
+  } else {
+    state = { kind: 'loading' }
+  }
 
   if (state.kind === 'loading') {
     return (

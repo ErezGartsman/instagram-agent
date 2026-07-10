@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect } from 'react'
 import type { ReactNode } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { queryKeys } from '../lib/queryClient'
 import { Icon } from '../components/Icon'
 import { MorningBriefing } from '../components/MorningBriefing'
 import { SurfaceLoading, SurfaceError } from '../components/SurfaceStates'
@@ -69,12 +71,7 @@ type State = { kind: 'loading' } | { kind: 'error' } | Ready
 
 export function OverviewPage() {
   const { session, devBypass, displayName } = useAuth()
-  const [state, setState] = useState<State>({ kind: 'loading' })
-  const [retryNonce, setRetryNonce] = useState(0)
-  const retry = useCallback(() => {
-    setState({ kind: 'loading' })
-    setRetryNonce((n) => n + 1)
-  }, [])
+  const queryClient = useQueryClient()
 
   // ── The single data cycle — every widget drinks from this one well ────────
   const runCycle = useCallback(async (signal?: AbortSignal): Promise<Ready> => {
@@ -127,6 +124,23 @@ export function OverviewPage() {
     }
   }, [devBypass, session?.access_token])
 
+  // The one data cycle on the TanStack spine (E1 §A2): 30s interval + focus
+  // refetch come from the query layer; error state only when there is no data
+  // to keep on screen (background failures silently keep the last snapshot —
+  // same posture as before, minus 50 lines of hand-rolled machinery).
+  const query = useQuery({
+    queryKey: queryKeys.overview,
+    queryFn: ({ signal }) => runCycle(signal),
+    enabled: devBypass || !!session?.access_token,
+    refetchInterval: 30_000,
+  })
+  const state: State = query.data
+    ? query.data
+    : query.isError && !query.isFetching
+      ? { kind: 'error' }
+      : { kind: 'loading' }
+  const retry = () => void query.refetch()
+
   // Publish accountability counts to the Sidebar badge on every ready state.
   useEffect(() => {
     if (state.kind !== 'ready' || !state.sla) return
@@ -136,47 +150,13 @@ export function OverviewPage() {
     })
   }, [state])
 
-  // Initial load (loading + error states).
+  // The Action Loop's SLA event → invalidate this screen's cycle.
   useEffect(() => {
-    const ctrl = new AbortController()
-    setState({ kind: 'loading' })
-    runCycle(ctrl.signal)
-      .then(setState)
-      .catch((err: unknown) => {
-        if ((err as { name?: string } | null)?.name !== 'AbortError') setState({ kind: 'error' })
-      })
-    return () => ctrl.abort()
-  }, [runCycle, retryNonce])
-
-  // Silent refresh: 30s poll + focus/visibility + the Action Loop's SLA event.
-  const busyRef = useRef(false)
-  useEffect(() => {
-    const silent = () => {
-      if (busyRef.current) return
-      busyRef.current = true
-      runCycle()
-        .then(setState)
-        .catch(() => { /* transient — keep what's on screen */ })
-        .finally(() => { busyRef.current = false })
-    }
-    let debounce: ReturnType<typeof setTimeout> | null = null
-    const trigger = () => {
-      if (debounce) clearTimeout(debounce)
-      debounce = setTimeout(silent, 400)
-    }
-    const onVisibility = () => { if (document.visibilityState === 'visible') trigger() }
-    const id = setInterval(silent, 30_000)
-    window.addEventListener('focus', trigger)
-    document.addEventListener('visibilitychange', onVisibility)
-    window.addEventListener('nexus:sla-changed', trigger)
-    return () => {
-      clearInterval(id)
-      window.removeEventListener('focus', trigger)
-      document.removeEventListener('visibilitychange', onVisibility)
-      window.removeEventListener('nexus:sla-changed', trigger)
-      if (debounce) clearTimeout(debounce)
-    }
-  }, [runCycle])
+    const onSlaChanged = () =>
+      void queryClient.invalidateQueries({ queryKey: queryKeys.overview })
+    window.addEventListener('nexus:sla-changed', onSlaChanged)
+    return () => window.removeEventListener('nexus:sla-changed', onSlaChanged)
+  }, [queryClient])
 
   return (
     <div className="mx-auto max-w-[1360px]">

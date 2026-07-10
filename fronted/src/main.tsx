@@ -9,11 +9,11 @@ import { queryClient } from './cockpit/lib/queryClient'
 import { AuthProvider } from './cockpit/auth/AuthProvider'
 import { RequireAuth } from './cockpit/auth/RequireAuth'
 import { AppShell } from './cockpit/shell/AppShell'
+import { Navigate } from 'react-router-dom'
 import { OverviewPage } from './cockpit/pages/OverviewPage'
 import { PersonDossierPage } from './cockpit/pages/PersonDossierPage'
 import { WorkQueuePage } from './cockpit/pages/WorkQueuePage'
 import { PipelinePage } from './cockpit/pages/PipelinePage'
-import { InboxPage } from './cockpit/pages/InboxPage'
 import { ContentStudioPage } from './cockpit/pages/ContentStudioPage'
 import { NotFoundPage } from './cockpit/pages/NotFoundPage'
 import { RouteErrorBoundary } from './cockpit/components/RouteErrorBoundary'
@@ -71,7 +71,9 @@ const router = createBrowserRouter([
         : []),
       { path: 'person/:id', element: <PersonDossierPage /> },
       { path: 'pipeline', element: <PipelinePage /> },
-      { path: 'inbox', element: <InboxPage /> },
+      // Inbox retired (E1 §A7) — One Thread in the dossier IS the inbox.
+      // Deep links stay safe: old /app/inbox bookmarks land on the queue.
+      { path: 'inbox', element: <Navigate to="/app/queue" replace /> },
       ...(FEATURES.content ? [{ path: 'content', element: <ContentStudioPage /> }] : []),
       { path: 'settings', element: <Suspense fallback={null}><SettingsPage /></Suspense> },
       { path: '*', element: <NotFoundPage /> },

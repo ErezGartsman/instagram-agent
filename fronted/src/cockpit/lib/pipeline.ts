@@ -1,4 +1,4 @@
-import { API_BASE } from './api'
+import { apiFetch } from './http'
 
 export type Lead = {
   id: string
@@ -30,12 +30,7 @@ export const CHANNEL_LABELS: Record<string, string> = {
 }
 
 export async function fetchPipeline(token: string, signal?: AbortSignal): Promise<Stage[]> {
-  const res = await fetch(`${API_BASE}/api/cockpit/pipeline`, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal,
-  })
-  if (!res.ok) throw new Error(`pipeline ${res.status}`)
-  const data = (await res.json()) as { stages?: Stage[] }
+  const data = await apiFetch<{ stages?: Stage[] }>('/api/cockpit/pipeline', token, { signal })
   return data.stages ?? []
 }
 

@@ -2,7 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { Icon } from '../components/Icon'
 import { SurfaceLoading, SurfaceError } from '../components/SurfaceStates'
+import { Button } from '../components/ui'
 import { useAuth } from '../auth/AuthProvider'
+import { useSurfaceQuery } from '../lib/useSurfaceQuery'
+import { queryKeys } from '../lib/queryClient'
 import { relativeTime } from '../lib/pipeline'
 import {
   createContent,
@@ -47,12 +50,6 @@ export function ContentStudioPage() {
   const pieceId   = searchParams.get('piece')
   const triggerNew = searchParams.get('new') === '1'
   const hasTriggeredNewRef = useRef(false)
-  const [phase, setPhase] = useState<Phase>('loading')
-  const [retryNonce, setRetryNonce] = useState(0)
-  const retry = useCallback(() => {
-    setPhase('loading')
-    setRetryNonce((n) => n + 1)
-  }, [])
   // ?new=1 auto-trigger — fires once after content loads when opened from ⌘K.
   // Stored in a ref so it doesn't cause a re-render and only fires once per open.
   const onNewRef = useRef<(() => Promise<void>) | null>(null)
@@ -60,42 +57,38 @@ export function ContentStudioPage() {
   // to avoid a TDZ ReferenceError in the production bundle.
   const [busy, setBusy] = useState(false)
   const [justSaved, setJustSaved] = useState(false)
-  useEffect(() => {
-    if (!triggerNew || hasTriggeredNewRef.current || phase !== 'ready' || busy) return
-    hasTriggeredNewRef.current = true
-    void onNewRef.current?.()
-  }, [phase, triggerNew, busy])
 
   const [sample, setSample] = useState(false)
   const [items, setItems] = useState<ContentPiece[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [draft, setDraft] = useState<Draft | null>(null)
 
+  // Read path on the TanStack spine (E1 §A2). The Studio holds a LOCAL working
+  // copy (items) because it's a write surface — so server data seeds it exactly
+  // once per mount/retry, and background refetches can never clobber a dirty
+  // draft mid-edit.
+  const read = useSurfaceQuery<ContentPiece[]>({
+    queryKey: queryKeys.content,
+    fetcher: fetchContent,
+    sample: SAMPLE_CONTENT,
+  })
+  const seededRef = useRef(false)
   useEffect(() => {
-    if (devBypass) {
-      setItems(SAMPLE_CONTENT)
-      setSample(true)
-      setSelectedId((id) => id ?? SAMPLE_CONTENT[0]?.id ?? null)
-      setPhase('ready')
-      return
-    }
-    if (!token) {
-      setPhase('loading')
-      return
-    }
-    const controller = new AbortController()
-    setPhase('loading')
-    fetchContent(token, controller.signal)
-      .then((list) => {
-        setItems(list)
-        setSelectedId((id) => id ?? pieceId ?? list[0]?.id ?? null)
-        setPhase('ready')
-      })
-      .catch((err: unknown) => {
-        if ((err as { name?: string } | null)?.name !== 'AbortError') setPhase('error')
-      })
-    return () => controller.abort()
-  }, [token, devBypass, retryNonce])
+    if (read.kind !== 'ready' || seededRef.current) return
+    seededRef.current = true
+    setItems(read.data)
+    setSample(read.sample)
+    setSelectedId((id) => id ?? pieceId ?? read.data[0]?.id ?? null)
+  }, [read, pieceId])
+
+  const phase: Phase =
+    read.kind === 'error' ? 'error' : seededRef.current ? 'ready' : 'loading'
+
+  useEffect(() => {
+    if (!triggerNew || hasTriggeredNewRef.current || phase !== 'ready' || busy) return
+    hasTriggeredNewRef.current = true
+    void onNewRef.current?.()
+  }, [phase, triggerNew, busy])
 
   const selected = useMemo(
     () => items.find((i) => i.id === selectedId) ?? null,
@@ -182,7 +175,7 @@ export function ContentStudioPage() {
     <SurfaceError
       title="Couldn't load the Studio"
       body="Your content couldn't be reached. Check your connection and try again."
-      onRetry={retry}
+      onRetry={read.kind === 'error' ? read.retry : undefined}
     />
   )
 
@@ -197,13 +190,9 @@ export function ContentStudioPage() {
               <span className="rounded-control border border-line px-1.5 py-px text-[10px] text-warn">sample</span>
             )}
           </div>
-          <button
-            onClick={onNew}
-            aria-label="New piece"
-            className="inline-flex items-center gap-1 rounded-control border border-accent/40 px-2 py-1 text-[11px] text-accent transition-colors hover:bg-accent/10"
-          >
-            <Icon name="sparkle" size={12} /> New
-          </button>
+          <Button variant="outline" size="sm" icon="sparkle" aria-label="New piece" onClick={onNew}>
+            New
+          </Button>
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
@@ -285,13 +274,9 @@ export function ContentStudioPage() {
                   )
                 })}
               </div>
-              <button
-                onClick={onDelete}
-                aria-label="Delete piece"
-                className="inline-flex items-center gap-1.5 rounded-control border border-line px-2.5 py-1.5 text-xs text-muted transition-colors hover:border-danger/40 hover:text-danger"
-              >
-                <Icon name="alert" size={13} /> Delete
-              </button>
+              <Button variant="danger" size="sm" icon="alert" aria-label="Delete piece" onClick={onDelete}>
+                Delete
+              </Button>
             </div>
 
             {/* The writing surface — Fraunces */}
@@ -336,13 +321,9 @@ export function ContentStudioPage() {
               </div>
               <div className="flex items-center gap-3">
                 {justSaved && <span className="font-mono text-[11px] text-sage">Saved</span>}
-                <button
-                  onClick={onSave}
-                  disabled={!dirty || busy}
-                  className="inline-flex items-center gap-1.5 rounded-control border border-accent/40 px-3.5 py-1.5 text-xs text-accent transition-colors hover:bg-accent/10 disabled:cursor-default disabled:opacity-40"
-                >
-                  <Icon name="check" size={13} /> Save
-                </button>
+                <Button variant="outline" size="sm" icon="check" onClick={onSave} disabled={!dirty || busy}>
+                  Save
+                </Button>
               </div>
             </div>
           </div>

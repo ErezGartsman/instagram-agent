@@ -1,4 +1,4 @@
-import { API_BASE } from './api'
+import { apiFetch } from './http'
 import type { Stage } from './pipeline'
 
 // The Analytics pillar — a NATIVE Bento dashboard (no Power BI embed). The data
@@ -25,12 +25,8 @@ export type AnalyticsData = {
 }
 
 export async function fetchAnalytics(token: string, signal?: AbortSignal): Promise<AnalyticsData> {
-  const res = await fetch(`${API_BASE}/api/cockpit/analytics`, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal,
-  })
-  if (!res.ok) throw new Error(`analytics ${res.status}`)
-  const data = await res.json() as { status?: string; community?: unknown } & Partial<AnalyticsData>
+  const data = await apiFetch<{ status?: string; community?: unknown } & Partial<AnalyticsData>>(
+    '/api/cockpit/analytics', token, { signal })
   // Backend returns HTTP 200 with {"status":"error"} on DB failures — treat as an error.
   if (data.status === 'error' || !data.community) {
     throw new Error('analytics returned error payload')
@@ -125,23 +121,16 @@ export async function fetchFunnel(
   days: number | null,
   signal?: AbortSignal,
 ): Promise<FunnelData> {
-  const url = days
-    ? `${API_BASE}/api/cockpit/analytics/funnel?days=${days}`
-    : `${API_BASE}/api/cockpit/analytics/funnel`
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, signal })
-  if (!res.ok) throw new Error(`funnel ${res.status}`)
-  const data = await res.json() as { status?: string } & Partial<FunnelData>
+  const path = days
+    ? `/api/cockpit/analytics/funnel?days=${days}`
+    : '/api/cockpit/analytics/funnel'
+  const data = await apiFetch<{ status?: string } & Partial<FunnelData>>(path, token, { signal })
   if (data.status === 'error' || !data.pairs) throw new Error('funnel returned error payload')
   return data as FunnelData
 }
 
 export async function fetchSla(token: string, signal?: AbortSignal): Promise<SlaData> {
-  const res = await fetch(`${API_BASE}/api/cockpit/analytics/sla`, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal,
-  })
-  if (!res.ok) throw new Error(`sla ${res.status}`)
-  return (await res.json()) as SlaData
+  return apiFetch<SlaData>('/api/cockpit/analytics/sla', token, { signal })
 }
 
 /** Format hours into a readable string: 2h, 1d 6h, 3d */
