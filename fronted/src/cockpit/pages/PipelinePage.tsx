@@ -87,17 +87,25 @@ function StageColumn({ stage }: { stage: Stage }) {
             No leads
           </p>
         ) : (
-          stage.leads.map((lead) => <LeadCard key={lead.id} lead={lead} />)
+          // Staggered entrance (E2 §A3): 40ms/row, capped at 6 — a long column
+          // shouldn't cascade for a full second before it's readable.
+          stage.leads.map((lead, i) => (
+            <LeadCard key={lead.id} lead={lead} delayMs={Math.min(i, 6) * 40} />
+          ))
         )}
       </div>
     </div>
   )
 }
 
-function LeadCard({ lead }: { lead: Lead }) {
+function LeadCard({ lead, delayMs = 0 }: { lead: Lead; delayMs?: number }) {
   const channel = lead.channel ? (CHANNEL_LABELS[lead.channel] ?? lead.channel) : null
   return (
-    <GlassPanel depth="card" className="p-3 transition-colors hover:bg-raised">
+    <GlassPanel
+      depth="card"
+      className="cq-rise p-3 transition-colors hover:bg-raised"
+      style={{ animationDelay: `${delayMs}ms` }}
+    >
       <div className="mb-1.5 flex items-start justify-between gap-2">
         <span className="text-sm font-semibold text-ink">{lead.name}</span>
         {channel && <span className="shrink-0 text-xs text-muted">{channel}</span>}

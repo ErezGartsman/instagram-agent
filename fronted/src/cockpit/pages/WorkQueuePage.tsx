@@ -81,6 +81,14 @@ export function WorkQueuePage() {
   const focusId = searchParams.get('focus') ?? undefined
   // ?draft=1 — auto-trigger AI drafting on the top lead (from ⌘K "Draft reply" action)
   const autoDraft = searchParams.get('draft') === '1'
+  // ?act=done|snooze|dismiss — fire an Action Loop move on the focused lead
+  // (from a ⌘K quick action, E2 §A6). Routes through the SAME optimistic +
+  // undo path a manual click would — a ⌘K action is never a silent mutation.
+  const autoActionParam = searchParams.get('act')
+  const autoAction: ActionType | undefined =
+    autoActionParam === 'done' || autoActionParam === 'snooze' || autoActionParam === 'dismiss'
+      ? autoActionParam
+      : undefined
 
   // ── Notifications ─────────────────────────────────────────────────────────
   const { notify } = useNotifications()
@@ -145,6 +153,7 @@ export function WorkQueuePage() {
         liveItems={state.items}
         initialSelectedId={focusId}
         autoDraft={autoDraft}
+        autoAction={autoAction}
         sample={state.sample}
         commit={commit}
         suppressRef={suppressRef}
@@ -169,6 +178,7 @@ function Board({
   liveItems,
   initialSelectedId,
   autoDraft = false,
+  autoAction,
   sample,
   commit,
   suppressRef,
@@ -181,6 +191,9 @@ function Board({
   initialSelectedId?: string
   /** Auto-trigger AI drafting on mount (from ⌘K "Draft reply" action via ?draft=1). */
   autoDraft?: boolean
+  /** Auto-fire an Action Loop move on mount (from ⌘K via ?act=; E2 §A6). Goes
+   *  through the same act() as a manual click — optimistic, undoable. */
+  autoAction?: ActionType
   sample: boolean
   commit: (id: string, type: ActionType, message?: string) => Promise<void>
   suppressRef: { current: boolean }
@@ -413,6 +426,17 @@ function Board({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoDraft, selected?.id, token])
 
+  // Auto-action: ?act=done|snooze|dismiss (from a ⌘K quick action, E2 §A6) —
+  // fires once on mount for the focused lead, through the normal optimistic
+  // act() path, so it's undoable exactly like a manual click.
+  const autoActionFiredRef = useRef(false)
+  useEffect(() => {
+    if (!autoAction || autoActionFiredRef.current) return
+    if (!selected || selected.id !== initialSelectedId) return
+    autoActionFiredRef.current = true
+    act(selected.id, autoAction)
+  }, [autoAction, selected, initialSelectedId, act])
+
   const sendComposed = useCallback(() => {
     const text = draft.trim()
     if (!text || !selected) return
@@ -439,8 +463,15 @@ function Board({
     }
     if (!selected) return
     switch (e.key) {
-      case 'ArrowDown': e.preventDefault(); move(1); break
-      case 'ArrowUp': e.preventDefault(); move(-1); break
+      // j/k are vim-style aliases for the arrow keys (E2 §A6: full keyboard
+      // traversal — j/k/enter/s) so the queue is operable without leaving
+      // the home row.
+      case 'ArrowDown':
+      case 'j':
+      case 'J': e.preventDefault(); move(1); break
+      case 'ArrowUp':
+      case 'k':
+      case 'K': e.preventDefault(); move(-1); break
       case 'Enter':
       case 's':
       case 'S': e.preventDefault(); openComposer(); break
@@ -497,7 +528,7 @@ function Board({
 
             <div className="border-t border-line px-4 py-2.5">
               <span className="font-mono text-[10px] leading-relaxed text-faint">
-                ↑↓ move · ↵ send · E done · Z snooze · ⌫ dismiss
+                ↑↓/jk move · ↵ send · E done · Z snooze · ⌫ dismiss
               </span>
             </div>
           </section>

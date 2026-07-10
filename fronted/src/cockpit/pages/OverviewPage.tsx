@@ -6,6 +6,7 @@ import { queryKeys } from '../lib/queryClient'
 import { Icon } from '../components/Icon'
 import { MorningBriefing } from '../components/MorningBriefing'
 import { SurfaceLoading, SurfaceError } from '../components/SurfaceStates'
+import { AnimatedNumber } from '../components/ui'
 import { useAuth } from '../auth/AuthProvider'
 import { setNavSignals } from '../lib/navSignals'
 import { fetchPipeline, SAMPLE_PIPELINE, STAGE_LABELS, type Stage } from '../lib/pipeline'
@@ -400,7 +401,7 @@ function KpiTile({ kpi, signature = false }: { kpi: Kpi; signature?: boolean }) 
           signature ? 'text-accent' : 'text-ink'
         }`}
       >
-        {kpi.value}
+        <AnimatedNumber value={Number(kpi.value) || 0} />
       </div>
       {kpi.note && <div className="mt-1.5 font-mono text-[9px] text-faint">{kpi.note}</div>}
     </>
@@ -436,9 +437,11 @@ function CommunityTile({ data }: { data: AnalyticsData }) {
         )}
       </div>
       <div className="mt-1.5 flex items-end justify-between gap-4">
-        <span className="font-mono text-[28px] font-light leading-none tabular-nums text-ink">
-          {compact(community.size)}
-        </span>
+        <AnimatedNumber
+          value={community.size}
+          formatter={compact}
+          className="font-mono text-[28px] font-light leading-none tabular-nums text-ink"
+        />
         <Spark points={community.growth.map((g) => g.followers)} className="h-9 w-40" />
       </div>
       <div className="mt-2.5 flex items-center gap-3 font-mono text-[9px] tabular-nums text-faint">
