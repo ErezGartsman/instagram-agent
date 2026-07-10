@@ -20,13 +20,11 @@ All DB work is commit-free; run_agent owns the transaction boundaries.
 
 from __future__ import annotations
 
-import json
 import logging
 
-from nexus import identity as nexus_identity
 from nexus import interactions as nexus_interactions
-from nexus import whatsapp as nexus_whatsapp
 from nexus.agents.base import AgentAction, AgentResult
+from nexus.flows import policy as flow_policy
 
 logger = logging.getLogger("nexus.agents.qualification")
 
@@ -62,7 +60,7 @@ def qualification_agent(conn, person_id: str, run_id: str) -> AgentResult:
         logger.info("[qualification] no open opportunity for %s — skipping", person_id)
         return AgentResult(status="skipped", output={"reason": "no_open_opportunity"})
 
-    opportunity_id, stage, source_channel = opp
+    opportunity_id, stage, _source_channel = opp
 
     # ── 2. Guard: only act on 'engaged' leads ─────────────────────────────────
     if stage != "engaged":
@@ -122,57 +120,37 @@ def qualification_agent(conn, person_id: str, run_id: str) -> AgentResult:
             },
         )
 
-    # ── 5. Resolve WhatsApp recipient ─────────────────────────────────────────
-    recipient = nexus_identity.resolve_whatsapp_recipient(conn, person_id)
-    if not recipient:
-        logger.info(
-            "[qualification] no WhatsApp number for %s — cannot send info request",
-            person_id,
-        )
-        return AgentResult(
-            status="skipped",
-            output={"reason": "no_whatsapp_number", "missing": missing},
-        )
-
-    # ── 6. Compose and send the info request ──────────────────────────────────
+    # ── 5. Compose and send via the Policy Gate ───────────────────────────────
+    # guarded_whatsapp_send (SYSTEM_ELEVATION_PRD.md §B5/F1) unifies this
+    # agent's sends with Flows' — crisis/pressure-budget/quiet-hours/channel-
+    # window checks now apply here for the first time, and the recipient
+    # lookup + outbound_messages persist + 'contacted' log all live there so
+    # they can't drift between this agent and a flow's own send node.
     name       = person.get("name", "")
     first_name = name.split()[0] if name else ""
     message    = _compose_info_request(first_name, missing)
 
-    resp = nexus_whatsapp.send_text(recipient, message)
-    if resp is None:
-        logger.warning(
-            "[qualification] WA send failed for %s (recipient=%s)", person_id, recipient
+    outcome = flow_policy.guarded_whatsapp_send(
+        conn, person_id=person_id, text=message, source="agent:qualification",
+        opportunity_id=opportunity_id,
+    )
+    if not outcome.sent:
+        is_failure = outcome.verdict.reason == "send_failed"
+        logger.log(
+            logging.WARNING if is_failure else logging.INFO,
+            "[qualification] send %s for %s: %s (%s)",
+            "failed" if is_failure else "blocked", person_id,
+            outcome.verdict.reason, outcome.verdict.detail,
         )
         return AgentResult(
-            status="failed",
-            error="WhatsApp send returned None — channel or token issue",
+            status="failed" if is_failure else "skipped",
+            output={"reason": outcome.verdict.reason, "detail": outcome.verdict.detail, "missing": missing},
+            error="WhatsApp send returned no response — channel or token issue" if is_failure else None,
         )
 
-    message_id = _extract_message_id(resp)
+    message_id = outcome.provider_message_id
 
-    # ── 7. Persist to outbound_messages ──────────────────────────────────────
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO outbound_messages "
-            "  (person_id, opportunity_id, channel, body, provider_message_id, sent_by) "
-            "VALUES (%s, %s, 'whatsapp', %s, %s, %s)",
-            (person_id, opportunity_id, message, message_id, "agent:qualification"),
-        )
-
-    # Log a 'contacted' signal (ref-only — never the message body).
-    nexus_interactions.log_interaction(
-        conn, "contacted", source_channel or "whatsapp",
-        person_id=person_id,
-        payload={
-            "by": "agent:qualification",
-            "via": "agent",
-            "message_id": message_id,
-            "length": len(message),
-        },
-    )
-
-    # ── 8. Insert info_requests row (idempotency table for future sweeps) ────
+    # ── 6. Insert info_requests row (idempotency table for future sweeps) ────
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO info_requests "
@@ -190,7 +168,6 @@ def qualification_agent(conn, person_id: str, run_id: str) -> AgentResult:
             AgentAction(
                 action_type="whatsapp_sent",
                 payload={
-                    "recipient": recipient,
                     "missing_fields": missing,
                     "message_id": message_id,
                 },
@@ -302,12 +279,3 @@ def _compose_info_request(first_name: str, missing: list[str]) -> str:
 
     lines += ["", "תודה רבה 🙏"]
     return "\n".join(lines)
-
-
-def _extract_message_id(resp: str | None) -> str | None:
-    """Best-effort pull of the wamid from a Meta/Kapso send response."""
-    try:
-        msgs = (json.loads(resp or "") or {}).get("messages") or []
-        return msgs[0].get("id") if msgs else None
-    except Exception:
-        return None

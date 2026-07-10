@@ -27,6 +27,7 @@ INTERACTION_KINDS = {
     "outreach_click", "contacted", "note_added", "merged", "alert_sent",
     "crm_synced", "formation_run",
     "handled", "snoozed",            # cockpit Action Loop — operator queue moves
+    "flag_set",                      # Flows action:set_flag (nexus/flows/runner.py)
 }
 
 # Forward-only pipeline. 'booked' may be reached from any open stage (a lead
