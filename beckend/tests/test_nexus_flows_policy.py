@@ -185,6 +185,16 @@ class TestEvaluateSendOrdering:
 # ── guarded_whatsapp_send — the orchestration ────────────────────────────────────
 
 class TestGuardedWhatsappSend:
+    @pytest.fixture(autouse=True)
+    def _freeze_quiet_hours_off(self, monkeypatch):
+        """guarded_whatsapp_send calls evaluate_send WITHOUT a `now`, so its
+        quiet-hours check reads the real wall clock — which made these
+        orchestration tests non-deterministic (they failed whenever CI ran
+        between 21:00 and 09:00 Israel time). Freeze quiet hours OFF here so
+        each test exercises the exact code path it names; the quiet-hours
+        rule itself is covered deterministically by TestQuietHoursBlock."""
+        monkeypatch.setattr(policy, "quiet_hours_block", lambda now=None: False)
+
     def _configure_permissive(self):
         policy.configure(
             is_crisis_fn=lambda text: False,

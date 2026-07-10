@@ -355,6 +355,25 @@
 .cockpit-root .cq-search:focus-within svg,
 .cockpit-root .cq-field:focus-within svg { color: var(--color-glow); }
 
+/* ── Flows canvas — electric current flowing along a traversed edge ──────────
+   A dashed overlay stroke that marches forward, reading as the run's path
+   lighting up. Draw cost: stroke-dashoffset only. Killed by reduced motion. */
+@keyframes cq-flow-dash {
+  to { stroke-dashoffset: -24; }
+}
+.cockpit-root .cq-flow-edge {
+  stroke-dasharray: 3 9;
+  animation: cq-flow-dash 0.9s linear infinite;
+}
+
+/* ── Flows canvas — the parked (waiting) node breathes, awaiting its timer ───
+   Opacity-only halo swell on the one node a run is currently parked at. */
+@keyframes cq-node-wait {
+  0%, 100% { opacity: 0.35; }
+  50%      { opacity: 0.85; }
+}
+.cockpit-root .cq-node-wait { animation: cq-node-wait 2.4s ease-in-out infinite; }
+
 @media (prefers-reduced-motion: reduce) {
   .cockpit-root *,
   .cockpit-root *::before,
