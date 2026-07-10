@@ -10,7 +10,15 @@ import datetime
 import pytest
 
 from nexus.flows import policy
+from nexus.flows import verifier as flow_verifier
 from tests._flows_fakes import FakeConn
+
+
+@pytest.fixture(autouse=True)
+def _memory_dir(tmp_path, monkeypatch):
+    # guarded_whatsapp_send records blocks/failures to flows memory — keep
+    # every test's writes in a throwaway dir, never the real ledger.
+    monkeypatch.setenv("FLOWS_MEMORY_DIR", str(tmp_path / "flows_memory"))
 
 
 # ── Pure sub-checks ─────────────────────────────────────────────────────────────
@@ -225,6 +233,58 @@ class TestGuardedWhatsappSend:
         outcome = policy.guarded_whatsapp_send(conn, person_id="p1", text="hi", source="flow:x")
         assert outcome.sent is False
         assert outcome.verdict.reason == "send_failed"
+
+    def test_verifier_reject_blocks_after_policy_passes(self, monkeypatch):
+        self._configure_permissive()
+        verification = flow_verifier.SendVerification(
+            decision="reject",
+            verdicts=[flow_verifier.VerifierVerdict("duplicate_content", "reject",
+                                                    reason="duplicate_content")],
+            blocking=flow_verifier.VerifierVerdict("duplicate_content", "reject",
+                                                   reason="duplicate_content"),
+        )
+        monkeypatch.setattr(flow_verifier, "verify_send", lambda conn, **kw: verification)
+        called = {"send": False}
+        monkeypatch.setattr(policy.nexus_whatsapp, "send_text",
+                            lambda r, t: called.__setitem__("send", True) or "{}")
+        conn = FakeConn(fetchone_queue=[None, (0,)])
+        outcome = policy.guarded_whatsapp_send(conn, person_id="p1", text="hi", source="flow:x")
+        assert outcome.sent is False
+        assert outcome.verdict.reason == "verifier:duplicate_content"
+        assert outcome.verification is verification
+        assert called["send"] is False   # transport never touched
+
+    def test_verifier_defer_carries_the_backoff(self, monkeypatch):
+        self._configure_permissive()
+        verification = flow_verifier.SendVerification(
+            decision="defer",
+            verdicts=[flow_verifier.VerifierVerdict("recent_inbound", "defer",
+                                                    reason="recent_inbound_activity",
+                                                    defer_hours=2.0)],
+            blocking=flow_verifier.VerifierVerdict("recent_inbound", "defer",
+                                                   reason="recent_inbound_activity",
+                                                   defer_hours=2.0),
+        )
+        monkeypatch.setattr(flow_verifier, "verify_send", lambda conn, **kw: verification)
+        conn = FakeConn(fetchone_queue=[None, (0,)])
+        outcome = policy.guarded_whatsapp_send(conn, person_id="p1", text="hi", source="flow:x")
+        assert outcome.sent is False
+        assert outcome.verdict.reason == "verifier_defer:recent_inbound_activity"
+        assert outcome.defer_hours == 2.0
+
+    def test_policy_block_is_recorded_to_failure_memory(self, monkeypatch, tmp_path):
+        policy.configure(
+            is_crisis_fn=lambda text: True,
+            channel_eligibility_fn=lambda conn, pid, ch: {"eligible": True, "reason": None},
+            get_config_fn=lambda k: "",
+            notify_operator_fn=None,
+        )
+        conn = FakeConn(fetchone_queue=[("i want to end it all",)])
+        policy.guarded_whatsapp_send(conn, person_id="p1", text="hi", source="flow:x")
+        import os
+        mem_file = os.path.join(os.environ["FLOWS_MEMORY_DIR"], "failures.jsonl")
+        content = open(mem_file, encoding="utf-8").read()
+        assert "policy_blocked" in content and '"crisis"' in content
 
     def test_happy_path_sends_persists_and_logs(self, monkeypatch):
         self._configure_permissive()

@@ -28,9 +28,11 @@ import json
 import logging
 
 from nexus import interactions as nexus_interactions
+from nexus.flows import memory as flow_memory
 from nexus.flows import policy as flow_policy
 from nexus.flows import predicates as flow_predicates
 from nexus.flows import signals as flow_signals
+from nexus.flows import verifier as flow_verifier
 
 logger = logging.getLogger("nexus.flows.runner")
 
@@ -42,13 +44,17 @@ _MAX_STEPS_PER_CLAIM = 25
 class StepResult:
     def __init__(
         self, status: str, *, output: dict | None = None, error: str | None = None,
-        next_node: str | None = None,
+        next_node: str | None = None, park_at_current: bool = False,
     ):
         # 'success' | 'shadow' | 'blocked' | 'failed' | 'waiting'
         self.status = status
         self.output = output or {}
         self.error = error
         self.next_node = next_node   # explicit override (unused in V1; reserved)
+        # 'waiting' only: park the run pointing at THIS node so it re-executes
+        # on resume (a verifier defer = retry the send later), instead of the
+        # default park-past-it (a wait node = continue beyond it).
+        self.park_at_current = park_at_current
 
 
 def run_sweep(conn, *, limit: int = 20) -> dict:
@@ -62,7 +68,31 @@ def run_sweep(conn, *, limit: int = 20) -> dict:
     summary = {"resumed": resumed, "claimed": len(claimed),
                "success": 0, "waiting": 0, "failed": 0, "continuing": 0}
     for run in claimed:
-        outcome = _drive(conn, run)
+        # Per-run SAVEPOINT isolation (the hooks.py discipline): one poisoned
+        # run rolls back ITS OWN statements and fails alone — it can neither
+        # abort the shared transaction for the runs after it nor kill the
+        # sweep loop. The F1 review found both failure modes latent here.
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SAVEPOINT flows_run")
+            outcome = _drive(conn, run)
+            with conn.cursor() as cur:
+                cur.execute("RELEASE SAVEPOINT flows_run")
+        except Exception as exc:
+            logger.exception("[runner] run %s crashed — isolating", run["id"])
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("ROLLBACK TO SAVEPOINT flows_run")
+                    cur.execute("RELEASE SAVEPOINT flows_run")
+                _fail_run(conn, run["id"], f"{type(exc).__name__}: {exc}")
+            except Exception as e2:
+                logger.warning("[runner] rollback/fail after crash also failed: %s", e2)
+            flow_memory.record_failure(
+                "run_crashed", flow_slug=run.get("flow_slug"),
+                person_id=run.get("person_id"),
+                reason=type(exc).__name__, detail=str(exc),
+            )
+            outcome = "failed"
         summary[outcome] = summary.get(outcome, 0) + 1
     return summary
 
@@ -73,7 +103,7 @@ def _claim_running(conn, *, limit: int) -> list[dict]:
     with conn.cursor() as cur:
         cur.execute(
             "SELECT fr.id, fr.flow_id, fr.person_id, fr.cursor_node, fr.context, "
-            "       fd.slug, fd.live, fd.graph "
+            "       fd.slug, fd.live, fd.graph, fd.trigger "
             "FROM flow_runs fr JOIN flow_definitions fd ON fd.id = fr.flow_id "
             "WHERE fr.status = 'running' AND fd.status IN ('published', 'paused') "
             "ORDER BY fr.started_at ASC LIMIT %s "
@@ -87,6 +117,7 @@ def _claim_running(conn, *, limit: int) -> list[dict]:
             "id": str(r[0]), "flow_id": str(r[1]), "person_id": str(r[2]),
             "cursor_node": r[3], "context": dict(r[4] or {}),
             "flow_slug": r[5], "flow_live": bool(r[6]), "graph": r[7],
+            "trigger": r[8] or {},
         })
     return runs
 
@@ -149,11 +180,14 @@ def _drive(conn, run: dict) -> str:
 
         # Compute the NEXT node before branching on status — a park on
         # 'waiting' must resume PAST the wait node, never re-execute it (that
-        # would insert a fresh flow_timers row and wait forever).
+        # would insert a fresh flow_timers row and wait forever). The one
+        # exception: park_at_current (a verifier defer) resumes AT the node,
+        # because a deferred send must be re-attempted, not skipped.
         next_cursor = result.next_node or _next_node_id(edges, cursor, node.get("type"), last_condition_result)
 
         if result.status == "waiting":
-            _park_waiting(conn, run["id"], next_cursor, context)
+            _park_waiting(conn, run["id"],
+                          cursor if result.park_at_current else next_cursor, context)
             return "waiting"
         if result.status == "failed":
             _fail_run(conn, run["id"], result.error or "node failed")
@@ -257,13 +291,42 @@ def _exec_set_flag(conn, run, node, context) -> StepResult:
 def _exec_send_message(conn, run, node, context) -> StepResult:
     body = node.get("body", "")
     if not run["flow_live"]:
-        return StepResult("shadow", output={"would_send": body, "channel": "whatsapp"})
+        # Shadow mode runs the FULL Verifier Loop read-only (record=False so
+        # an observed flow can't open a real circuit) and records the panel's
+        # verdicts on the step — shadow review shows not just what would have
+        # been sent, but whether it would have been vetoed and by whom.
+        verification = flow_verifier.verify_send(
+            conn, person_id=run["person_id"], text=body,
+            source=f"flow:{run['flow_slug']}", flow_slug=run["flow_slug"],
+            trigger=run.get("trigger"), record=False,
+        )
+        return StepResult("shadow", output={
+            "would_send": body, "channel": "whatsapp",
+            "verification": verification.as_dict(),
+        })
     outcome = flow_policy.guarded_whatsapp_send(
         conn, person_id=run["person_id"], text=body,
         source=f"flow:{run['flow_slug']}", opportunity_id=context.get("opportunity_id"),
+        flow_slug=run["flow_slug"], trigger=run.get("trigger"),
     )
     if not outcome.sent:
-        return StepResult("blocked", output={"reason": outcome.verdict.reason, "detail": outcome.verdict.detail})
+        output = {"reason": outcome.verdict.reason, "detail": outcome.verdict.detail}
+        if outcome.verification is not None:
+            output["verification"] = outcome.verification.as_dict()
+        # A verifier DEFER parks the run pointing at this node and retries
+        # after the panel's suggested backoff — reuses the durable-wait
+        # machinery instead of dropping the send on the floor.
+        if outcome.defer_hours:
+            fire_at = (datetime.datetime.now(datetime.timezone.utc)
+                       + datetime.timedelta(hours=outcome.defer_hours))
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO flow_timers (flow_run_id, fire_at) VALUES (%s, %s)",
+                    (run["id"], fire_at),
+                )
+            output["retry_at"] = fire_at.isoformat()
+            return StepResult("waiting", output=output, park_at_current=True)
+        return StepResult("blocked", output=output)
     return StepResult("success", output={"provider_message_id": outcome.provider_message_id})
 
 

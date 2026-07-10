@@ -10,16 +10,21 @@ import pytest
 
 from nexus.flows import policy as flow_policy
 from nexus.flows import runner
+from nexus.flows import verifier as flow_verifier
 from tests._flows_fakes import FakeConn
 
 
 @pytest.fixture(autouse=True)
-def _flows_on(monkeypatch):
+def _flows_on(tmp_path, monkeypatch):
     monkeypatch.setattr(flow_policy, "flows_enabled", lambda: True)
+    # Point the flows memory at a throwaway dir — runner paths (shadow
+    # verification, crash isolation) write failure/lesson records.
+    monkeypatch.setenv("FLOWS_MEMORY_DIR", str(tmp_path / "flows_memory"))
 
 
-def _run_row(id_, flow_id, person_id, cursor_node, context, slug, live, graph):
-    return (id_, flow_id, person_id, cursor_node, context, slug, live, graph)
+def _run_row(id_, flow_id, person_id, cursor_node, context, slug, live, graph, trigger=None):
+    # Mirrors _claim_running's SELECT: ... fd.graph, fd.trigger
+    return (id_, flow_id, person_id, cursor_node, context, slug, live, graph, trigger or {})
 
 
 # A single-node graph: trigger -> notify_operator, no condition/branch.
@@ -79,6 +84,36 @@ class TestShadowMode:
         runner.run_sweep(conn)
         assert called["sent"] is False
 
+    def test_shadow_send_step_carries_the_verifier_panel(self, monkeypatch):
+        """Shadow review must show not just what WOULD send, but whether the
+        panel would have vetoed it — the F1 observability gap, closed."""
+        verification = flow_verifier.SendVerification(
+            decision="reject",
+            verdicts=[flow_verifier.VerifierVerdict("staleness", "reject", reason="stale_trigger")],
+            blocking=flow_verifier.VerifierVerdict("staleness", "reject", reason="stale_trigger"),
+        )
+        seen = {}
+        def fake_verify(conn, **kw):
+            seen.update(kw)
+            return verification
+        monkeypatch.setattr(flow_verifier, "verify_send", fake_verify)
+        graph = {
+            "nodes": [{"id": "t1", "type": "trigger"},
+                     {"id": "n1", "type": "action:send_message", "body": "hi"}],
+            "edges": [{"from": "t1", "to": "n1"}],
+        }
+        trigger = {"type": "state", "predicate": {"field": "stage", "op": "eq", "value": "qualified"}}
+        conn = FakeConn(
+            fetchall_queue=[[], [_run_row("r1", "f1", "p1", None, {}, "x", False, graph, trigger)], []],
+        )
+        runner.run_sweep(conn)
+        assert seen["record"] is False          # observed flows can't open real circuits
+        assert seen["trigger"] == trigger       # staleness gets the run's trigger
+        step_stmts = [(s, p) for s, p in conn.executed if s.startswith("INSERT INTO flow_run_steps")]
+        shadow_step = step_stmts[1]
+        assert shadow_step[1][3] == "shadow"
+        assert '"stale_trigger"' in shadow_step[1][5]   # panel verdicts in the output JSON
+
 
 class TestLiveSendMessage:
     def test_live_flow_calls_guarded_send_and_records_success(self, monkeypatch):
@@ -119,6 +154,32 @@ class TestLiveSendMessage:
         assert summary["success"] == 1   # the RUN completes; the STEP is 'blocked'
         step_stmts = [(s, p) for s, p in conn.executed if s.startswith("INSERT INTO flow_run_steps")]
         assert step_stmts[1][1][3] == "blocked"
+
+    def test_live_flow_verifier_defer_parks_at_the_send_node_with_a_timer(self, monkeypatch):
+        """A deferred send is a retry, not a skip: the run parks pointing AT
+        the send node with a timer at the panel's suggested backoff."""
+        outcome = flow_policy.SendOutcome(
+            sent=False,
+            verdict=flow_policy.PolicyVerdict(False, "verifier_defer:recent_inbound_activity",
+                                              "inbound within 2h"),
+            defer_hours=2.0,
+        )
+        monkeypatch.setattr(flow_policy, "guarded_whatsapp_send", lambda *a, **k: outcome)
+        graph = {
+            "nodes": [{"id": "t1", "type": "trigger"},
+                     {"id": "n1", "type": "action:send_message", "body": "hi"}],
+            "edges": [{"from": "t1", "to": "n1"}],
+        }
+        conn = FakeConn(
+            fetchall_queue=[[], [_run_row("r1", "f1", "p1", None, {}, "x", True, graph)], []],
+        )
+        summary = runner.run_sweep(conn)
+        assert summary["waiting"] == 1
+        timer_stmts = [s for s, _ in conn.executed if s.startswith("INSERT INTO flow_timers")]
+        assert len(timer_stmts) == 1
+        park_stmts = [(s, p) for s, p in conn.executed
+                     if s.startswith("UPDATE flow_runs SET status = 'waiting'")]
+        assert park_stmts[0][1][0] == "n1"   # parked AT the send node — retry, not skip
 
 
 class TestCondition:
@@ -304,6 +365,41 @@ class TestMalformedGraph:
         )
         summary = runner.run_sweep(conn)
         assert summary["failed"] == 1
+
+    def test_crashed_run_is_isolated_by_savepoint_and_the_sweep_continues(self, monkeypatch, tmp_path):
+        """The F1 review's failure-isolation gap, closed: an exception
+        ESCAPING one run's graph walk rolls back only that run's statements
+        (SAVEPOINT), marks it failed, records the crash to failure memory —
+        and the next claimed run still executes."""
+        graph = {"nodes": [{"id": "t1", "type": "trigger"}], "edges": []}
+        calls = {"n": 0}
+        real_drive = runner._drive
+
+        def flaky_drive(conn, run):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("poisoned run")
+            return real_drive(conn, run)
+
+        monkeypatch.setattr(runner, "_drive", flaky_drive)
+        conn = FakeConn(
+            fetchall_queue=[
+                [],   # timers
+                [_run_row("r1", "f1", "p1", None, {}, "x", False, graph),
+                 _run_row("r2", "f1", "p2", None, {}, "x", False, graph)],
+                [],   # signals for r2
+            ],
+        )
+        summary = runner.run_sweep(conn)
+        assert summary["failed"] == 1
+        assert summary["success"] == 1   # the second run was NOT collateral damage
+        rollback_stmts = [s for s, _ in conn.executed if s.startswith("ROLLBACK TO SAVEPOINT flows_run")]
+        assert len(rollback_stmts) == 1
+        fail_stmts = [s for s, _ in conn.executed if s.startswith("UPDATE flow_runs SET status = 'failed'")]
+        assert len(fail_stmts) == 1
+        import os
+        mem_file = os.path.join(os.environ["FLOWS_MEMORY_DIR"], "failures.jsonl")
+        assert "run_crashed" in open(mem_file, encoding="utf-8").read()
 
     def test_step_budget_exhaustion_parks_as_continuing_not_failed(self):
         # A trivial cycle: t1 -> n1 -> n1 -> n1 ... forever.

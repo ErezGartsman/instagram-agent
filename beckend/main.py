@@ -53,6 +53,7 @@ from nexus import whatsapp as nexus_whatsapp
 from nexus.agents.base import run_agent  # noqa: F401 — used by routers/* via main.<name> (E0 late-binding contract)
 from nexus.agents.qualification import qualification_agent  # noqa: F401 — used by routers/* via main.<name> (E0 late-binding contract)
 from nexus.flows import dispatcher as nexus_flows_dispatcher  # noqa: F401 — used by routers/* via main.<name> (E0 late-binding contract)
+from nexus.flows import memory as nexus_flows_memory  # noqa: F401 — used by routers/* via main.<name> (E0 late-binding contract)
 from nexus.flows import policy as nexus_flows_policy
 from nexus.flows import runner as nexus_flows_runner  # noqa: F401 — used by routers/* via main.<name> (E0 late-binding contract)
 import scheduler as nexus_scheduler

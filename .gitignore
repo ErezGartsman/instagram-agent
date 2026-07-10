@@ -71,6 +71,9 @@ beckend/scripts/*
 !fronted/scripts/
 fronted/scripts/*
 !fronted/scripts/check-bundle-budget.mjs
+# Flows runtime memory ledgers (F2) — runtime state; only the README is source.
+beckend/flows_memory/*
+!beckend/flows_memory/README.md
 orchestrator.py
 node_modules/
 .ig-profile/
