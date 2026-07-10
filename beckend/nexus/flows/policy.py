@@ -42,6 +42,8 @@ from zoneinfo import ZoneInfo
 from nexus import identity as nexus_identity
 from nexus import interactions as nexus_interactions
 from nexus import whatsapp as nexus_whatsapp
+from nexus.flows import memory as flow_memory
+from nexus.flows import verifier as flow_verifier
 
 logger = logging.getLogger("nexus.flows.policy")
 
@@ -96,6 +98,13 @@ class SendOutcome:
     sent: bool
     verdict: PolicyVerdict
     provider_message_id: str | None = None
+    # The Verifier Loop's full panel record (nexus/flows/verifier.py) — None
+    # when the Policy Gate itself vetoed before the panel convened.
+    verification: "flow_verifier.SendVerification | None" = None
+    # Set when the panel said "defer": callers that can park-and-retry (the
+    # flow runner) should retry after this many hours; callers that can't
+    # (the qualification agent) treat it as a skip.
+    defer_hours: float | None = None
 
 
 # ── Pure sub-checks (no DB) ─────────────────────────────────────────────────────
@@ -229,12 +238,18 @@ def guarded_whatsapp_send(
     text: str,
     source: str,
     opportunity_id: str | None = None,
+    flow_slug: str | None = None,
+    trigger: dict | None = None,
 ) -> SendOutcome:
-    """Evaluate + (if allowed) send + persist to outbound_messages + log the
-    'contacted' interaction — the ONE path every automated WhatsApp send
-    should use. `source` becomes outbound_messages.sent_by — MUST start with
-    'agent:' / 'flow:' / 'cron:' (asserted) so the pressure-budget count sees
-    it and it's visually distinct from a manual operator send in the thread.
+    """Evaluate (Policy Gate, then the Verifier Loop panel) + (if allowed)
+    send + persist to outbound_messages + log the 'contacted' interaction —
+    the ONE path every automated WhatsApp send should use. `source` becomes
+    outbound_messages.sent_by — MUST start with 'agent:' / 'flow:' / 'cron:'
+    (asserted) so the pressure-budget count sees it and it's visually
+    distinct from a manual operator send in the thread.
+
+    flow_slug/trigger are optional run context — when present, the panel's
+    staleness verifier re-checks the trigger predicate against live signals.
     Commit-free — caller owns the transaction, matching the rest of the
     codebase's send call sites (qualification_agent, route_and_send)."""
     if not source.startswith(_AUTOMATED_SENT_BY_PREFIXES):
@@ -250,20 +265,54 @@ def guarded_whatsapp_send(
             "[policy] blocked send to %s (source=%s): %s — %s",
             person_id, source, verdict.reason, verdict.detail,
         )
+        flow_memory.record_failure(
+            "policy_blocked", flow_slug=flow_slug or source, person_id=person_id,
+            reason=verdict.reason, detail=verdict.detail,
+        )
         return SendOutcome(sent=False, verdict=verdict)
+
+    # The Verifier Loop — the multi-agent review panel (nexus/flows/verifier.py).
+    verification = flow_verifier.verify_send(
+        conn, person_id=person_id, text=text, source=source,
+        flow_slug=flow_slug, trigger=trigger,
+    )
+    if not verification.approved:
+        blocking = verification.blocking
+        logger.info(
+            "[policy] verifier %s send to %s (source=%s): %s — %s",
+            verification.decision, person_id, source,
+            blocking.reason if blocking else "?", blocking.detail if blocking else "",
+        )
+        reason_prefix = "verifier" if verification.decision == "reject" else "verifier_defer"
+        return SendOutcome(
+            sent=False,
+            verdict=PolicyVerdict(
+                False,
+                f"{reason_prefix}:{blocking.reason if blocking else 'unknown'}",
+                blocking.detail if blocking else "",
+            ),
+            verification=verification,
+            defer_hours=blocking.defer_hours if blocking else None,
+        )
 
     recipient = nexus_identity.resolve_whatsapp_recipient(conn, person_id)
     if not recipient:
         return SendOutcome(
             sent=False,
             verdict=PolicyVerdict(False, "no_whatsapp_number", "no reachable WhatsApp identity"),
+            verification=verification,
         )
 
     resp = nexus_whatsapp.send_text(recipient, text)
     if resp is None:
+        flow_memory.record_failure(
+            "send_failed", flow_slug=flow_slug or source, person_id=person_id,
+            reason="transport_no_response",
+        )
         return SendOutcome(
             sent=False,
             verdict=PolicyVerdict(False, "send_failed", "channel transport returned no response"),
+            verification=verification,
         )
 
     message_id = _extract_wamid(resp)
@@ -278,7 +327,8 @@ def guarded_whatsapp_send(
         conn, "contacted", "whatsapp", person_id=person_id,
         payload={"by": source, "via": "policy_gate", "message_id": message_id, "length": len(text)},
     )
-    return SendOutcome(sent=True, verdict=verdict, provider_message_id=message_id)
+    return SendOutcome(sent=True, verdict=verdict, provider_message_id=message_id,
+                       verification=verification)
 
 
 def notify_operator(text: str) -> str | None:

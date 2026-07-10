@@ -26,7 +26,10 @@ router = APIRouter()
 def _run_sweep_cycle() -> dict:
     """Dispatch events, dispatch states, then run the executor — each phase
     its own commit, so a failure in a later phase never rolls back runs a
-    prior phase already dispatched (SYSTEM_ELEVATION_PRD.md §B3)."""
+    prior phase already dispatched (SYSTEM_ELEVATION_PRD.md §B3). The cycle's
+    cost lands in the flows memory efficiency ledger — the optimization
+    record for tuning cadence and batch limits."""
+    started = main.time.perf_counter()
     events_dispatched = 0
     states_dispatched = 0
     with main.get_db_conn() as conn:
@@ -38,6 +41,15 @@ def _run_sweep_cycle() -> dict:
     with main.get_db_conn() as conn:
         run_summary = main.nexus_flows_runner.run_sweep(conn)
         conn.commit()
+    main.nexus_flows_memory.record_efficiency(
+        "sweep_cycle",
+        duration_ms=(main.time.perf_counter() - started) * 1000,
+        counts={
+            "events_dispatched": events_dispatched,
+            "states_dispatched": states_dispatched,
+            **{k: v for k, v in run_summary.items() if isinstance(v, int)},
+        },
+    )
     return {
         "events_dispatched": events_dispatched,
         "states_dispatched": states_dispatched,
