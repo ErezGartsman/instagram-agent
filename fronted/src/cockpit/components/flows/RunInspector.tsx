@@ -38,7 +38,7 @@ export function RunInspector({
   canSweep: boolean
 }) {
   return (
-    <aside className="flex h-full w-[384px] shrink-0 flex-col border-l border-line">
+    <aside className="flex h-full w-[384px] shrink-0 flex-col">
       {selectedRun ? (
         <RunDetail
           run={selectedRun}

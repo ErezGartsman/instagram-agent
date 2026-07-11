@@ -1,5 +1,5 @@
 import type { LucideIcon } from 'lucide-react'
-import { LayoutGrid, ListChecks, Columns3, Sparkles, ChartColumn, Workflow } from 'lucide-react'
+import { LayoutGrid, ListChecks, Columns3, Sparkles, ChartColumn, Zap } from 'lucide-react'
 import { FEATURES } from '../lib/flags'
 
 export type NavItem = { to: string; label: string; icon: LucideIcon }
@@ -43,7 +43,9 @@ export const NAV_SECTIONS: NavSection[] = [
   {
     label: 'Automate',
     items: [
-      ...(FEATURES.flows ? [{ to: '/app/flows', label: 'Flows', icon: Workflow }] : []),
+      // Renamed from "Flows" 2026-07-11: the node canvas is gone; automations
+      // are now sentence-form Playbooks (same route, same engine).
+      ...(FEATURES.flows ? [{ to: '/app/flows', label: 'Playbooks', icon: Zap }] : []),
     ],
   },
 ]

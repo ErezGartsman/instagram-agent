@@ -1,46 +1,13 @@
+import { parsePredicate, buildPredicate, STAGES } from '../../lib/playbook'
+
 /**
  * PredicateBuilder — a bounded, safe editor for the common flow predicate:
  * "stage is one of [...] AND the lead has been quiet ≥ N hours". Shared by the
- * state-trigger editor and condition nodes. A predicate that doesn't fit this
- * shape shows a read-only note rather than risk corrupting a hand-authored one
- * (F3 V1 — the builder covers what the seeded/typical flows need).
+ * state-trigger editor and 'only if' steps in the composer. The pure
+ * parse/build logic lives in lib/playbook (tested there); a predicate that
+ * doesn't fit the editable shape shows a read-only note rather than risk
+ * corrupting a hand-authored one.
  */
-const STAGES = ['engaged', 'qualified', 'captured', 'briefed', 'booked'] as const
-
-type Model = { stages: string[]; hours: number | null }
-
-export function parsePredicate(pred: unknown): Model | null {
-  if (!pred || typeof pred !== 'object') return { stages: [], hours: null }
-  const p = pred as Record<string, unknown>
-  // A fresh state trigger has no predicate yet — start from a blank model.
-  if (Object.keys(p).length === 0) return { stages: [], hours: null }
-  const clauses = Array.isArray(p.all) ? (p.all as Record<string, unknown>[]) : [p]
-  const model: Model = { stages: [], hours: null }
-  let recognized = 0
-  for (const c of clauses) {
-    if (c.field === 'stage' && c.op === 'in' && Array.isArray(c.value)) {
-      model.stages = (c.value as string[]).filter((s) => STAGES.includes(s as typeof STAGES[number]))
-      recognized++
-    } else if (c.field === 'stage' && c.op === 'eq' && typeof c.value === 'string') {
-      model.stages = [c.value]
-      recognized++
-    } else if (c.field === 'hours_since_last' && c.op === 'gte' && typeof c.value === 'number') {
-      model.hours = c.value
-      recognized++
-    } else {
-      return null // an unrecognized clause — don't pretend we can edit it
-    }
-  }
-  return recognized > 0 || Object.keys(p).length === 0 ? model : null
-}
-
-export function buildPredicate(model: Model): Record<string, unknown> {
-  const clauses: Record<string, unknown>[] = []
-  if (model.stages.length) clauses.push({ field: 'stage', op: 'in', value: model.stages })
-  if (model.hours != null) clauses.push({ field: 'hours_since_last', op: 'gte', value: model.hours })
-  if (clauses.length === 1) return clauses[0]
-  return { all: clauses }
-}
 
 export function PredicateBuilder({
   predicate,
