@@ -152,6 +152,110 @@ export async function triggerFlowsSweep(token: string): Promise<SweepResult | nu
   }
 }
 
+// ── Authoring (F3) ────────────────────────────────────────────────────────────
+
+/** The 90-day simulation impact report (nexus/flows/simulate.py). */
+export type SimulationReport = {
+  window_days: number
+  trigger_type: string
+  fires: number
+  actions: Record<string, number>
+  blocked: number
+  blocked_by: Record<string, number>
+  sample: { person_name: string; at: string; outcome: string; reason: string | null }[]
+  notes: string[]
+}
+
+type FlowDraftBody = {
+  name?: string
+  description?: string | null
+  trigger?: FlowTrigger
+  graph?: FlowGraph
+}
+
+export async function createFlow(token: string, body: FlowDraftBody): Promise<{ id: string }> {
+  return apiFetch<{ id: string }>('/api/cockpit/flows', token, {
+    method: 'POST', body: JSON.stringify(body),
+  })
+}
+
+export async function updateFlow(token: string, id: string, body: FlowDraftBody): Promise<void> {
+  await apiFetch(`/api/cockpit/flows/${encodeURIComponent(id)}`, token, {
+    method: 'PATCH', body: JSON.stringify(body),
+  })
+}
+
+export async function forkFlow(token: string, id: string): Promise<{ id: string }> {
+  return apiFetch<{ id: string }>(`/api/cockpit/flows/${encodeURIComponent(id)}/fork`, token, { method: 'POST' })
+}
+
+export async function simulateFlow(
+  token: string, id: string, body?: { graph?: FlowGraph; trigger?: FlowTrigger },
+): Promise<SimulationReport> {
+  const data = await apiFetch<{ report: SimulationReport }>(
+    `/api/cockpit/flows/${encodeURIComponent(id)}/simulate`, token,
+    { method: 'POST', body: JSON.stringify(body ?? {}) },
+  )
+  return data.report
+}
+
+export async function publishFlow(token: string, id: string): Promise<SimulationReport> {
+  const data = await apiFetch<{ report: SimulationReport }>(
+    `/api/cockpit/flows/${encodeURIComponent(id)}/publish`, token, { method: 'POST' },
+  )
+  return data.report
+}
+
+export async function setFlowStatus(
+  token: string, id: string, action: 'pause' | 'resume' | 'archive',
+): Promise<void> {
+  await apiFetch(`/api/cockpit/flows/${encodeURIComponent(id)}/status`, token, {
+    method: 'POST', body: JSON.stringify({ action }),
+  })
+}
+
+export async function setFlowLive(token: string, id: string, live: boolean): Promise<void> {
+  await apiFetch(`/api/cockpit/flows/${encodeURIComponent(id)}/live`, token, {
+    method: 'POST', body: JSON.stringify({ live }),
+  })
+}
+
+export async function updateFlowSettings(
+  token: string, body: { enabled?: boolean; pressure_budget?: number },
+): Promise<{ enabled: boolean; pressure_budget: number }> {
+  return apiFetch<{ enabled: boolean; pressure_budget: number }>(
+    '/api/cockpit/flow-settings', token, { method: 'PATCH', body: JSON.stringify(body) },
+  )
+}
+
+/** Blank starter graph for a new draft — a trigger wired to a notify node. */
+export function blankGraph(): FlowGraph {
+  return {
+    nodes: [
+      { id: 'trigger', type: 'trigger' },
+      { id: 'n1', type: 'action:notify_operator', body: 'A lead needs your attention.' },
+    ],
+    edges: [{ from: 'trigger', to: 'n1' }],
+  }
+}
+
+/** The node types a user can add from the palette (trigger is fixed, one per flow). */
+export const ADDABLE_NODE_TYPES: string[] = [
+  'condition', 'wait', 'action:send_message', 'action:notify_operator',
+  'action:advance_stage', 'action:add_note', 'action:set_flag',
+]
+
+/** Reason-code → plain language for the simulation's blocked breakdown. */
+export const BLOCK_REASON_LABEL: Record<string, string> = {
+  crisis: 'Crisis signal',
+  pressure_budget: 'Pressure budget',
+  quiet_hours: 'Quiet hours',
+}
+
+export function blockReasonLabel(reason: string): string {
+  return BLOCK_REASON_LABEL[reason] ?? reason.replace(/_/g, ' ')
+}
+
 // ── Presentation helpers (single source of truth for status → meaning) ───────
 
 /** Human label + a semantic tone token for a node type. Tone maps to the

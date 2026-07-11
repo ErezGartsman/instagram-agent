@@ -77,8 +77,58 @@ export const SAMPLE_FLOWS: FlowSummary[] = import.meta.env.DEV
         run_count: 6,
         last_run_at: ago(3 * 3600),
       },
+      {
+        id: 'flow-draft',
+        slug: 'briefed-lead-followup',
+        version: 1,
+        status: 'draft',
+        live: false,
+        name: 'Briefed lead → wait then nudge (draft)',
+        description: 'A briefed lead who has gone quiet 48h+ gets a gentle nudge — waiting one day first so it never feels pushy.',
+        trigger: {
+          type: 'state',
+          predicate: {
+            all: [
+              { field: 'stage', op: 'in', value: ['briefed'] },
+              { field: 'hours_since_last', op: 'gte', value: 48 },
+            ],
+          },
+        },
+        graph: {
+          nodes: [
+            { id: 'trigger', type: 'trigger' },
+            { id: 'w1', type: 'wait', hours: 24 },
+            { id: 's1', type: 'action:send_message', body: 'היי, רק בודק — עדיין מתלבט/ת לגבי פגישה? אשמח לעזור.' },
+          ],
+          edges: [{ from: 'trigger', to: 'w1' }, { from: 'w1', to: 's1' }],
+        },
+        created_at: ago(2 * 3600),
+        published_at: null,
+        run_count: 0,
+        last_run_at: null,
+      },
     ]
   : []
+
+// A representative simulation report for dev-bypass (the publish dialog demo).
+export const SAMPLE_SIM_REPORT = {
+  window_days: 90,
+  trigger_type: 'state',
+  fires: 34,
+  actions: { would_send: 28, would_notify: 0, advanced: 0, noted: 0, flagged: 0 },
+  blocked: 6,
+  blocked_by: { pressure_budget: 4, quiet_hours: 2 },
+  sample: [
+    { person_name: 'Maya Goren', at: ago(3 * 86400), outcome: 'blocked', reason: 'pressure_budget' },
+    { person_name: 'Daniel Roth', at: ago(9 * 86400), outcome: 'blocked', reason: 'quiet_hours' },
+    { person_name: 'Noa Levi', at: ago(12 * 86400), outcome: 'would_send', reason: null },
+    { person_name: 'Ofir Ben-David', at: ago(20 * 86400), outcome: 'would_send', reason: null },
+    { person_name: 'Tamar Shaked', at: ago(31 * 86400), outcome: 'would_send', reason: null },
+  ],
+  notes: [
+    'State trigger — cooling episodes reconstructed from the interaction log; the real predicate is evaluated against each reconstructed as-of signal.',
+  ],
+}
 
 // ── Runs, keyed by flow id ───────────────────────────────────────────────────
 

@@ -159,3 +159,121 @@ class TestCronFlowsSweep:
              patch.object(main.nexus_flows_runner, "run_sweep", return_value={"claimed": 0}):
             r = TestClient(app).post("/api/cron/flows-sweep")
         assert r.status_code == 200
+
+
+# ── F3 authoring endpoints ────────────────────────────────────────────────────
+
+from nexus.flows.authoring import AuthoringError  # noqa: E402
+
+
+class TestCreateFlow:
+    def test_success_returns_id(self, client):
+        with patch.object(main, "get_db_conn", _conn_with()), \
+             patch.object(main.nexus_flows_authoring, "create_draft", return_value="new-flow-id"):
+            r = client.post("/api/cockpit/flows", json={
+                "name": "My Flow", "trigger": {"type": "event", "kind": "booking_canceled"},
+                "graph": {"nodes": [{"id": "t1", "type": "trigger"}], "edges": []},
+            })
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "success" and body["id"] == "new-flow-id"
+
+    def test_validation_error_is_422(self, client):
+        with patch.object(main, "get_db_conn", _conn_with()), \
+             patch.object(main.nexus_flows_authoring, "create_draft",
+                          side_effect=AuthoringError("a flow must have exactly one trigger node")):
+            r = client.post("/api/cockpit/flows", json={"name": "x", "trigger": {}, "graph": {}})
+        assert r.status_code == 422
+        assert "exactly one trigger" in r.json()["detail"]
+
+
+class TestUpdateFlow:
+    def test_success(self, client):
+        with patch.object(main, "get_db_conn", _conn_with()), \
+             patch.object(main.nexus_flows_authoring, "update_draft") as upd:
+            r = client.patch("/api/cockpit/flows/f1", json={"name": "Renamed"})
+        assert r.status_code == 200 and r.json()["status"] == "success"
+        assert upd.called
+
+    def test_editing_published_is_422(self, client):
+        with patch.object(main, "get_db_conn", _conn_with()), \
+             patch.object(main.nexus_flows_authoring, "update_draft",
+                          side_effect=AuthoringError("a published flow is immutable — fork a new draft to edit it")):
+            r = client.patch("/api/cockpit/flows/f1", json={"name": "x"})
+        assert r.status_code == 422
+        assert "immutable" in r.json()["detail"]
+
+
+class TestSimulateEndpoint:
+    def test_returns_report(self, client):
+        report = {"fires": 34, "actions": {"would_notify": 34}, "blocked": 6,
+                  "blocked_by": {"pressure_budget": 4, "quiet_hours": 2}, "window_days": 90}
+        with patch.object(main, "get_db_conn", _conn_with()), \
+             patch.object(main.nexus_flows_authoring, "load_flow",
+                          return_value={"trigger": {"type": "event", "kind": "x"}, "graph": {"nodes": [], "edges": []}}), \
+             patch.object(main.nexus_flows_simulate, "simulate_flow", return_value=report):
+            r = client.post("/api/cockpit/flows/f1/simulate", json={})
+        assert r.status_code == 200
+        assert r.json()["report"]["fires"] == 34
+
+    def test_missing_flow_is_404(self, client):
+        with patch.object(main, "get_db_conn", _conn_with()), \
+             patch.object(main.nexus_flows_authoring, "load_flow", return_value=None):
+            r = client.post("/api/cockpit/flows/ghost/simulate", json={})
+        assert r.status_code == 404
+
+
+class TestPublishEndpoint:
+    def test_runs_sim_then_publishes(self, client):
+        report = {"fires": 12, "blocked": 0}
+        with patch.object(main, "get_db_conn", _conn_with()), \
+             patch.object(main.nexus_flows_authoring, "load_flow",
+                          return_value={"trigger": {"type": "event", "kind": "x"}, "graph": {"nodes": [], "edges": []}}), \
+             patch.object(main.nexus_flows_simulate, "simulate_flow", return_value=report), \
+             patch.object(main.nexus_flows_authoring, "publish") as pub:
+            r = client.post("/api/cockpit/flows/f1/publish")
+        assert r.status_code == 200
+        assert r.json()["report"]["fires"] == 12
+        # publish was gated on the simulation report just produced
+        assert pub.call_args.kwargs["simulation"] == report
+
+    def test_publish_of_nondraft_is_422(self, client):
+        with patch.object(main, "get_db_conn", _conn_with()), \
+             patch.object(main.nexus_flows_authoring, "load_flow",
+                          return_value={"trigger": {"type": "event", "kind": "x"}, "graph": {"nodes": [], "edges": []}}), \
+             patch.object(main.nexus_flows_simulate, "simulate_flow", return_value={"fires": 1}), \
+             patch.object(main.nexus_flows_authoring, "publish",
+                          side_effect=AuthoringError("only a draft can be published (this is published)")):
+            r = client.post("/api/cockpit/flows/f1/publish")
+        assert r.status_code == 422
+
+
+class TestStatusEndpoint:
+    def test_pause(self, client):
+        with patch.object(main, "get_db_conn", _conn_with()), \
+             patch.object(main.nexus_flows_authoring, "set_status", return_value="paused"):
+            r = client.post("/api/cockpit/flows/f1/status", json={"action": "pause"})
+        assert r.status_code == 200 and r.json()["flow_status"] == "paused"
+
+    def test_illegal_transition_is_422(self, client):
+        with patch.object(main, "get_db_conn", _conn_with()), \
+             patch.object(main.nexus_flows_authoring, "set_status",
+                          side_effect=AuthoringError("cannot pause a draft flow")):
+            r = client.post("/api/cockpit/flows/f1/status", json={"action": "pause"})
+        assert r.status_code == 422
+
+
+class TestFlowSettings:
+    def test_updates_budget_and_returns_effective(self, client):
+        with patch.object(main, "get_db_conn", _conn_with()), \
+             patch.object(main.nexus_flows_policy, "flows_enabled", return_value=True), \
+             patch.object(main.nexus_flows_policy, "pressure_budget", return_value=3):
+            r = client.patch("/api/cockpit/flow-settings", json={"enabled": True, "pressure_budget": 3})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["enabled"] is True and body["pressure_budget"] == 3
+
+    def test_bad_budget_is_422(self, client):
+        with patch.object(main, "get_db_conn", _conn_with()):
+            r = client.patch("/api/cockpit/flow-settings", json={"pressure_budget": "lots"})
+        assert r.status_code == 422

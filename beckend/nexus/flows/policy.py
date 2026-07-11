@@ -147,6 +147,20 @@ def pressure_budget() -> int:
         return _DEFAULT_PRESSURE_BUDGET
 
 
+def detect_crisis(text: str) -> bool:
+    """Public passthrough to main.py's configured crisis detector — for the
+    simulation's as-of crisis check (nexus/flows/simulate.py), which can't
+    import main. Returns False when unconfigured (fail-open for a read-only
+    replay; the LIVE crisis gate in evaluate_send is what actually protects a
+    real send)."""
+    if _is_crisis_fn is None:
+        return False
+    try:
+        return bool(_is_crisis_fn(text))
+    except Exception:
+        return False
+
+
 # ── DB-touching helpers (commit-free) ────────────────────────────────────────────
 
 def count_recent_automated_sends(conn, person_id: str, *, days: int = _PRESSURE_WINDOW_DAYS) -> int:
