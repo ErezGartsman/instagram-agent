@@ -1,6 +1,6 @@
 import { apiFetch } from './http'
 
-// The Flows engine's read surface (F2 canvas). The backend
+// The Flows engine's read surface (the Playbooks page). The backend
 // (routers/flows.py) ships flow definitions with their graph inline, plus
 // per-flow run history where every run carries its executed steps — and a
 // send step carries the full Verifier Loop panel that decided its fate.
@@ -18,7 +18,7 @@ export type FlowNodeType =
   | 'action:set_flag'
 
 /** A node is {id, type, …type-specific fields}. We keep the extras loose —
- *  the canvas reads a few known ones (body, note, hours, to_stage) for labels. */
+ *  the playbook compiler reads a few known ones (body, note, hours, to_stage). */
 export type FlowNodeDef = {
   id: string
   type: FlowNodeType | string
@@ -228,23 +228,6 @@ export async function updateFlowSettings(
   )
 }
 
-/** Blank starter graph for a new draft — a trigger wired to a notify node. */
-export function blankGraph(): FlowGraph {
-  return {
-    nodes: [
-      { id: 'trigger', type: 'trigger' },
-      { id: 'n1', type: 'action:notify_operator', body: 'A lead needs your attention.' },
-    ],
-    edges: [{ from: 'trigger', to: 'n1' }],
-  }
-}
-
-/** The node types a user can add from the palette (trigger is fixed, one per flow). */
-export const ADDABLE_NODE_TYPES: string[] = [
-  'condition', 'wait', 'action:send_message', 'action:notify_operator',
-  'action:advance_stage', 'action:add_note', 'action:set_flag',
-]
-
 /** Reason-code → plain language for the simulation's blocked breakdown. */
 export const BLOCK_REASON_LABEL: Record<string, string> = {
   crisis: 'Crisis signal',
@@ -259,7 +242,7 @@ export function blockReasonLabel(reason: string): string {
 // ── Presentation helpers (single source of truth for status → meaning) ───────
 
 /** Human label + a semantic tone token for a node type. Tone maps to the
- *  Midnight Instrument palette; the canvas + inspector both read this. */
+ *  Midnight Instrument palette; the composer + inspector both read this. */
 export const NODE_META: Record<string, { label: string; tone: string; icon: string }> = {
   trigger:                  { label: 'Trigger',        tone: 'sage',   icon: 'zap' },
   condition:                { label: 'Condition',      tone: 'glow',   icon: 'branch' },
@@ -273,23 +256,6 @@ export const NODE_META: Record<string, { label: string; tone: string; icon: stri
 
 export function nodeMeta(type: string) {
   return NODE_META[type] ?? { label: type, tone: 'muted', icon: 'sparkle' }
-}
-
-/** The concise on-node caption for a node's static config. */
-export function nodeCaption(node: FlowNodeDef): string | null {
-  switch (node.type) {
-    case 'wait':                   return node.hours ? `${node.hours}h` : null
-    case 'action:advance_stage':   return node.to_stage ? `→ ${node.to_stage}` : null
-    case 'action:send_message':
-    case 'action:notify_operator': return node.body ? truncate(node.body, 60) : null
-    case 'action:add_note':        return node.note ? truncate(node.note, 50) : null
-    case 'action:set_flag':        return node.flag ?? null
-    default: return null
-  }
-}
-
-function truncate(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n - 1) + '…' : s
 }
 
 export const RUN_STATUS_TONE: Record<RunStatus, string> = {

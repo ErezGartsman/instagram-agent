@@ -12,7 +12,7 @@ export const FEATURES = {
   analytics: import.meta.env.DEV || import.meta.env.VITE_FEATURE_ANALYTICS === '1',
   /** Sprint 5 · the Content Studio. */
   content: import.meta.env.DEV || import.meta.env.VITE_FEATURE_CONTENT === '1',
-  /** F2 · the Flows visual canvas + run inspector (SYSTEM_ELEVATION_PRD.md §B7). */
+  /** F2/F3 · Playbooks — sentence-form automations + run inspector + simulation. */
   flows: import.meta.env.DEV || import.meta.env.VITE_FEATURE_FLOWS === '1',
   // 'inbox' RETIRED (E1 §A7, SYSTEM_ELEVATION_PRD.md): One Thread inside the
   // dossier superseded the planned inbox surface; /app/inbox redirects to the queue.
