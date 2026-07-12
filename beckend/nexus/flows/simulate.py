@@ -393,8 +393,12 @@ def _fetch_names(conn, person_ids: set[str]) -> dict[str, str]:
     if not person_ids:
         return {}
     with conn.cursor() as cur:
+        # person.id is uuid, but person_ids are str()-ified in the pure core, so
+        # psycopg2 adapts the list to a text[] literal — `uuid = ANY(text[])`
+        # has no operator. Cast the array to uuid[] explicitly (the same idiom
+        # as routers/cockpit.py's person queries).
         cur.execute(
-            "SELECT id, display_name FROM person WHERE id = ANY(%s)",
+            "SELECT id, display_name FROM person WHERE id = ANY(%s::uuid[])",
             (list(person_ids),),
         )
         return {str(pid): (name or "Lead") for pid, name in cur.fetchall()}
