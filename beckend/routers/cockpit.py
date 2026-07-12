@@ -557,9 +557,12 @@ def cockpit_agent_runs(person_id: str, user: dict = main.Depends(main.require_co
                 actions_by_run: dict[str, list] = {rid: [] for rid in run_ids}
                 if run_ids:
                     cur.execute(
+                        # agent_run_id is uuid; run_ids are str()-ified, so the
+                        # list adapts to text[] — cast to uuid[] (`uuid = ANY(text[])`
+                        # has no operator), matching the person query above.
                         "SELECT agent_run_id, action_type, payload, result, at "
                         "FROM agent_actions "
-                        "WHERE agent_run_id = ANY(%s) "
+                        "WHERE agent_run_id = ANY(%s::uuid[]) "
                         "ORDER BY at ASC",
                         (run_ids,),
                     )

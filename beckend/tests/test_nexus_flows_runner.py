@@ -46,6 +46,28 @@ class TestRunSweepGate:
         assert conn.executed == []
 
 
+class TestTimerResume:
+    def test_resume_casts_run_ids_to_uuid_array(self):
+        # A matured timer returns its flow_run_id (str()-ified from a uuid
+        # column). The follow-up UPDATE must cast to uuid[] or Postgres throws
+        # `operator does not exist: uuid = text`. This path runs for every flow
+        # that has a `wait` step, so the bug would silently strand those runs.
+        conn = FakeConn(
+            fetchall_queue=[
+                [("44444444-4444-4444-4444-444444444444",)],  # flow_timers fired -> one run
+                [],                                            # _claim_running -> nothing to run
+            ],
+        )
+        summary = runner.run_sweep(conn)
+        assert summary["resumed"] == 1
+
+        resume = [(s, p) for s, p in conn.executed if s.startswith("UPDATE flow_runs SET status = 'running'")]
+        assert len(resume) == 1
+        stmt, params = resume[0]
+        assert "ANY(%s::uuid[])" in stmt
+        assert params == (["44444444-4444-4444-4444-444444444444"],)
+
+
 class TestShadowMode:
     def test_notify_operator_shadow_when_not_live(self):
         conn = FakeConn(

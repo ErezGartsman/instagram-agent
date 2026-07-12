@@ -6,6 +6,8 @@ covered with FakeConn.
 """
 import datetime
 
+import pytest
+
 from nexus.flows import simulate
 from nexus.flows.simulate import (
     Candidate, Outcome, aggregate, dry_run, event_candidates,
@@ -241,3 +243,57 @@ class TestSimulateFlowIO:
         )
         assert report["fires"] == 0
         assert "Invalid predicate" in report["notes"][0]
+
+
+class TestUuidArrayCasts:
+    """Regression for the `operator does not exist: uuid = text` crash: the
+    pure core str()-ifies every person_id, so any query that feeds those ids
+    into `= ANY(%s)` against a uuid column MUST cast to `::uuid[]`, or psycopg2
+    adapts the Python str list to a text[] literal and Postgres rejects it.
+
+    The DB is mocked in CI (a fake cursor never type-checks SQL), so these lock
+    in the cast by inspecting the emitted SQL — across BOTH trigger families,
+    since both reach _fetch_names on the person-name lookup.
+    """
+
+    def _names_query(self, conn) -> str:
+        matches = [s for s, _ in conn.executed if "FROM person" in s]
+        assert matches, "expected a person-name lookup to run"
+        return matches[0]
+
+    @pytest.mark.parametrize("kind", ["booking_canceled", "captured", "outreach_click"])
+    def test_event_trigger_person_lookup_casts_uuid_array(self, monkeypatch, kind):
+        monkeypatch.setattr(simulate.flow_policy, "pressure_budget", lambda: 2)
+        conn = FakeConn(
+            fetchall_queue=[
+                [("11111111-1111-1111-1111-111111111111", NOW - datetime.timedelta(days=2)),
+                 ("22222222-2222-2222-2222-222222222222", NOW - datetime.timedelta(days=9))],  # _fetch_event_rows
+                [("11111111-1111-1111-1111-111111111111", "Maya"),
+                 ("22222222-2222-2222-2222-222222222222", "Daniel")],                          # _fetch_names
+            ],
+        )
+        report = simulate.simulate_flow(
+            conn, trigger={"type": "event", "kind": kind}, graph=NOTIFY_GRAPH, now=NOW,
+        )
+        assert report["fires"] == 2
+        assert "ANY(%s::uuid[])" in self._names_query(conn)
+
+    def test_state_trigger_person_lookup_casts_uuid_array(self, monkeypatch):
+        monkeypatch.setattr(simulate.flow_policy, "pressure_budget", lambda: 2)
+        entered = NOW - datetime.timedelta(days=40)
+        conn = FakeConn(
+            fetchall_queue=[
+                # _fetch_timelines: one person entered 'qualified' then went quiet.
+                [("33333333-3333-3333-3333-333333333333", entered, "stage_change", {"to": "qualified"})],
+                # _crisis_as_of (no crisis) then _automated_sends_before are fetchone;
+                # _fetch_names returns the display name.
+                [("33333333-3333-3333-3333-333333333333", "Noa")],
+            ],
+            fetchone_queue=[None, (0,)],  # crisis lookup miss, 0 prior automated sends
+        )
+        report = simulate.simulate_flow(
+            conn, trigger={"type": "state", "predicate": COOLING_PREDICATE},
+            graph=SEND_GRAPH, now=NOW,
+        )
+        assert report["fires"] == 1
+        assert "ANY(%s::uuid[])" in self._names_query(conn)

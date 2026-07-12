@@ -133,8 +133,12 @@ def _resume_fired_timers(conn) -> int:
     if not run_ids:
         return 0
     with conn.cursor() as cur:
+        # run_ids are str()-ified flow_run uuids; psycopg2 renders the list as a
+        # text[] literal, and `uuid = ANY(text[])` has no operator. Cast to
+        # uuid[] so timer-matured waits actually resume (this fires for every
+        # flow with a `wait` step).
         cur.execute(
-            "UPDATE flow_runs SET status = 'running' WHERE id = ANY(%s) AND status = 'waiting'",
+            "UPDATE flow_runs SET status = 'running' WHERE id = ANY(%s::uuid[]) AND status = 'waiting'",
             (run_ids,),
         )
     return len(run_ids)

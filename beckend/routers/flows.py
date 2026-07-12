@@ -117,8 +117,11 @@ def list_flow_runs(flow_id: str, user: dict = main.Depends(main.require_cockpit_
                 steps_by_run: dict[str, list] = {rid: [] for rid in run_ids}
                 if run_ids:
                     cur.execute(
+                        # flow_run_id is uuid; run_ids are str()-ified, so the
+                        # list adapts to text[] — cast to uuid[] (`uuid = ANY(text[])`
+                        # has no operator).
                         "SELECT flow_run_id, node_id, node_type, status, output, error, at "
-                        "FROM flow_run_steps WHERE flow_run_id = ANY(%s) ORDER BY at ASC",
+                        "FROM flow_run_steps WHERE flow_run_id = ANY(%s::uuid[]) ORDER BY at ASC",
                         (run_ids,),
                     )
                     for run_id, node_id, node_type, status, output, error, at in cur.fetchall():

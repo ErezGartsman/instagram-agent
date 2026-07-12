@@ -94,6 +94,26 @@ class TestListFlowRuns:
         assert len(body["runs"][0]["steps"]) == 1
         assert body["runs"][0]["steps"][0]["status"] == "shadow"
 
+    def test_steps_query_casts_run_ids_to_uuid_array(self, client):
+        # run_ids are str()-ified flow_run uuids; the steps lookup uses
+        # `flow_run_id = ANY(%s)` against a uuid column, so it must cast to
+        # uuid[] or Postgres throws `operator does not exist: uuid = text`.
+        run_row = ("r1", "p1", "Dana K.", "success", None, None, None)
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        cur.fetchall.side_effect = [[run_row], []]
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        conn.__exit__.return_value = False
+        conn.cursor.return_value = cur
+
+        with patch.object(main, "get_db_conn", MagicMock(return_value=conn)):
+            r = client.get("/api/cockpit/flows/f1/runs")
+        assert r.status_code == 200
+        steps_sql = [c.args[0] for c in cur.execute.call_args_list if "flow_run_steps" in c.args[0]]
+        assert steps_sql and "ANY(%s::uuid[])" in steps_sql[0]
+
 
 class TestTriggerSweep:
     def test_success_aggregates_all_three_phases(self, client):
