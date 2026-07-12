@@ -1565,7 +1565,12 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins.split(","),
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    # PATCH is required for the cockpit's in-place edits (flow draft update,
+    # flow-settings, content update). Its omission silently 400'd every
+    # cross-origin PATCH at the preflight — the browser never sent the body,
+    # so it read as a dead button, not a validation error. List methods
+    # explicitly (not "*") to stay compatible with allow_credentials=True.
+    allow_methods=["GET", "POST", "PATCH"],
     # Authorization must be listed explicitly — browsers will block any
     # request that sends a header not in this allowlist (CORS preflight).
     allow_headers=["Content-Type", "Authorization"],
